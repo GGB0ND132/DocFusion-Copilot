@@ -147,13 +147,23 @@ export default function ResultPreviewPage() {
   }
 
   async function handleTraceLookup() {
-    if (!traceFactIdInput.trim()) {
+    const trimmedFactId = traceFactIdInput.trim();
+    if (!trimmedFactId) {
       setPageError('请输入要查询的 fact_id。');
+      return;
+    }
+    if (!trimmedFactId.startsWith('fact_')) {
+      setPageError('来源追溯接口只接受 fact_id。当前输入看起来像 document_set_id、doc_id 或 task_id。');
+      pushToast({
+        title: '追溯参数不正确',
+        message: '请传入 fact_id，例如 fact_xxx；document_set_id 不能用于 /facts/{fact_id}/trace。',
+        tone: 'error',
+      });
       return;
     }
 
     setPageError(null);
-    await openTraceByFactId(traceFactIdInput.trim(), null);
+    await openTraceByFactId(trimmedFactId, null);
   }
 
   return (
@@ -322,7 +332,7 @@ export default function ResultPreviewPage() {
             <input
               value={traceFactIdInput}
               onChange={(event) => setTraceFactIdInput(event.target.value)}
-              placeholder="输入 fact_id 后查询来源"
+              placeholder="输入 fact_id（例如 fact_xxx）后查询来源"
               className="flex-1 rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm text-slate-700 outline-none transition focus:border-teal"
             />
             <AppButton
@@ -334,6 +344,7 @@ export default function ResultPreviewPage() {
           </div>
           <ul className="mt-4 space-y-3 text-sm leading-7 text-slate-600">
             <li>当前 trace 接口是 GET /api/v1/facts/{'{fact_id}'}/trace。</li>
+            <li>document_set_id、doc_id、task_id 都不能代替 fact_id 调用追溯接口。</li>
             <li>README.txt 这类提示词文件不会生成 fact_id，因此不会出现在追溯和模板回填结果中。</li>
             <li>模板结果下载接口返回的是文件流，trace 需要基于 fact_id 单独查询。</li>
             <li>当前页面已经把追溯按钮挂到 filled_cells 上，便于直接回看证据链。</li>

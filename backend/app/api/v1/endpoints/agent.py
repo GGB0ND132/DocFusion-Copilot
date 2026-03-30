@@ -4,8 +4,8 @@ import json
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.datastructures import UploadFile
 from fastapi.responses import FileResponse
+from starlette.datastructures import UploadFile
 
 from app.core.container import get_container
 from app.schemas.agent import (
@@ -37,6 +37,8 @@ async def execute(request: Request) -> AgentExecuteResponse:
         payload = await _parse_multipart_execute_request(request)
     else:
         payload = AgentExecuteRequest.model_validate(await request.json()).model_dump()
+        payload["template_name"] = None
+        payload["template_content"] = None
 
     try:
         response = get_container().document_interaction_service.execute(
@@ -44,8 +46,8 @@ async def execute(request: Request) -> AgentExecuteResponse:
             document_ids=payload["document_ids"] or None,
             document_set_id=payload["document_set_id"],
             context_id=payload["context_id"],
-            template_name=payload["template_name"],
-            template_content=payload["template_content"],
+            template_name=payload.get("template_name"),
+            template_content=payload.get("template_content"),
             fill_mode=payload["fill_mode"],
             auto_match=payload["auto_match"],
         )
