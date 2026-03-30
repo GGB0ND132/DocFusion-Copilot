@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-from collections import defaultdict
 from contextlib import contextmanager
 from dataclasses import asdict
 from datetime import datetime, timezone
 from typing import Iterator
 
-from sqlalchemy import Engine, create_engine, delete, select
+from sqlalchemy import Engine, case, create_engine, delete, func, select, update
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.models.domain import (
@@ -27,6 +26,7 @@ from app.repositories.sqlalchemy_models import (
     TaskRow,
     TemplateResultRow,
 )
+from app.utils.fact_selection import select_scope_canonical_facts
 
 
 class PostgresRepository:
@@ -51,6 +51,9 @@ class PostgresRepository:
         Create the database tables required by the repository.
         """
         Base.metadata.create_all(self._engine)
+        for table in Base.metadata.sorted_tables:
+            for index in table.indexes:
+                index.create(bind=self._engine, checkfirst=True)
 
     @contextmanager
     def _session(self) -> Iterator[Session]:
@@ -204,18 +207,20 @@ class PostgresRepository:
             return []
 
         with self._session() as session:
-            session.add_all(self._fact_to_row(fact) for fact in facts)
+            rows = [self._fact_to_row(fact) for fact in facts]
+            fact_ids = [row.fact_id for row in rows]
+            affected_conflict_group_ids = {row.conflict_group_id for row in rows if row.conflict_group_id}
+            session.add_all(rows)
             session.flush()
-            affected_groups = {
-                (fact.entity_type, fact.entity_name, fact.field_name, fact.year, fact.unit)
-                for fact in facts
-            }
-            self._recompute_canonical_flags(session, affected_groups)
-            reloaded = [
-                session.get(FactRow, fact.fact_id)
-                for fact in facts
-            ]
-            return [self._fact_from_row(row) for row in reloaded if row is not None]
+            self._recompute_canonical_flags(session, affected_conflict_group_ids)
+            session.flush()
+            stmt = (
+                select(FactRow)
+                .where(FactRow.fact_id.in_(fact_ids))
+                .execution_options(populate_existing=True)
+            )
+            reloaded_by_id = {row.fact_id: row for row in session.scalars(stmt).all()}
+            return [self._fact_from_row(reloaded_by_id[fact_id]) for fact_id in fact_ids if fact_id in reloaded_by_id]
 
     def list_facts(
         self,
@@ -243,12 +248,15 @@ class PostgresRepository:
                 stmt = stmt.where(FactRow.status == status)
             if min_confidence is not None:
                 stmt = stmt.where(FactRow.confidence >= min_confidence)
-            if canonical_only:
+            if canonical_only and document_ids is None:
                 stmt = stmt.where(FactRow.is_canonical.is_(True))
             if document_ids is not None:
                 stmt = stmt.where(FactRow.source_doc_id.in_(sorted(document_ids)))
             stmt = stmt.order_by(FactRow.confidence.desc(), FactRow.fact_id.asc())
-            return [self._fact_from_row(row) for row in session.scalars(stmt).all()]
+            facts = [self._fact_from_row(row) for row in session.scalars(stmt).all()]
+            if canonical_only and document_ids is not None:
+                return select_scope_canonical_facts(facts)
+            return facts
 
     def get_fact(self, fact_id: str) -> FactRecord | None:
         """按 id 查询事实记录。
@@ -275,13 +283,18 @@ class PostgresRepository:
                 row.status = status
             if metadata_updates:
                 row.metadata_json = {**(row.metadata_json or {}), **metadata_updates}
+            row.conflict_group_id = row.conflict_group_id or self._build_conflict_group_id(
+                row.entity_type,
+                row.entity_name,
+                row.field_name,
+                row.year,
+                row.unit,
+            )
             session.add(row)
             session.flush()
-            affected_groups = {
-                (row.entity_type, row.entity_name, row.field_name, row.year, row.unit),
-            }
-            self._recompute_canonical_flags(session, affected_groups)
+            self._recompute_canonical_flags(session, {row.conflict_group_id})
             session.flush()
+            session.refresh(row)
             return self._fact_from_row(row)
 
     def get_fact_block(self, fact_id: str) -> DocumentBlock | None:
@@ -338,29 +351,62 @@ class PostgresRepository:
     def _recompute_canonical_flags(
         self,
         session: Session,
-        affected_groups: set[tuple[str, str, str, int | None, str | None]],
+        affected_conflict_group_ids: set[str],
     ) -> None:
         """重算受影响冲突组的 canonical 事实标记。
         Recompute canonical fact flags for affected conflict groups.
         """
-        for entity_type, entity_name, field_name, year, unit in affected_groups:
-            conflict_group_id = f"{entity_type}::{entity_name}::{field_name}::{year}::{unit}"
-            stmt = select(FactRow).where(
-                FactRow.entity_type == entity_type,
-                FactRow.entity_name == entity_name,
-                FactRow.field_name == field_name,
-                FactRow.year == year,
-                FactRow.unit == unit,
-            ).order_by(FactRow.confidence.desc(), FactRow.value_num.is_not(None).desc(), FactRow.source_doc_id.desc())
-            rows = list(session.scalars(stmt).all())
-            for row in rows:
-                row.is_canonical = False
-                row.conflict_group_id = conflict_group_id
-                session.add(row)
-            ordered_rows = [row for row in rows if row.status != "rejected"]
-            for index, row in enumerate(ordered_rows):
-                row.is_canonical = index == 0
-                session.add(row)
+        if not affected_conflict_group_ids:
+            return
+
+        group_ids = sorted(affected_conflict_group_ids)
+        session.execute(
+            update(FactRow)
+            .where(FactRow.conflict_group_id.in_(group_ids))
+            .values(is_canonical=False)
+        )
+
+        has_numeric_value = case((FactRow.value_num.is_not(None), 1), else_=0)
+        ranked_facts = (
+            select(
+                FactRow.fact_id.label("fact_id"),
+                func.row_number()
+                .over(
+                    partition_by=FactRow.conflict_group_id,
+                    order_by=(
+                        FactRow.confidence.desc(),
+                        has_numeric_value.desc(),
+                        FactRow.source_doc_id.desc(),
+                        FactRow.fact_id.asc(),
+                    ),
+                )
+                .label("rank_index"),
+            )
+            .where(
+                FactRow.conflict_group_id.in_(group_ids),
+                FactRow.status != "rejected",
+            )
+            .cte("ranked_facts")
+        )
+        canonical_fact_ids = select(ranked_facts.c.fact_id).where(ranked_facts.c.rank_index == 1)
+        session.execute(
+            update(FactRow)
+            .where(FactRow.fact_id.in_(canonical_fact_ids))
+            .values(is_canonical=True)
+        )
+
+    @staticmethod
+    def _build_conflict_group_id(
+        entity_type: str,
+        entity_name: str,
+        field_name: str,
+        year: int | None,
+        unit: str | None,
+    ) -> str:
+        """构造事实冲突组的稳定唯一标识。
+        Build a stable unique identifier for one fact conflict group.
+        """
+        return f"{entity_type}::{entity_name}::{field_name}::{year}::{unit}"
 
     @staticmethod
     def _clone_document(record: DocumentRecord) -> DocumentRecord:
@@ -491,7 +537,14 @@ class PostgresRepository:
             source_block_id=fact.source_block_id,
             source_span=fact.source_span,
             confidence=fact.confidence,
-            conflict_group_id=fact.conflict_group_id,
+            conflict_group_id=fact.conflict_group_id
+            or PostgresRepository._build_conflict_group_id(
+                fact.entity_type,
+                fact.entity_name,
+                fact.field_name,
+                fact.year,
+                fact.unit,
+            ),
             is_canonical=fact.is_canonical,
             status=fact.status,
             metadata_json=dict(fact.metadata),

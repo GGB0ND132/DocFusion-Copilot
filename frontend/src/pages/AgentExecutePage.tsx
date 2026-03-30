@@ -13,6 +13,7 @@ import {
   submitTemplateFill,
   type FilledCellResponse,
 } from '@/services';
+import { isTemplateFillTask } from '@/services/taskTypes';
 import type { AgentChatResponse, AgentExecuteResponse } from '@/services';
 import { useUiStore } from '@/stores/uiStore';
 
@@ -70,7 +71,7 @@ function TemplateFillPanel() {
 
   const templateFillTasks = useMemo(() => {
     return Object.values(taskSnapshots)
-      .filter((t) => t.task_type === 'template_fill')
+      .filter((t) => isTemplateFillTask(t.task_type))
       .sort((a, b) => new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime());
   }, [taskSnapshots]);
 

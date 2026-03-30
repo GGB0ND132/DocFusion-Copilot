@@ -5,6 +5,7 @@ import ErrorStateCard from '@/components/ErrorStateCard';
 import LoadingStateCard from '@/components/LoadingStateCard';
 import StatusBadge from '@/components/StatusBadge';
 import { getDocumentBlocks, getDocumentDetail, getDocumentFacts, getTaskStatus, listDocuments } from '@/services';
+import { isDocumentParseTask } from '@/services/taskTypes';
 import type { BlockResponse, DocumentResponse, FactResponse } from '@/services';
 import { useUiStore } from '@/stores/uiStore';
 
@@ -28,7 +29,7 @@ export default function DocumentDetailPage() {
   /* ── auto-poll active document parsing tasks ── */
   const docParseTasks = useMemo(() => {
     return Object.values(taskSnapshots)
-      .filter((t) => t.task_type !== 'template_fill')
+      .filter((t) => isDocumentParseTask(t.task_type))
       .sort((a, b) => new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime());
   }, [taskSnapshots]);
 

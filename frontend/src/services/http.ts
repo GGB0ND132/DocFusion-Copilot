@@ -59,12 +59,34 @@ export async function requestFile(path: string, options: RequestOptions = {}): P
 
   const disposition = response.headers.get('content-disposition') ?? '';
   const matchedFileName = disposition.match(/filename\*=UTF-8''([^;]+)|filename="?([^";]+)"?/i);
-  const fileName = decodeURIComponent(matchedFileName?.[1] ?? matchedFileName?.[2] ?? 'download.xlsx');
+  const fileName = decodeURIComponent(
+    matchedFileName?.[1] ?? matchedFileName?.[2] ?? guessDownloadFileName(response.headers.get('content-type')),
+  );
 
   return {
     blob: await response.blob(),
     fileName,
   };
+}
+
+function guessDownloadFileName(contentType: string | null): string {
+  const normalized = (contentType ?? '').toLowerCase();
+  if (normalized.includes('wordprocessingml.document')) {
+    return 'download.docx';
+  }
+  if (normalized.includes('spreadsheetml.sheet')) {
+    return 'download.xlsx';
+  }
+  if (normalized.includes('application/json')) {
+    return 'download.json';
+  }
+  if (normalized.includes('text/markdown')) {
+    return 'download.md';
+  }
+  if (normalized.includes('text/plain')) {
+    return 'download.txt';
+  }
+  return 'download.bin';
 }
 
 export { API_BASE_URL };

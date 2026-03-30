@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import re
 import shutil
 import sys
 import unittest
@@ -18,6 +19,7 @@ from app.core.openai_client import OpenAICompatibleClient
 from app.models.domain import DocumentRecord, DocumentStatus, FactRecord
 from app.parsers.factory import ParserRegistry
 from app.repositories.memory import InMemoryRepository
+from app.repositories.postgres import PostgresRepository
 from app.services.agent_service import AgentService
 from app.services.benchmark_service import BenchmarkService
 from app.services.document_interaction_service import DocumentInteractionService
@@ -27,8 +29,8 @@ from app.services.fact_service import FactService
 from app.services.template_service import TemplateService
 from app.services.trace_service import TraceService
 from app.tasks.executor import TaskExecutor
-from app.utils.spreadsheet import load_xlsx
-from app.utils.wordprocessing import load_docx_tables
+from app.utils.spreadsheet import CellWrite, apply_xlsx_updates, load_xlsx
+from app.utils.wordprocessing import WordCellWrite, apply_docx_updates, load_docx_tables
 
 
 class BackendPipelineTests(unittest.TestCase):
@@ -144,6 +146,138 @@ class BackendPipelineTests(unittest.TestCase):
         self.assertEqual("52073.4", rows[3][1])
         self.assertGreaterEqual(len(result.filled_cells), 4)
 
+    def test_document_service_returns_scope_local_canonical_facts(self) -> None:
+        """文档事实查询应在当前文档范围内返回局部 canonical。    Document fact queries should return scope-local canonical facts within the selected document."""
+
+        scoped_fact, _global_fact = self._seed_scope_conflicting_facts()
+
+        facts = self.document_service.get_document_facts("doc_scope", canonical_only=True)
+
+        self.assertEqual(1, len(facts))
+        self.assertEqual(scoped_fact.fact_id, facts[0].fact_id)
+        self.assertTrue(facts[0].is_canonical)
+
+    def test_template_fill_uses_scope_local_canonical_facts(self) -> None:
+        """模板回填应按当前选中文档范围挑选 canonical，而不是被库里其他文档挤掉。    Template filling should choose canonical facts within the selected document scope instead of being shadowed by other documents in the repository."""
+
+        scoped_fact, _global_fact = self._seed_scope_conflicting_facts()
+        template_bytes = build_simple_template_xlsx(
+            headers=["城市", "GDP总量（亿元）"],
+            rows=[["上海", ""]],
+        )
+
+        task = self.template_service.submit_fill_task(
+            template_name="scoped_template.xlsx",
+            content=template_bytes,
+            document_ids=["doc_scope"],
+            fill_mode="canonical",
+        )
+        self.executor.wait(task.task_id, timeout=5)
+
+        result = self.template_service.get_result(task.task_id)
+        self.assertIsNotNone(result)
+        self.assertEqual(1, len(result.filled_cells))
+        workbook = load_xlsx(Path(result.output_path))
+        first_sheet = workbook.sheets[0]
+        rows = {row.row_index: row.values for row in first_sheet.rows}
+
+        expected_value = str(scoped_fact.value_num)
+        self.assertEqual(expected_value, rows[2][1])
+        self.assertEqual(expected_value, str(result.filled_cells[0].value))
+
+    def test_template_fill_skips_entity_only_rows_when_no_field_matches(self) -> None:
+        """若模板字段没有任何匹配事实，则不应只把实体名灌进第一列。    When template fields have no matching facts, the filler should not inject entity names into the first column only."""
+
+        self._seed_city_facts()
+        template_bytes = build_simple_template_xlsx(
+            headers=["国家/地区", "病例数"],
+            rows=[["", ""]],
+        )
+
+        task = self.template_service.submit_fill_task(
+            template_name="no_match_template.xlsx",
+            content=template_bytes,
+            document_ids=["doc_seed"],
+            fill_mode="canonical",
+        )
+        self.executor.wait(task.task_id, timeout=5)
+
+        result = self.template_service.get_result(task.task_id)
+        self.assertIsNotNone(result)
+        self.assertEqual(0, len(result.filled_cells))
+        workbook = load_xlsx(Path(result.output_path))
+        rows = {row.row_index: row.values for row in workbook.sheets[0].rows}
+        self.assertEqual("", rows[2][0])
+        self.assertEqual("", rows[2][1])
+
+    def test_epidemic_summary_template_fill_extracts_expected_fields(self) -> None:
+        """疫情综述文档应能回填地区、大洲、人均 GDP、人口、检测数和病例数。    Epidemic summary documents should fill region, continent, per-capita GDP, population, test counts and case counts."""
+
+        content = (
+            "2020年7月27日，地处Asia（亚洲）的中国持续推进疫情防控。"
+            "广东省常住人口约1.26亿，人均 GDP 约 9.6 万元，7月27日无本土新增确诊病例，新增 4 例境外输入无症状感染者，"
+            "当日核酸检测量约 38.2 万份。"
+        )
+        document, parse_task = self.document_service.upload_document(
+            "covid_summary.txt",
+            content.encode("utf-8"),
+            document_set_id="set_covid_template",
+        )
+        self.executor.wait(parse_task.task_id, timeout=5)
+
+        template_bytes = build_simple_template_xlsx(
+            headers=["国家/地区", "大洲", "人均GDP", "人口", "每日检测数", "病例数"],
+            rows=[["", "", "", "", "", ""]],
+        )
+        task = self.template_service.submit_fill_task(
+            template_name="covid_template.xlsx",
+            content=template_bytes,
+            document_ids=[document.doc_id],
+            fill_mode="canonical",
+        )
+        self.executor.wait(task.task_id, timeout=5)
+
+        result = self.template_service.get_result(task.task_id)
+        self.assertIsNotNone(result)
+        workbook = load_xlsx(Path(result.output_path))
+        rows = {row.row_index: row.values for row in workbook.sheets[0].rows}
+
+        self.assertEqual("广东", rows[2][0])
+        self.assertEqual("亚洲", rows[2][1])
+        self.assertEqual("96000", rows[2][2])
+        self.assertEqual("12600", rows[2][3])
+        self.assertEqual("38.2", rows[2][4])
+        self.assertEqual("4", rows[2][5])
+
+    def test_apply_xlsx_updates_preserves_worksheet_root_declarations(self) -> None:
+        """XLSX 写回应保留工作表根节点的命名空间声明。    XLSX writes should preserve worksheet root namespace declarations."""
+
+        template_bytes = build_excel_compatible_template_xlsx(
+            headers=["国家/地区", "大洲", "病例数"],
+            rows=[],
+        )
+        template_path = self.settings.temp_dir / "excel_compatible_template.xlsx"
+        output_path = self.settings.outputs_dir / "excel_compatible_output.xlsx"
+        template_path.write_bytes(template_bytes)
+
+        apply_xlsx_updates(
+            template_path,
+            output_path,
+            [CellWrite(sheet_name="Sheet1", cell_ref="A2", value="中国")],
+        )
+
+        with zipfile.ZipFile(template_path, "r") as template_archive:
+            input_xml = template_archive.read("xl/worksheets/sheet1.xml").decode("utf-8")
+        with zipfile.ZipFile(output_path, "r") as output_archive:
+            output_xml = output_archive.read("xl/worksheets/sheet1.xml").decode("utf-8")
+
+        input_root = re.search(r"<worksheet\b[^>]*>", input_xml)
+        output_root = re.search(r"<worksheet\b[^>]*>", output_xml)
+        self.assertIsNotNone(input_root)
+        self.assertIsNotNone(output_root)
+        self.assertEqual(input_root.group(0), output_root.group(0))
+        self.assertIn('ref="A1:C2"', output_xml)
+
     def test_template_fill_populates_docx_table_cells(self) -> None:
         """DOCX 表格模板回填应写入事实值。    DOCX table-template filling should write fact values into table cells."""
 
@@ -174,6 +308,113 @@ class BackendPipelineTests(unittest.TestCase):
         self.assertEqual("2487.45", rows[2][2])
         self.assertEqual("52073.4", rows[3][1])
         self.assertGreaterEqual(len(result.filled_cells), 4)
+
+    def test_postgres_fact_rows_auto_compute_conflict_group_id(self) -> None:
+        """PostgreSQL 事实行应自动生成 conflict group id。    PostgreSQL fact rows should auto-compute conflict group ids."""
+
+        fact = FactRecord(
+            fact_id="fact_conflict",
+            entity_type="city",
+            entity_name="上海",
+            field_name="GDP总量",
+            value_num=56708.71,
+            value_text="56708.71",
+            unit="亿元",
+            year=2025,
+            source_doc_id="doc_seed",
+            source_block_id="block_seed",
+            source_span="2025年上海GDP总量56,708.71亿元",
+            confidence=0.98,
+        )
+
+        row = PostgresRepository._fact_to_row(fact)
+
+        self.assertEqual("city::上海::GDP总量::2025::亿元", row.conflict_group_id)
+
+    def test_air_quality_xlsx_can_fill_docx_template(self) -> None:
+        """环境监测 XLSX 文档应能回填到 DOCX 表格模板。    An air-quality XLSX document should fill a DOCX table template."""
+
+        source_bytes = build_simple_template_xlsx(
+            headers=[
+                "序号",
+                "监测时间",
+                "城市",
+                "区",
+                "站点编码",
+                "站点名称",
+                "空气质量指数",
+                "PM10监测值",
+                "PM2.5监测值",
+                "首要污染物",
+                "污染类型",
+            ],
+            rows=[
+                ["1", "2025-11-25 09:00:00", "枣庄市", "滕州市", "370481001", "滕州北辛中学", "29", "32", "7", "—", "优"],
+                ["2", "2025-11-25 09:00:00", "东营市", "东营经济技术开发区", "370500052", "东营市环保局", "22", "22", "2", "—", "优"],
+            ],
+        )
+        document, parse_task = self.document_service.upload_document(
+            "air_quality.xlsx",
+            source_bytes,
+            document_set_id="set_air_quality",
+        )
+        self.executor.wait(parse_task.task_id, timeout=5)
+
+        template_bytes = build_word_compatible_template_docx(
+            headers=["城市", "区", "站点名称", "空气质量指数", "PM10监测值", "PM2.5监测值", "首要污染物", "污染类型"],
+            rows=[["", "", "", "", "", "", "", ""], ["", "", "", "", "", "", "", ""]],
+        )
+        task = self.template_service.submit_fill_task(
+            template_name="air_quality_template.docx",
+            content=template_bytes,
+            document_ids=[document.doc_id],
+            fill_mode="canonical",
+        )
+        self.executor.wait(task.task_id, timeout=5)
+
+        result = self.template_service.get_result(task.task_id)
+        self.assertIsNotNone(result)
+        output_document = load_docx_tables(Path(result.output_path))
+        first_table = output_document.tables[0]
+        rows = {row.row_index: row.values for row in first_table.rows}
+
+        self.assertEqual("枣庄市", rows[2][0])
+        self.assertEqual("滕州市", rows[2][1])
+        self.assertEqual("滕州北辛中学", rows[2][2])
+        self.assertEqual("29", rows[2][3])
+        self.assertEqual("32", rows[2][4])
+        self.assertEqual("7", rows[2][5])
+        self.assertEqual("优", rows[2][7])
+
+    def test_apply_docx_updates_preserves_word_root_declarations(self) -> None:
+        """DOCX 写回应保留 Word 根节点上的命名空间声明。    DOCX writes should preserve the Word root namespace declarations."""
+
+        template_bytes = build_word_compatible_template_docx(
+            headers=["城市", "站点名称", "空气质量指数"],
+            rows=[["", "", ""]],
+        )
+        template_path = self.settings.temp_dir / "word_compatible_template.docx"
+        output_path = self.settings.outputs_dir / "word_compatible_output.docx"
+        template_path.write_bytes(template_bytes)
+
+        apply_docx_updates(
+            template_path,
+            output_path,
+            [WordCellWrite(table_index=1, row_index=2, column_index=1, value="枣庄市")],
+        )
+
+        with zipfile.ZipFile(template_path, "r") as template_archive:
+            input_xml = template_archive.read("word/document.xml").decode("utf-8")
+        with zipfile.ZipFile(output_path, "r") as output_archive:
+            output_xml = output_archive.read("word/document.xml").decode("utf-8")
+
+        input_root = re.search(r"<w:document\b[^>]*>", input_xml)
+        output_root = re.search(r"<w:document\b[^>]*>", output_xml)
+        self.assertIn('mc:Ignorable="w14 w15 w16se w16cid w16 w16cex w16sdtdh w16sdtfl w16du wp14"', output_xml)
+        self.assertIn("xmlns:mc=", output_xml)
+        self.assertIsNotNone(input_root)
+        self.assertIsNotNone(output_root)
+        self.assertEqual(input_root.group(0), output_root.group(0))
 
     def test_trace_service_reports_template_usage(self) -> None:
         """追溯事实时应包含模板使用位置。    Fact tracing should include template usage positions."""
@@ -589,6 +830,56 @@ class BackendPipelineTests(unittest.TestCase):
             ]
         )
 
+    def _seed_scope_conflicting_facts(self) -> tuple[FactRecord, FactRecord]:
+        """插入两个来自不同文档但属于同一冲突组的事实，用于验证局部 canonical 选择。    Insert two same-group facts from different documents to verify scope-local canonical selection."""
+
+        for doc_id in ("doc_scope", "doc_global"):
+            self.repository.add_document(
+                DocumentRecord(
+                    doc_id=doc_id,
+                    file_name=f"{doc_id}.txt",
+                    stored_path=f"{doc_id}.txt",
+                    doc_type="txt",
+                    upload_time=datetime.now(timezone.utc),
+                    status=DocumentStatus.parsed,
+                    metadata={"document_set_id": "set_scope"},
+                )
+            )
+
+        stored_facts = self.repository.add_facts(
+            [
+                FactRecord(
+                    fact_id="fact_scope_gdp",
+                    entity_type="city",
+                    entity_name="上海",
+                    field_name="GDP总量",
+                    value_num=111.1,
+                    value_text="111.1",
+                    unit="亿元",
+                    year=2025,
+                    source_doc_id="doc_scope",
+                    source_block_id="blk_scope",
+                    source_span="上海GDP总量111.1亿元",
+                    confidence=0.61,
+                ),
+                FactRecord(
+                    fact_id="fact_global_gdp",
+                    entity_type="city",
+                    entity_name="上海",
+                    field_name="GDP总量",
+                    value_num=222.2,
+                    value_text="222.2",
+                    unit="亿元",
+                    year=2025,
+                    source_doc_id="doc_global",
+                    source_block_id="blk_global",
+                    source_span="上海GDP总量222.2亿元",
+                    confidence=0.99,
+                ),
+            ]
+        )
+        return stored_facts[0], stored_facts[1]
+
 
 def build_simple_template_xlsx(headers: list[str], rows: list[list[str]]) -> bytes:
     """在内存中构造最小可用 XLSX 模板。    Build a minimal usable XLSX template in memory."""
@@ -656,10 +947,186 @@ def build_simple_template_xlsx(headers: list[str], rows: list[list[str]]) -> byt
     return workbook_bytes.getvalue()
 
 
+def build_excel_compatible_template_xlsx(headers: list[str], rows: list[list[str]]) -> bytes:
+    """在内存中构造带有 Excel 常见命名空间声明的 XLSX 模板。    Build an XLSX template with Excel-style namespace declarations."""
+
+    shared_strings = list(headers)
+    header_cells = []
+    for column_index, _header in enumerate(headers, start=1):
+        column_letter = chr(ord("A") + column_index - 1)
+        header_cells.append(f'<c r="{column_letter}1" t="s"><v>{column_index - 1}</v></c>')
+
+    workbook_bytes = io.BytesIO()
+    with zipfile.ZipFile(workbook_bytes, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(
+            "[Content_Types].xml",
+            """<?xml version="1.0" encoding="UTF-8"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+  <Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+  <Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>
+  <Override PartName="/xl/sharedStrings.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"/>
+</Types>
+""",
+        )
+        archive.writestr(
+            "_rels/.rels",
+            """<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
+</Relationships>
+""",
+        )
+        archive.writestr(
+            "xl/workbook.xml",
+            """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+          xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <sheets>
+    <sheet name="Sheet1" sheetId="1" r:id="rId1"/>
+  </sheets>
+</workbook>
+""",
+        )
+        archive.writestr(
+            "xl/_rels/workbook.xml.rels",
+            """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+  <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings" Target="sharedStrings.xml"/>
+  <Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>
+</Relationships>
+""",
+        )
+        archive.writestr(
+            "xl/sharedStrings.xml",
+            f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="{len(shared_strings)}" uniqueCount="{len(shared_strings)}">
+  {''.join(f"<si><t>{escape(value)}</t></si>" for value in shared_strings)}
+</sst>
+""",
+        )
+        archive.writestr(
+            "xl/styles.xml",
+            """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <fonts count="1"><font><sz val="11"/><name val="等线"/></font></fonts>
+  <fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill></fills>
+  <borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>
+  <cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>
+  <cellXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/></cellXfs>
+</styleSheet>
+""",
+        )
+        archive.writestr(
+            "xl/worksheets/sheet1.xml",
+            f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+    xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+    mc:Ignorable="x14ac xr xr2 xr3"
+    xmlns:x14ac="http://schemas.microsoft.com/office/spreadsheetml/2009/9/ac"
+    xmlns:xr="http://schemas.microsoft.com/office/spreadsheetml/2014/revision"
+    xmlns:xr2="http://schemas.microsoft.com/office/spreadsheetml/2015/revision2"
+    xmlns:xr3="http://schemas.microsoft.com/office/spreadsheetml/2016/revision3"
+    xr:uid="{{00000000-0001-0000-0000-000000000000}}">
+  <dimension ref="A1:{chr(ord('A') + len(headers) - 1)}1"/>
+  <sheetViews><sheetView workbookViewId="0"/></sheetViews>
+  <sheetFormatPr defaultRowHeight="14" x14ac:dyDescent="0.3"/>
+  <sheetData>
+    <row r="1" spans="1:{len(headers)}" x14ac:dyDescent="0.3">{''.join(header_cells)}</row>
+  </sheetData>
+</worksheet>
+""",
+        )
+    return workbook_bytes.getvalue()
+
+
 def build_simple_template_docx(headers: list[str], rows: list[list[str]]) -> bytes:
     """在内存中构造最小 DOCX 表格模板。    Build a minimal DOCX table template in memory."""
 
     return build_simple_document_docx(table_rows=[headers, *rows])
+
+
+def build_word_compatible_template_docx(headers: list[str], rows: list[list[str]]) -> bytes:
+    """在内存中构造带有 Word 常见命名空间声明的 DOCX 表格模板。    Build a DOCX table template with Word-style namespace declarations."""
+
+    row_xml = []
+    for row in [headers, *rows]:
+        cells = "".join(
+            f"<w:tc><w:p><w:r><w:t>{escape(value)}</w:t></w:r></w:p></w:tc>"
+            for value in row
+        )
+        row_xml.append(f"<w:tr>{cells}</w:tr>")
+
+    document_xml = f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:wpc="http://schemas.microsoft.com/office/word/2010/wordprocessingCanvas"
+    xmlns:cx="http://schemas.microsoft.com/office/drawing/2014/chartex"
+    xmlns:cx1="http://schemas.microsoft.com/office/drawing/2015/9/8/chartex"
+    xmlns:cx2="http://schemas.microsoft.com/office/drawing/2015/10/21/chartex"
+    xmlns:cx3="http://schemas.microsoft.com/office/drawing/2016/5/9/chartex"
+    xmlns:cx4="http://schemas.microsoft.com/office/drawing/2016/5/10/chartex"
+    xmlns:cx5="http://schemas.microsoft.com/office/drawing/2016/5/11/chartex"
+    xmlns:cx6="http://schemas.microsoft.com/office/drawing/2016/5/12/chartex"
+    xmlns:cx7="http://schemas.microsoft.com/office/drawing/2016/5/13/chartex"
+    xmlns:cx8="http://schemas.microsoft.com/office/drawing/2016/5/14/chartex"
+    xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+    xmlns:aink="http://schemas.microsoft.com/office/drawing/2016/ink"
+    xmlns:am3d="http://schemas.microsoft.com/office/drawing/2017/model3d"
+    xmlns:o="urn:schemas-microsoft-com:office:office"
+    xmlns:oel="http://schemas.microsoft.com/office/2019/extlst"
+    xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+    xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math"
+    xmlns:v="urn:schemas-microsoft-com:vml"
+    xmlns:wp14="http://schemas.microsoft.com/office/word/2010/wordprocessingDrawing"
+    xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
+    xmlns:w10="urn:schemas-microsoft-com:office:word"
+    xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    xmlns:w14="http://schemas.microsoft.com/office/word/2010/wordml"
+    xmlns:w15="http://schemas.microsoft.com/office/word/2012/wordml"
+    xmlns:w16cex="http://schemas.microsoft.com/office/word/2018/wordml/cex"
+    xmlns:w16cid="http://schemas.microsoft.com/office/word/2016/wordml/cid"
+    xmlns:w16="http://schemas.microsoft.com/office/word/2018/wordml"
+    xmlns:w16du="http://schemas.microsoft.com/office/word/2023/wordml/word16du"
+    xmlns:w16sdtdh="http://schemas.microsoft.com/office/word/2020/wordml/sdtdatahash"
+    xmlns:w16sdtfl="http://schemas.microsoft.com/office/word/2024/wordml/sdtformatlock"
+    xmlns:w16se="http://schemas.microsoft.com/office/word/2015/wordml/symex"
+    xmlns:wpg="http://schemas.microsoft.com/office/word/2010/wordprocessingGroup"
+    xmlns:wpi="http://schemas.microsoft.com/office/word/2010/wordprocessingInk"
+    xmlns:wne="http://schemas.microsoft.com/office/word/2006/wordml"
+    xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape"
+    mc:Ignorable="w14 w15 w16se w16cid w16 w16cex w16sdtdh w16sdtfl w16du wp14">
+  <w:body>
+    <w:tbl>{''.join(row_xml)}</w:tbl>
+    <w:sectPr/>
+  </w:body>
+</w:document>
+"""
+
+    docx_bytes = io.BytesIO()
+    with zipfile.ZipFile(docx_bytes, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(
+            "[Content_Types].xml",
+            """<?xml version="1.0" encoding="UTF-8"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+</Types>
+""",
+        )
+        archive.writestr(
+            "_rels/.rels",
+            """<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
+</Relationships>
+""",
+        )
+        archive.writestr("word/document.xml", document_xml)
+    return docx_bytes.getvalue()
 
 
 def build_simple_document_docx(

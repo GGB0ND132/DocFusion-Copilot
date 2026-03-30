@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import shutil
 import zipfile
 from copy import deepcopy
 from dataclasses import dataclass
@@ -16,6 +17,9 @@ ET.register_namespace("w", W_NS)
 _DOCX_HEADING_RE = re.compile(
     r"^(?P<prefix>(?:[一二三四五六七八九十]+[、.．]|\d{1,2}(?:\.\d{1,2}){0,2}[、.．]))\s*(?P<title>\S.*)$"
 )
+_XML_DECLARATION_RE = re.compile(r"^\s*(<\?xml[^>]+\?>)")
+_DOCX_ROOT_TAG_RE = re.compile(r"<w:document\b[^>]*>")
+_XMLNS_DECLARATION_RE = re.compile(r'\sxmlns(?::(?P<prefix>[\w.-]+))?="(?P<uri>[^"]+)"')
 
 
 @dataclass(slots=True)
@@ -82,12 +86,17 @@ def apply_docx_updates(template_path: str | Path, output_path: str | Path, updat
     destination_file = Path(output_path)
     destination_file.parent.mkdir(parents=True, exist_ok=True)
 
+    if not updates:
+        shutil.copyfile(source_file, destination_file)
+        return
+
     grouped_updates: dict[int, list[WordCellWrite]] = {}
     for update in updates:
         grouped_updates.setdefault(update.table_index, []).append(update)
 
     with zipfile.ZipFile(source_file, "r") as source_archive:
-        root = ET.fromstring(source_archive.read("word/document.xml"))
+        original_document_payload = source_archive.read("word/document.xml")
+        root = ET.fromstring(original_document_payload)
         tables = root.findall(".//w:tbl", W)
 
         for table_index, table_updates in grouped_updates.items():
@@ -101,7 +110,7 @@ def apply_docx_updates(template_path: str | Path, output_path: str | Path, updat
                 cell_el = _get_or_create_table_cell(row_el, update.column_index)
                 _set_cell_text(cell_el, str(update.value))
 
-        document_payload = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+        document_payload = _serialize_docx_xml(root, original_document_payload)
         with zipfile.ZipFile(destination_file, "w", compression=zipfile.ZIP_DEFLATED) as destination_archive:
             for file_info in source_archive.infolist():
                 payload = (
@@ -120,7 +129,8 @@ def reformat_docx_document(source_path: str | Path, output_path: str | Path) -> 
     destination_file.parent.mkdir(parents=True, exist_ok=True)
 
     with zipfile.ZipFile(template_file, "r") as source_archive:
-        root = ET.fromstring(source_archive.read("word/document.xml"))
+        original_document_payload = source_archive.read("word/document.xml")
+        root = ET.fromstring(original_document_payload)
         for paragraph_el in root.findall(".//w:p", W):
             text = _text_from_element(paragraph_el).strip()
             if not text:
@@ -130,7 +140,7 @@ def reformat_docx_document(source_path: str | Path, output_path: str | Path) -> 
             if heading_level is not None:
                 _set_paragraph_style(paragraph_el, f"Heading{min(heading_level, 3)}")
 
-        document_payload = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+        document_payload = _serialize_docx_xml(root, original_document_payload)
         with zipfile.ZipFile(destination_file, "w", compression=zipfile.ZIP_DEFLATED) as destination_archive:
             for file_info in source_archive.infolist():
                 payload = (
@@ -154,7 +164,8 @@ def replace_text_in_docx_document(
 
     total_changes = 0
     with zipfile.ZipFile(template_file, "r") as source_archive:
-        root = ET.fromstring(source_archive.read("word/document.xml"))
+        original_document_payload = source_archive.read("word/document.xml")
+        root = ET.fromstring(original_document_payload)
         for paragraph_el in root.findall(".//w:p", W):
             text = _text_from_element(paragraph_el)
             if not text:
@@ -165,7 +176,11 @@ def replace_text_in_docx_document(
             _set_paragraph_text(paragraph_el, updated_text)
             total_changes += change_count
 
-        document_payload = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+        if total_changes <= 0:
+            shutil.copyfile(template_file, destination_file)
+            return 0
+
+        document_payload = _serialize_docx_xml(root, original_document_payload)
         with zipfile.ZipFile(destination_file, "w", compression=zipfile.ZIP_DEFLATED) as destination_archive:
             for file_info in source_archive.infolist():
                 payload = (
@@ -181,6 +196,50 @@ def _text_from_element(element: ET.Element) -> str:
     """提取 XML 元素中的可见文本。    Extract visible text from one XML element."""
 
     return "".join(node.text or "" for node in element.findall(".//w:t", W))
+
+
+def _serialize_docx_xml(root: ET.Element, original_payload: bytes) -> bytes:
+    """在保留 Word 根节点命名空间声明的前提下序列化 `document.xml`。
+    Serialize `document.xml` while preserving the original Word root namespace declarations.
+    """
+
+    original_text = original_payload.decode("utf-8")
+    original_declaration = _extract_xml_declaration(original_text)
+    root_tag = _extract_docx_root_tag(original_text)
+    if root_tag:
+        _register_namespaces_from_root_tag(root_tag)
+
+    serialized_text = ET.tostring(root, encoding="utf-8", xml_declaration=True).decode("utf-8")
+    if original_declaration:
+        serialized_text = _XML_DECLARATION_RE.sub(original_declaration, serialized_text, count=1)
+    if root_tag:
+        serialized_text = _DOCX_ROOT_TAG_RE.sub(root_tag, serialized_text, count=1)
+    return serialized_text.encode("utf-8")
+
+
+def _extract_xml_declaration(xml_text: str) -> str:
+    """提取原始 XML 声明头。    Extract the original XML declaration header."""
+
+    match = _XML_DECLARATION_RE.search(xml_text)
+    return match.group(1) if match else ""
+
+
+def _extract_docx_root_tag(xml_text: str) -> str:
+    """提取 `w:document` 根节点起始标签文本。    Extract the raw `w:document` root start tag."""
+
+    match = _DOCX_ROOT_TAG_RE.search(xml_text)
+    return match.group(0) if match else ""
+
+
+def _register_namespaces_from_root_tag(root_tag: str) -> None:
+    """把原始根节点上的命名空间前缀重新注册到 ElementTree。    Re-register root namespace prefixes from the original document tag."""
+
+    for match in _XMLNS_DECLARATION_RE.finditer(root_tag):
+        prefix = match.group("prefix") or ""
+        uri = match.group("uri")
+        if prefix == "xml":
+            continue
+        ET.register_namespace(prefix, uri)
 
 
 def _apply_replacements(text: str, replacements: list[tuple[str, str]]) -> tuple[str, int]:

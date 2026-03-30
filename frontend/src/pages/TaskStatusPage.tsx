@@ -5,6 +5,7 @@ import ErrorStateCard from '@/components/ErrorStateCard';
 import LoadingStateCard from '@/components/LoadingStateCard';
 import StatusBadge from '@/components/StatusBadge';
 import { getTaskStatus } from '@/services';
+import { getTaskTypeLabel } from '@/services/taskTypes';
 import { useUiStore } from '@/stores/uiStore';
 
 export default function TaskStatusPage() {
@@ -44,7 +45,7 @@ export default function TaskStatusPage() {
         id: task.task_id,
         name:
           String(task.result.output_file_name ?? task.result.file_name ?? task.result.template_name ?? task.task_id),
-        type: task.task_type === 'template_fill' ? '模板回填' : '文档解析',
+        type: getTaskTypeLabel(task.task_type),
         status: mapTaskStatus(task.status),
         progress: Math.round(task.progress * 100),
         updatedAt: formatTime(task.updated_at),

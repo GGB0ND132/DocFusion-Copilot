@@ -119,13 +119,6 @@ export default function UploadPage() {
 						>
 							清除缓存
 						</AppButton>
-						<AppButton
-							onClick={() => documentInputRef.current?.click()}
-							loading={isUploading}
-							loadingText="上传中..."
-						>
-							上传并启动解析
-						</AppButton>
 					</div>
 				</div>
 

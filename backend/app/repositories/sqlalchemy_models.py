@@ -82,6 +82,7 @@ class FactRow(Base):
 
     __table_args__ = (
         Index("ix_facts_lookup", "entity_name", "field_name", "year", "unit"),
+        Index("ix_facts_conflict_group_rank", "conflict_group_id", "status", "confidence", "source_doc_id"),
     )
 
 

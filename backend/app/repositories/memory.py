@@ -15,6 +15,7 @@ from app.models.domain import (
     TaskStatus,
     TemplateResultRecord,
 )
+from app.utils.fact_selection import select_scope_canonical_facts
 
 
 class InMemoryRepository:
@@ -172,10 +173,12 @@ class InMemoryRepository:
                 facts = [fact for fact in facts if fact.status == status]
             if min_confidence is not None:
                 facts = [fact for fact in facts if fact.confidence >= min_confidence]
-            if canonical_only:
+            if canonical_only and document_ids is None:
                 facts = [fact for fact in facts if fact.is_canonical]
             if document_ids is not None:
                 facts = [fact for fact in facts if fact.source_doc_id in document_ids]
+            if canonical_only and document_ids is not None:
+                facts = select_scope_canonical_facts(facts)
             return [replace(fact) for fact in facts]
 
     def get_fact(self, fact_id: str) -> FactRecord | None:

@@ -7,9 +7,24 @@ from app.core.catalog import CITY_NAMES, ENTITY_COLUMN_ALIASES, FIELD_ALIASES, F
 
 _BRACKET_TEXT_RE = re.compile(r"[（(].*?[)）]")
 _WHITESPACE_RE = re.compile(r"\s+")
-_NUMERIC_RE = re.compile(r"(?P<value>-?\d[\d,]*(?:\.\d+)?)\s*(?P<unit>万亿元|亿元|万元|元|万人|人|%)?")
+_NUMERIC_RE = re.compile(
+    r"(?P<value>-?\d[\d,]*(?:\.\d+)?)\s*(?P<unit>万份|份|万人|万余人|亿|万|人|亿元|万元|元|万例|例|%)?"
+)
 _YEAR_RE = re.compile(r"(?P<year>(?:19|20)\d{2})年")
-_CITY_WITH_SUFFIX_RE = re.compile(r"(?P<name>[\u4e00-\u9fff]{2,4})市")
+_CITY_WITH_SUFFIX_RE = re.compile(r"(?P<name>[\u4e00-\u9fff]{2,8})市")
+_REGION_WITH_SUFFIX_RE = re.compile(
+    r"(?P<name>(?:内蒙古|广西壮族|宁夏回族|新疆维吾尔|西藏|香港|澳门|[\u4e00-\u9fff]{2,12}))(?:自治区|特别行政区|省|市|兵团|地区|盟)"
+)
+
+_SPECIAL_REGION_NAMES: dict[str, str] = {
+    "广西壮族自治区": "广西",
+    "宁夏回族自治区": "宁夏",
+    "新疆维吾尔自治区": "新疆",
+    "西藏自治区": "西藏",
+    "内蒙古自治区": "内蒙古",
+    "香港特别行政区": "香港",
+    "澳门特别行政区": "澳门",
+}
 
 _FIELD_ALIAS_LOOKUP: dict[str, str] = {}
 for canonical_name, aliases in FIELD_ALIASES.items():
@@ -48,9 +63,19 @@ def is_entity_column(raw_value: str) -> bool:
 def normalize_entity_name(raw_value: str) -> str:
     """标准化实体名称，便于跨文档匹配。    Normalize entity text for cross-document matching."""
 
-    candidate = re.sub(r"[\s:：\-_/]+", "", raw_value or "")
-    if candidate.endswith("市") and len(candidate) > 2:
-        candidate = candidate[:-1]
+    candidate = re.sub(r"[\s:：,，、;；\-_/]+", "", raw_value or "")
+    if not candidate:
+        return ""
+    if candidate in _SPECIAL_REGION_NAMES:
+        return _SPECIAL_REGION_NAMES[candidate]
+    for raw_name, normalized_name in _SPECIAL_REGION_NAMES.items():
+        if candidate.endswith(raw_name):
+            return normalized_name
+    for suffix in ("特别行政区", "自治区", "兵团", "地区", "自治州", "盟"):
+        if candidate.endswith(suffix) and len(candidate) > len(suffix):
+            return candidate[: -len(suffix)]
+    if candidate.endswith(("省", "市")) and len(candidate) > 2:
+        return candidate[:-1]
     return candidate
 
 
@@ -68,9 +93,12 @@ def find_entity_mentions(text: str, extra_candidates: Iterable[str] | None = Non
             seen.add(normalized)
             candidates.append(normalized)
 
-    for city_name in CITY_NAMES:
-        if city_name in text or f"{city_name}市" in text:
-            _push(city_name)
+    for entity_name in CITY_NAMES:
+        if entity_name in text:
+            _push(entity_name)
+
+    for match in _REGION_WITH_SUFFIX_RE.finditer(text):
+        _push(match.group("name"))
 
     for match in _CITY_WITH_SUFFIX_RE.finditer(text):
         _push(match.group("name"))
@@ -78,7 +106,7 @@ def find_entity_mentions(text: str, extra_candidates: Iterable[str] | None = Non
     if extra_candidates:
         for candidate in extra_candidates:
             normalized = normalize_entity_name(candidate)
-            if normalized and (normalized in text or f"{normalized}市" in text):
+            if normalized and normalized in text:
                 _push(normalized)
 
     return candidates
@@ -98,7 +126,7 @@ def extract_numeric_with_unit(raw_value: str) -> tuple[float | None, str | None]
 
     if not raw_value:
         return None, None
-    match = _NUMERIC_RE.search(raw_value.replace("，", ","))
+    match = _NUMERIC_RE.search(raw_value.replace("，", "").replace(",", ""))
     if not match:
         return None, None
     number = float(match.group("value").replace(",", ""))
@@ -117,32 +145,47 @@ def convert_to_canonical_unit(
         return None, FIELD_CANONICAL_UNITS.get(field_name, unit)
 
     canonical_unit = FIELD_CANONICAL_UNITS.get(field_name, unit)
-    if not unit or not canonical_unit or unit == canonical_unit:
+    normalized_unit = (unit or "").strip()
+    if not normalized_unit or not canonical_unit or normalized_unit == canonical_unit:
         return value_num, canonical_unit
 
     if field_name in {"GDP总量", "一般公共预算收入"}:
-        if unit == "万亿元":
+        if normalized_unit == "万亿元":
             return value_num * 10000, "亿元"
-        if unit == "万元":
+        if normalized_unit == "万元":
             return value_num / 10000, "亿元"
-        if unit == "元":
+        if normalized_unit == "元":
             return value_num / 100000000, "亿元"
-        if unit == "亿元":
+        if normalized_unit == "亿元":
             return value_num, "亿元"
 
     if field_name == "常住人口":
-        if unit == "人":
-            return value_num / 10000, "万人"
-        if unit == "万人":
+        if normalized_unit == "亿":
+            return value_num * 10000, "万人"
+        if normalized_unit in {"万", "万人", "万余人"}:
             return value_num, "万人"
+        if normalized_unit == "人":
+            return value_num / 10000, "万人"
 
     if field_name in {"人均GDP", "合同金额"}:
-        if unit == "万元":
+        if normalized_unit in {"万", "万元"}:
             return value_num * 10000, "元"
-        if unit == "亿元":
+        if normalized_unit == "亿元":
             return value_num * 100000000, "元"
-        if unit == "元":
+        if normalized_unit == "元":
             return value_num, "元"
+
+    if field_name == "每日检测数":
+        if normalized_unit in {"万", "万份"}:
+            return value_num, "万份"
+        if normalized_unit == "份":
+            return value_num / 10000, "万份"
+
+    if field_name == "病例数":
+        if normalized_unit in {"万例", "万"}:
+            return value_num * 10000, "例"
+        if normalized_unit in {"例", ""}:
+            return value_num, "例"
 
     return value_num, canonical_unit
 

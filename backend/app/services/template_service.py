@@ -9,6 +9,7 @@ from app.core.config import Settings
 from app.core.openai_client import OpenAIClientError, OpenAICompatibleClient
 from app.models.domain import (
     DocumentRecord,
+    DocumentStatus,
     FilledCellRecord,
     TaskRecord,
     TaskStatus,
@@ -151,7 +152,7 @@ class TemplateService:
 
         facts = self._repository.list_facts(canonical_only=(fill_mode == "canonical"), document_ids=set(document_ids))
         fact_lookup = self._build_fact_lookup(facts)
-        unique_entities = list(dict.fromkeys(fact.entity_name for fact in facts if fact.entity_name))
+        unique_entities = self._build_entity_fill_order(document_ids, facts)
         resolved_output_file_name = output_file_name or f"{task_id}_{safe_filename(template_name)}"
         output_path = self._settings.outputs_dir / resolved_output_file_name
 
@@ -192,7 +193,7 @@ class TemplateService:
         """将显式文档列表或文档批次解析为具体文档 id 列表。
         Resolve an explicit document list or document batch into concrete document ids.
         """
-        parsed_documents = [document for document in self._repository.list_documents() if document.status == "parsed"]
+        parsed_documents = self._repository.list_documents(status=DocumentStatus.parsed)
         if document_ids:
             allowed_ids = {document.doc_id for document in parsed_documents}
             return [doc_id for doc_id in document_ids if doc_id in allowed_ids]
@@ -612,6 +613,40 @@ class TemplateService:
             fact_lookup.setdefault((fact.entity_name, fact.field_name), fact)
         return fact_lookup
 
+    def _entity_has_matching_fields(
+        self,
+        entity_name: str,
+        field_columns: list[tuple[int, str]],
+        fact_lookup: dict[tuple[str, str], object],
+    ) -> bool:
+        """判断实体是否至少能填充当前模板中的一个目标字段。    Return whether an entity can fill at least one requested field in the current template."""
+
+        return any((entity_name, field_name) in fact_lookup for _column_index, field_name in field_columns)
+
+    def _build_entity_fill_order(self, document_ids: list[str], facts: list[object]) -> list[str]:
+        """按文档与块出现顺序生成实体回填顺序。    Build the entity fill order based on document and block appearance order."""
+
+        block_order: dict[tuple[str, str], tuple[int, int, int]] = {}
+        for document_index, doc_id in enumerate(document_ids):
+            for block_index, block in enumerate(self._repository.list_blocks(doc_id)):
+                page_or_index = block.page_or_index if block.page_or_index is not None else block_index
+                block_order[(doc_id, block.block_id)] = (document_index, page_or_index, block_index)
+
+        entity_positions: dict[str, tuple[int, int, int, str]] = {}
+        for fact in facts:
+            if not fact.entity_name:
+                continue
+            position = block_order.get(
+                (fact.source_doc_id, fact.source_block_id),
+                (document_ids.index(fact.source_doc_id) if fact.source_doc_id in document_ids else len(document_ids), 10**9, 10**9),
+            )
+            ranked_position = (*position, fact.entity_name)
+            existing_position = entity_positions.get(fact.entity_name)
+            if existing_position is None or ranked_position < existing_position:
+                entity_positions[fact.entity_name] = ranked_position
+
+        return [entity_name for entity_name, _position in sorted(entity_positions.items(), key=lambda item: item[1])]
+
     def _fill_xlsx_template(
         self,
         *,
@@ -657,18 +692,27 @@ class TemplateService:
         document = load_docx_tables(template_path)
         updates: list[WordCellWrite] = []
         filled_cells: list[FilledCellRecord] = []
+        eligible_tables: list[tuple[WordTable, int, int, list[tuple[int, str]]]] = []
         for table in document.tables:
             header_row, entity_column, field_columns = self._detect_layout(table)
             if header_row is None or entity_column is None or not field_columns:
                 continue
-            table_updates, table_filled_cells = self._build_docx_table_updates(
+            eligible_tables.append((table, header_row, entity_column, field_columns))
+
+        remaining_entities = list(unique_entities)
+        for index, (table, header_row, entity_column, field_columns) in enumerate(eligible_tables):
+            table_updates, table_filled_cells, consumed_entities = self._build_docx_table_updates(
                 table=table,
                 header_row=header_row,
                 entity_column=entity_column,
                 field_columns=field_columns,
                 fact_lookup=fact_lookup,
-                unique_entities=unique_entities,
+                unique_entities=remaining_entities,
+                append_remaining_entities=index == len(eligible_tables) - 1,
             )
+            if consumed_entities:
+                consumed_set = set(consumed_entities)
+                remaining_entities = [entity for entity in remaining_entities if entity not in consumed_set]
             updates.extend(table_updates)
             filled_cells.extend(table_filled_cells)
         apply_docx_updates(template_path, output_path, updates)
@@ -765,9 +809,14 @@ class TemplateService:
             entity_value = row.values[entity_column - 1] if len(row.values) >= entity_column else ""
             normalized_entity = normalize_entity_name(entity_value) if entity_value else ""
             if not normalized_entity and entity_cursor < len(unique_entities):
-                normalized_entity = unique_entities[entity_cursor]
-                entity_cursor += 1
-                write_row(row.row_index, normalized_entity, True)
+                while entity_cursor < len(unique_entities):
+                    candidate_entity = unique_entities[entity_cursor]
+                    entity_cursor += 1
+                    if not self._entity_has_matching_fields(candidate_entity, field_columns, fact_lookup):
+                        continue
+                    normalized_entity = candidate_entity
+                    write_row(row.row_index, normalized_entity, True)
+                    break
             elif normalized_entity:
                 write_row(row.row_index, normalized_entity, False)
             if normalized_entity:
@@ -775,6 +824,8 @@ class TemplateService:
 
         for entity_name in unique_entities:
             if entity_name in assigned_entities:
+                continue
+            if not self._entity_has_matching_fields(entity_name, field_columns, fact_lookup):
                 continue
             write_row(next_row_index, entity_name, True)
             next_row_index += 1
@@ -790,13 +841,15 @@ class TemplateService:
         field_columns: list[tuple[int, str]],
         fact_lookup: dict[tuple[str, str], object],
         unique_entities: list[str],
-    ) -> tuple[list[WordCellWrite], list[FilledCellRecord]]:
+        append_remaining_entities: bool,
+    ) -> tuple[list[WordCellWrite], list[FilledCellRecord], list[str]]:
         """将事实结果转换为 Word 表格中的单元格写入。
         Convert facts into concrete DOCX table cell writes.
         """
         rows_after_header = [row for row in table.rows if row.row_index > header_row]
         updates: list[WordCellWrite] = []
         filled_cells: list[FilledCellRecord] = []
+        consumed_entities: list[str] = []
 
         assigned_entities: list[str] = []
         entity_cursor = 0
@@ -850,18 +903,29 @@ class TemplateService:
             entity_value = row.values[entity_column - 1] if len(row.values) >= entity_column else ""
             normalized_entity = normalize_entity_name(entity_value) if entity_value else ""
             if not normalized_entity and entity_cursor < len(unique_entities):
-                normalized_entity = unique_entities[entity_cursor]
-                entity_cursor += 1
-                write_row(row.row_index, normalized_entity, True)
+                while entity_cursor < len(unique_entities):
+                    candidate_entity = unique_entities[entity_cursor]
+                    entity_cursor += 1
+                    if not self._entity_has_matching_fields(candidate_entity, field_columns, fact_lookup):
+                        continue
+                    normalized_entity = candidate_entity
+                    write_row(row.row_index, normalized_entity, True)
+                    break
             elif normalized_entity:
                 write_row(row.row_index, normalized_entity, False)
             if normalized_entity:
                 assigned_entities.append(normalized_entity)
+                if normalized_entity in unique_entities and normalized_entity not in consumed_entities:
+                    consumed_entities.append(normalized_entity)
 
-        for entity_name in unique_entities:
-            if entity_name in assigned_entities:
-                continue
-            write_row(next_row_index, entity_name, True)
-            next_row_index += 1
+        if append_remaining_entities:
+            for entity_name in unique_entities:
+                if entity_name in assigned_entities:
+                    continue
+                if not self._entity_has_matching_fields(entity_name, field_columns, fact_lookup):
+                    continue
+                write_row(next_row_index, entity_name, True)
+                consumed_entities.append(entity_name)
+                next_row_index += 1
 
-        return updates, filled_cells
+        return updates, filled_cells, consumed_entities

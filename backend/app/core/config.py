@@ -81,6 +81,9 @@ class Settings:
     cors_allow_headers_raw: tuple[str, ...] = field(
         default_factory=lambda: _split_csv_env("DOCFUSION_CORS_ALLOW_HEADERS", ("*",))
     )
+    cors_expose_headers_raw: tuple[str, ...] = field(
+        default_factory=lambda: _split_csv_env("DOCFUSION_CORS_EXPOSE_HEADERS", ("Content-Disposition",))
+    )
     cors_allow_credentials: bool = field(
         default_factory=lambda: _env_flag("DOCFUSION_CORS_ALLOW_CREDENTIALS", default=False)
     )
@@ -161,6 +164,12 @@ class Settings:
         Return the request headers allowed for CORS requests.
         """
         return list(self.cors_allow_headers_raw)
+
+    @property
+    def cors_expose_headers(self) -> list[str]:
+        """杩斿洖鍏佽鍓嶇浠庤法鍩熷搷搴斾腑璇诲彇鐨勫搷搴斿ご鍒楄〃銆?        Return the response headers exposed to frontend code in CORS requests.
+        """
+        return list(self.cors_expose_headers_raw)
 
     def ensure_directories(self) -> None:
         """确保后端运行所需目录全部存在。
