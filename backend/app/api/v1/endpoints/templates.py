@@ -18,6 +18,7 @@ async def fill_template(
     fill_mode: str = Form(default="canonical"),
     document_ids: str | None = Form(default=None),
     auto_match: bool = Form(default=True),
+    user_requirement: str = Form(default=""),
 ) -> TemplateFillAcceptedResponse:
     """上传模板工作簿并加入回填任务队列。
     Upload a template workbook and queue a fill task.
@@ -35,6 +36,7 @@ async def fill_template(
             document_set_id=document_set_id,
             document_ids=parsed_document_ids or None,
             auto_match=auto_match,
+            user_requirement=user_requirement,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

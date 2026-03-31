@@ -52,6 +52,7 @@ class DocumentService:
         stored_name = f"{doc_id}_{safe_filename(file_name)}"
         stored_path = self._settings.uploads_dir / stored_name
         stored_path.write_bytes(content)
+        document_metadata = self._build_document_metadata(file_name, content, document_set_id)
 
         document = DocumentRecord(
             doc_id=doc_id,
@@ -60,7 +61,7 @@ class DocumentService:
             doc_type=suffix.lstrip("."),
             upload_time=datetime.now(timezone.utc),
             status=DocumentStatus.uploaded,
-            metadata={"document_set_id": document_set_id} if document_set_id else {},
+            metadata=document_metadata,
         )
         task = TaskRecord(
             task_id=new_id("task"),
@@ -138,6 +139,28 @@ class DocumentService:
             if document is None:
                 raise RuntimeError(f"Document {doc_id} disappeared during parsing.")
 
+            if self._should_skip_fact_extraction(document):
+                self._repository.update_document(
+                    doc_id,
+                    status=DocumentStatus.parsed,
+                    metadata_updates={
+                        "block_count": len(blocks),
+                        "fact_count": 0,
+                        "processing_note": "Prompt/instruction text detected, skipped fact extraction.",
+                    },
+                )
+                self._repository.update_task(
+                    task_id,
+                    status=TaskStatus.succeeded,
+                    progress=1.0,
+                    message="Instruction text parsed and excluded from fact extraction.",
+                    result_updates={
+                        "fact_count": 0,
+                        "skipped_fact_extraction": True,
+                    },
+                )
+                return
+
             facts = self._extraction_service.extract(document, blocks)
             stored_facts = self._repository.add_facts(facts)
             self._repository.update_document(
@@ -166,3 +189,54 @@ class DocumentService:
                 message="Document parsing failed.",
                 error=str(exc),
             )
+
+    def _build_document_metadata(
+        self,
+        file_name: str,
+        content: bytes,
+        document_set_id: str | None,
+    ) -> dict[str, object]:
+        """构建文档元数据并识别测试集中的提示词 TXT。
+        Build document metadata and detect prompt/instruction TXT files from the competition dataset.
+        """
+
+        metadata: dict[str, object] = {"document_set_id": document_set_id} if document_set_id else {}
+        if self._is_instruction_text(file_name, content):
+            metadata.update(
+                {
+                    "document_role": "prompt_instruction",
+                    "skip_fact_extraction": True,
+                }
+            )
+        else:
+            metadata.setdefault("document_role", "source_document")
+        return metadata
+
+    def _is_instruction_text(self, file_name: str, content: bytes) -> bool:
+        """判断 TXT 文件是否更像比赛附带的提示词说明，而不是事实来源文档。
+        Decide whether a TXT file looks like competition prompt instructions instead of a source document.
+        """
+
+        normalized_name = Path(file_name).name.lower()
+        if not normalized_name.endswith(".txt"):
+            return False
+        if normalized_name in {"readme.txt", "README.txt".lower()}:
+            return True
+
+        preview = content[:2048].decode("utf-8", errors="ignore").lower()
+        instruction_markers = [
+            "提示词",
+            "prompt",
+            "根据以下要求",
+            "请根据",
+            "输出要求",
+            "填报说明",
+        ]
+        return any(marker in preview for marker in instruction_markers) and "README" in file_name.upper()
+
+    def _should_skip_fact_extraction(self, document: DocumentRecord) -> bool:
+        """判断该文档是否应跳过事实抽取。
+        Return whether fact extraction should be skipped for this document.
+        """
+
+        return bool(document.metadata.get("skip_fact_extraction"))

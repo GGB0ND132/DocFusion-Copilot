@@ -50,6 +50,7 @@ async def execute(request: Request) -> AgentExecuteResponse:
             template_content=payload.get("template_content"),
             fill_mode=payload["fill_mode"],
             auto_match=payload["auto_match"],
+            user_requirement=str(payload.get("user_requirement", "")),
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -95,6 +96,7 @@ async def _parse_multipart_execute_request(request: Request) -> dict[str, object
         "auto_match": _parse_bool(form.get("auto_match"), default=True),
         "template_name": template_file.filename if template_file is not None else None,
         "template_content": template_content,
+        "user_requirement": str(form.get("user_requirement", "")).strip(),
     }
 
 

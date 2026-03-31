@@ -35,6 +35,9 @@ export async function runAgentExecute(payload: AgentExecuteRequest): Promise<Age
     }
     formData.append('fill_mode', payload.fillMode ?? 'canonical');
     formData.append('auto_match', String(payload.autoMatch ?? true));
+    if (payload.userRequirement) {
+      formData.append('user_requirement', payload.userRequirement);
+    }
     formData.append('template_file', payload.templateFile);
 
     return requestJson<AgentExecuteResponse>('/api/v1/agent/execute', {

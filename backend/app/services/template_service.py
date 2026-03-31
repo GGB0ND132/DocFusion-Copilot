@@ -9,6 +9,7 @@ from app.core.config import Settings
 from app.core.openai_client import OpenAIClientError, OpenAICompatibleClient
 from app.models.domain import (
     DocumentRecord,
+    FactRecord,
     FilledCellRecord,
     TaskRecord,
     TaskStatus,
@@ -22,9 +23,13 @@ from app.utils.ids import new_id
 from app.utils.normalizers import (
     find_entity_mentions,
     format_value,
+    is_date_column,
     is_entity_column,
     normalize_entity_name,
     normalize_field_name,
+    normalize_field_name_or_passthrough,
+    parse_date_range_from_text,
+    strip_header_adornments,
 )
 from app.utils.spreadsheet import CellWrite, SpreadsheetDocument, SpreadsheetSheet, apply_xlsx_updates, build_cell_ref, load_xlsx
 from app.utils.wordprocessing import WordCellWrite, WordDocument, WordTable, apply_docx_updates, load_docx_tables
@@ -84,6 +89,7 @@ class TemplateService:
         document_set_id: str | None = None,
         document_ids: list[str] | None = None,
         auto_match: bool = True,
+        user_requirement: str = "",
     ) -> TaskRecord:
         """保存模板上传内容并加入异步回填队列。
         Persist a template upload and enqueue asynchronous filling work.
@@ -104,6 +110,7 @@ class TemplateService:
                 "document_set_id": document_set_id,
                 "requested_document_ids": list(document_ids or []),
                 "auto_match": auto_match,
+                "user_requirement": user_requirement,
             },
         )
 
@@ -122,6 +129,7 @@ class TemplateService:
             document_set_id,
             list(document_ids or []),
             auto_match,
+            user_requirement,
         )
         return task
 
@@ -141,6 +149,7 @@ class TemplateService:
         document_ids: list[str],
         output_file_name: str | None = None,
         persist_result: bool = True,
+        user_requirement: str = "",
     ) -> TemplateResultRecord:
         """同步执行一次模板回填并返回结果。
         Execute one template fill synchronously and return the result.
@@ -149,7 +158,15 @@ class TemplateService:
         if suffix not in {".xlsx", ".docx"}:
             raise ValueError(f"Unsupported template type: {suffix}")
 
-        facts = self._repository.list_facts(canonical_only=(fill_mode == "canonical"), document_ids=set(document_ids))
+        facts = self._repository.list_facts(canonical_only=False, document_ids=set(document_ids))
+
+        # Parse user_requirement for date range filtering
+        date_from, date_to = parse_date_range_from_text(user_requirement) if user_requirement else (None, None)
+        if date_from or date_to:
+            facts = self._filter_facts_by_date(facts, date_from, date_to)
+
+        # Build row-oriented groups: each source block → one template row
+        row_groups = self._build_row_groups(facts)
         fact_lookup = self._build_fact_lookup(facts)
         unique_entities = list(dict.fromkeys(fact.entity_name for fact in facts if fact.entity_name))
         resolved_output_file_name = output_file_name or f"{task_id}_{safe_filename(template_name)}"
@@ -161,6 +178,7 @@ class TemplateService:
                 output_path=output_path,
                 fact_lookup=fact_lookup,
                 unique_entities=unique_entities,
+                row_groups=row_groups,
             )
         else:
             filled_cells = self._fill_docx_template(
@@ -168,6 +186,7 @@ class TemplateService:
                 output_path=output_path,
                 fact_lookup=fact_lookup,
                 unique_entities=unique_entities,
+                row_groups=row_groups,
             )
 
         result = TemplateResultRecord(
@@ -184,6 +203,50 @@ class TemplateService:
             self._repository.save_template_result(result)
         return result
 
+    @staticmethod
+    def _filter_facts_by_date(
+        facts: list[FactRecord],
+        date_from: str | None,
+        date_to: str | None,
+    ) -> list[FactRecord]:
+        """按日期范围过滤事实，只保留 metadata 中有 date 且在范围内的事实。
+        无 date metadata 的事实照常保留（如人口等静态字段）。"""
+        filtered: list[FactRecord] = []
+        for fact in facts:
+            fact_date = fact.metadata.get("date") if fact.metadata else None
+            if fact_date is None:
+                # Static fields without date — always keep
+                filtered.append(fact)
+                continue
+            if date_from and str(fact_date) < date_from:
+                continue
+            if date_to and str(fact_date) > date_to:
+                continue
+            filtered.append(fact)
+        return filtered
+
+    @staticmethod
+    def _build_row_groups(facts: list[FactRecord]) -> list[dict[str, FactRecord]]:
+        """将事实按 source_block_id 分组，每组代表源数据的一行。
+        Group facts by source_block_id, each group = one source row."""
+        from collections import defaultdict
+        groups: dict[str, dict[str, FactRecord]] = defaultdict(dict)
+        block_entity: dict[str, str] = {}
+        for fact in facts:
+            key = fact.source_block_id
+            groups[key][fact.field_name] = fact
+            if fact.entity_name:
+                block_entity[key] = fact.entity_name
+        # Return as list of {field_name: fact}, ordered by block_id for stability
+        result: list[dict[str, FactRecord]] = []
+        for block_id in sorted(groups.keys()):
+            group = groups[block_id]
+            # Attach entity_name from block to all facts in group
+            entity = block_entity.get(block_id, "")
+            group["__entity__"] = type("_EntityHolder", (), {"entity_name": entity})()  # type: ignore[arg-type]
+            result.append(group)
+        return result
+
     def resolve_document_ids(
         self,
         document_set_id: str | None,
@@ -192,7 +255,11 @@ class TemplateService:
         """将显式文档列表或文档批次解析为具体文档 id 列表。
         Resolve an explicit document list or document batch into concrete document ids.
         """
-        parsed_documents = [document for document in self._repository.list_documents() if document.status == "parsed"]
+        parsed_documents = [
+            document
+            for document in self._repository.list_documents()
+            if document.status == "parsed" and not bool(document.metadata.get("skip_fact_extraction"))
+        ]
         if document_ids:
             allowed_ids = {document.doc_id for document in parsed_documents}
             return [doc_id for doc_id in document_ids if doc_id in allowed_ids]
@@ -219,6 +286,7 @@ class TemplateService:
         document_set_id: str | None,
         document_ids: list[str],
         auto_match: bool,
+        user_requirement: str = "",
     ) -> None:
         """执行单个排队模板任务的文档匹配与回填流程。
         Execute the document-matching and fill pipeline for one queued template task.
@@ -252,6 +320,7 @@ class TemplateService:
                 document_ids=matched_document_ids,
                 output_file_name=f"{task_id}_{safe_filename(template_name)}",
                 persist_result=True,
+                user_requirement=user_requirement,
             )
             elapsed_seconds = round(perf_counter() - started_at, 4)
             self._repository.update_task(
@@ -535,7 +604,7 @@ class TemplateService:
         for sheet in document.sheets:
             for row in sheet.rows[:10]:
                 for value in row.values:
-                    field_name = normalize_field_name(value)
+                    field_name = normalize_field_name_or_passthrough(value)
                     if field_name:
                         field_names.add(field_name)
         return field_names
@@ -548,7 +617,7 @@ class TemplateService:
         for table in document.tables:
             for row in table.rows[:10]:
                 for value in row.values:
-                    field_name = normalize_field_name(value)
+                    field_name = normalize_field_name_or_passthrough(value)
                     if field_name:
                         field_names.add(field_name)
         return field_names
@@ -619,6 +688,7 @@ class TemplateService:
         output_path: Path,
         fact_lookup: dict[tuple[str, str], object],
         unique_entities: list[str],
+        row_groups: list[dict[str, object]] | None = None,
     ) -> list[FilledCellRecord]:
         """执行 XLSX 模板回填。
         Execute XLSX template filling.
@@ -626,8 +696,9 @@ class TemplateService:
         workbook = load_xlsx(template_path)
         updates: list[CellWrite] = []
         filled_cells: list[FilledCellRecord] = []
+        known_field_names = {key[1] for key in fact_lookup}
         for sheet in workbook.sheets:
-            header_row, entity_column, field_columns = self._detect_layout(sheet)
+            header_row, entity_column, field_columns = self._detect_layout(sheet, known_field_names)
             if header_row is None or entity_column is None or not field_columns:
                 continue
             sheet_updates, sheet_filled_cells = self._build_sheet_updates(
@@ -637,6 +708,7 @@ class TemplateService:
                 field_columns=field_columns,
                 fact_lookup=fact_lookup,
                 unique_entities=unique_entities,
+                row_groups=row_groups,
             )
             updates.extend(sheet_updates)
             filled_cells.extend(sheet_filled_cells)
@@ -650,6 +722,7 @@ class TemplateService:
         output_path: Path,
         fact_lookup: dict[tuple[str, str], object],
         unique_entities: list[str],
+        row_groups: list[dict[str, object]] | None = None,
     ) -> list[FilledCellRecord]:
         """执行 DOCX 表格模板回填。
         Execute DOCX table-template filling.
@@ -657,8 +730,9 @@ class TemplateService:
         document = load_docx_tables(template_path)
         updates: list[WordCellWrite] = []
         filled_cells: list[FilledCellRecord] = []
+        known_field_names = {key[1] for key in fact_lookup}
         for table in document.tables:
-            header_row, entity_column, field_columns = self._detect_layout(table)
+            header_row, entity_column, field_columns = self._detect_layout(table, known_field_names)
             if header_row is None or entity_column is None or not field_columns:
                 continue
             table_updates, table_filled_cells = self._build_docx_table_updates(
@@ -668,16 +742,22 @@ class TemplateService:
                 field_columns=field_columns,
                 fact_lookup=fact_lookup,
                 unique_entities=unique_entities,
+                row_groups=row_groups,
             )
             updates.extend(table_updates)
             filled_cells.extend(table_filled_cells)
         apply_docx_updates(template_path, output_path, updates)
         return filled_cells
 
-    def _detect_layout(self, sheet: SpreadsheetSheet | WordTable) -> tuple[int | None, int | None, list[tuple[int, str]]]:
+    def _detect_layout(
+        self,
+        sheet: SpreadsheetSheet | WordTable,
+        known_field_names: set[str] | None = None,
+    ) -> tuple[int | None, int | None, list[tuple[int, str]]]:
         """推断表格的表头行、实体列和目标字段列。
         Infer the header row, entity column and target field columns of a table.
         """
+        known = known_field_names or set()
         best_row_index: int | None = None
         best_score = -1
         best_fields: list[tuple[int, str]] = []
@@ -695,6 +775,21 @@ class TemplateService:
                 if field_name:
                     field_columns.append((column_index, field_name))
                     score += 2
+                    continue
+                # Dynamic: match stripped header against known fact field names
+                stripped = strip_header_adornments(raw_value)
+                if stripped and stripped in known:
+                    field_columns.append((column_index, stripped))
+                    score += 2
+                    continue
+                # Fuzzy: case-insensitive match
+                if stripped:
+                    stripped_lower = stripped.lower()
+                    for kf in known:
+                        if kf.lower() == stripped_lower:
+                            field_columns.append((column_index, kf))
+                            score += 2
+                            break
             if score > best_score and field_columns:
                 best_row_index = row.row_index
                 best_score = score
@@ -712,6 +807,7 @@ class TemplateService:
         field_columns: list[tuple[int, str]],
         fact_lookup: dict[tuple[str, str], object],
         unique_entities: list[str],
+        row_groups: list[dict[str, object]] | None = None,
     ) -> tuple[list[CellWrite], list[FilledCellRecord]]:
         """将事实结果转换为单个工作表的具体单元格写入操作。
         Convert facts into concrete cell writes for one worksheet.
@@ -719,47 +815,52 @@ class TemplateService:
         rows_after_header = [row for row in sheet.rows if row.row_index > header_row]
         updates: list[CellWrite] = []
         filled_cells: list[FilledCellRecord] = []
-
-        assigned_entities: list[str] = []
-        entity_cursor = 0
         next_row_index = max([header_row, *(row.row_index for row in rows_after_header)], default=header_row) + 1
 
-        def write_row(row_index: int, entity_name: str, write_entity_cell: bool) -> None:
-            """为目标工作表中的一个实体行追加单元格写入操作。
-            Append cell writes for one entity row in the target worksheet.
-            """
+        def _format_cell(fact: object) -> str | float | int:
+            value = fact.value_num if fact.value_num is not None else fact.value_text
+            if isinstance(value, float) and not value.is_integer():
+                return float(format_value(value))
+            elif isinstance(value, float):
+                return int(value)
+            return value
+
+        def write_row(row_index: int, entity_name: str, row_fact_map: dict[str, object] | None, write_entity_cell: bool) -> None:
             if write_entity_cell:
-                updates.append(
-                    CellWrite(
-                        sheet_name=sheet.name,
-                        cell_ref=build_cell_ref(row_index, entity_column),
-                        value=entity_name,
-                    )
-                )
+                updates.append(CellWrite(sheet_name=sheet.name, cell_ref=build_cell_ref(row_index, entity_column), value=entity_name))
             for column_index, field_name in field_columns:
-                fact = fact_lookup.get((entity_name, field_name))
+                fact = None
+                if row_fact_map:
+                    fact = row_fact_map.get(field_name)
+                if fact is None:
+                    fact = fact_lookup.get((entity_name, field_name))
                 if fact is None:
                     continue
-                value = fact.value_num if fact.value_num is not None else fact.value_text
-                if isinstance(value, float) and not value.is_integer():
-                    cell_value: str | float = float(format_value(value))
-                elif isinstance(value, float):
-                    cell_value = int(value)
-                else:
-                    cell_value = value
+                cell_value = _format_cell(fact)
                 cell_ref = build_cell_ref(row_index, column_index)
                 updates.append(CellWrite(sheet_name=sheet.name, cell_ref=cell_ref, value=cell_value))
-                filled_cells.append(
-                    FilledCellRecord(
-                        sheet_name=sheet.name,
-                        cell_ref=cell_ref,
-                        entity_name=entity_name,
-                        field_name=field_name,
-                        value=cell_value,
-                        fact_id=fact.fact_id,
-                        confidence=fact.confidence,
-                    )
-                )
+                filled_cells.append(FilledCellRecord(
+                    sheet_name=sheet.name, cell_ref=cell_ref, entity_name=entity_name,
+                    field_name=field_name, value=cell_value, fact_id=fact.fact_id, confidence=fact.confidence,
+                ))
+
+        # If we have row_groups (multi-row data like COVID-19), use them for empty templates
+        if row_groups and not rows_after_header:
+            field_name_set = {fn for _, fn in field_columns}
+            for group in row_groups:
+                entity_holder = group.get("__entity__")
+                entity_name = getattr(entity_holder, "entity_name", "") if entity_holder else ""
+                # Check if this group has any matching fields
+                has_match = any(fn in group for fn in field_name_set)
+                if not has_match:
+                    continue
+                write_row(next_row_index, entity_name, group, True)
+                next_row_index += 1
+            return updates, filled_cells
+
+        # Standard flow: fill existing rows then append unassigned entities
+        assigned_entities: list[str] = []
+        entity_cursor = 0
 
         for row in rows_after_header:
             entity_value = row.values[entity_column - 1] if len(row.values) >= entity_column else ""
@@ -767,16 +868,16 @@ class TemplateService:
             if not normalized_entity and entity_cursor < len(unique_entities):
                 normalized_entity = unique_entities[entity_cursor]
                 entity_cursor += 1
-                write_row(row.row_index, normalized_entity, True)
+                write_row(row.row_index, normalized_entity, None, True)
             elif normalized_entity:
-                write_row(row.row_index, normalized_entity, False)
+                write_row(row.row_index, normalized_entity, None, False)
             if normalized_entity:
                 assigned_entities.append(normalized_entity)
 
         for entity_name in unique_entities:
             if entity_name in assigned_entities:
                 continue
-            write_row(next_row_index, entity_name, True)
+            write_row(next_row_index, entity_name, None, True)
             next_row_index += 1
 
         return updates, filled_cells
@@ -790,6 +891,7 @@ class TemplateService:
         field_columns: list[tuple[int, str]],
         fact_lookup: dict[tuple[str, str], object],
         unique_entities: list[str],
+        row_groups: list[dict[str, object]] | None = None,
     ) -> tuple[list[WordCellWrite], list[FilledCellRecord]]:
         """将事实结果转换为 Word 表格中的单元格写入。
         Convert facts into concrete DOCX table cell writes.
@@ -797,54 +899,37 @@ class TemplateService:
         rows_after_header = [row for row in table.rows if row.row_index > header_row]
         updates: list[WordCellWrite] = []
         filled_cells: list[FilledCellRecord] = []
-
-        assigned_entities: list[str] = []
-        entity_cursor = 0
         next_row_index = max([header_row, *(row.row_index for row in rows_after_header)], default=header_row) + 1
 
-        def write_row(row_index: int, entity_name: str, write_entity_cell: bool) -> None:
-            """向 Word 表格中的一行写入实体与字段值。
-            Write one entity row into a DOCX table.
-            """
+        def _format_cell(fact: object) -> str | float | int:
+            value = fact.value_num if fact.value_num is not None else fact.value_text
+            if isinstance(value, float) and not value.is_integer():
+                return float(format_value(value))
+            elif isinstance(value, float):
+                return int(value)
+            return value
+
+        def write_row(row_index: int, entity_name: str, row_fact_map: dict[str, object] | None, write_entity_cell: bool) -> None:
             if write_entity_cell:
-                updates.append(
-                    WordCellWrite(
-                        table_index=table.table_index,
-                        row_index=row_index,
-                        column_index=entity_column,
-                        value=entity_name,
-                    )
-                )
+                updates.append(WordCellWrite(table_index=table.table_index, row_index=row_index, column_index=entity_column, value=entity_name))
             for column_index, field_name in field_columns:
-                fact = fact_lookup.get((entity_name, field_name))
+                fact = None
+                if row_fact_map:
+                    fact = row_fact_map.get(field_name)
+                if fact is None:
+                    fact = fact_lookup.get((entity_name, field_name))
                 if fact is None:
                     continue
-                value = fact.value_num if fact.value_num is not None else fact.value_text
-                if isinstance(value, float) and not value.is_integer():
-                    cell_value: str | float = float(format_value(value))
-                elif isinstance(value, float):
-                    cell_value = int(value)
-                else:
-                    cell_value = value
-                updates.append(
-                    WordCellWrite(
-                        table_index=table.table_index,
-                        row_index=row_index,
-                        column_index=column_index,
-                        value=cell_value,
-                    )
-                )
-                filled_cells.append(
-                    FilledCellRecord(
-                        sheet_name=table.name,
-                        cell_ref=f"R{row_index}C{column_index}",
-                        entity_name=entity_name,
-                        field_name=field_name,
-                        value=cell_value,
-                        fact_id=fact.fact_id,
-                        confidence=fact.confidence,
-                    )
-                )
+                cell_value = _format_cell(fact)
+                updates.append(WordCellWrite(table_index=table.table_index, row_index=row_index, column_index=column_index, value=cell_value))
+                filled_cells.append(FilledCellRecord(
+                    sheet_name=table.name, cell_ref=f"R{row_index}C{column_index}", entity_name=entity_name,
+                    field_name=field_name, value=cell_value, fact_id=fact.fact_id, confidence=fact.confidence,
+                ))
+
+        # Standard flow: fill existing rows then append unassigned entities
+        assigned_entities: list[str] = []
+        entity_cursor = 0
 
         for row in rows_after_header:
             entity_value = row.values[entity_column - 1] if len(row.values) >= entity_column else ""
@@ -852,16 +937,16 @@ class TemplateService:
             if not normalized_entity and entity_cursor < len(unique_entities):
                 normalized_entity = unique_entities[entity_cursor]
                 entity_cursor += 1
-                write_row(row.row_index, normalized_entity, True)
+                write_row(row.row_index, normalized_entity, None, True)
             elif normalized_entity:
-                write_row(row.row_index, normalized_entity, False)
+                write_row(row.row_index, normalized_entity, None, False)
             if normalized_entity:
                 assigned_entities.append(normalized_entity)
 
         for entity_name in unique_entities:
             if entity_name in assigned_entities:
                 continue
-            write_row(next_row_index, entity_name, True)
+            write_row(next_row_index, entity_name, None, True)
             next_row_index += 1
 
         return updates, filled_cells

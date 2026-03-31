@@ -349,9 +349,17 @@ class PostgresRepository:
                 FactRow.entity_type == entity_type,
                 FactRow.entity_name == entity_name,
                 FactRow.field_name == field_name,
-                FactRow.year == year,
-                FactRow.unit == unit,
-            ).order_by(FactRow.confidence.desc(), FactRow.value_num.is_not(None).desc(), FactRow.source_doc_id.desc())
+            )
+            # NULL-safe comparisons: SQL requires IS NULL instead of = NULL
+            if year is None:
+                stmt = stmt.where(FactRow.year.is_(None))
+            else:
+                stmt = stmt.where(FactRow.year == year)
+            if unit is None:
+                stmt = stmt.where(FactRow.unit.is_(None))
+            else:
+                stmt = stmt.where(FactRow.unit == unit)
+            stmt = stmt.order_by(FactRow.confidence.desc(), FactRow.value_num.is_not(None).desc(), FactRow.source_doc_id.desc())
             rows = list(session.scalars(stmt).all())
             for row in rows:
                 row.is_canonical = False

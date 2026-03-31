@@ -145,6 +145,7 @@ export interface AgentExecuteRequest {
   fillMode?: string;
   autoMatch?: boolean;
   templateFile?: File | null;
+  userRequirement?: string;
 }
 
 export interface AgentExecutionArtifactResponse {
@@ -215,6 +216,7 @@ export interface TemplateFillRequest {
   fillMode?: string;
   documentIds?: string[];
   autoMatch?: boolean;
+  userRequirement?: string;
 }
 
 export interface DownloadFileResult {

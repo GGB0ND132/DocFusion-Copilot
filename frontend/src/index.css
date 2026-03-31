@@ -2,17 +2,38 @@
 @tailwind components;
 @tailwind utilities;
 
-:root {
-  color: #102a43;
-  background: #fbf7f1;
-  font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+@layer base {
+  :root {
+    --background: 40 33% 97%;
+    --foreground: 210 40% 16%;
+    --card: 0 0% 100%;
+    --card-foreground: 210 40% 16%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 210 40% 16%;
+    --primary: 174 72% 26%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 40 24% 92%;
+    --secondary-foreground: 210 40% 16%;
+    --muted: 40 20% 94%;
+    --muted-foreground: 210 8% 46%;
+    --accent: 36 90% 44%;
+    --accent-foreground: 0 0% 100%;
+    --destructive: 0 72% 51%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 40 12% 88%;
+    --input: 40 12% 88%;
+    --ring: 174 72% 26%;
+    --radius: 0.5rem;
+    color: hsl(var(--foreground));
+    background: hsl(var(--background));
+    font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  }
 }
 
 body {
   margin: 0;
   min-width: 320px;
   min-height: 100vh;
-  background-image: radial-gradient(circle at top left, rgba(217, 119, 6, 0.16), transparent 28%), radial-gradient(circle at bottom right, rgba(15, 118, 110, 0.18), transparent 24%), linear-gradient(135deg, #fbf7f1 0%, #eef5f3 48%, #f7efe4 100%);
 }
 
 #root {
@@ -21,6 +42,7 @@ body {
 
 * {
   box-sizing: border-box;
+  border-color: hsl(var(--border));
 }
 
 button,
@@ -28,9 +50,4 @@ input,
 textarea,
 select {
   font: inherit;
-}
-
-.glass-panel {
-  background: rgba(255, 255, 255, 0.72);
-  backdrop-filter: blur(14px);
 }

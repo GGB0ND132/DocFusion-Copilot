@@ -1,35 +1,52 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
-from typing import Any
-from urllib import error, request
+import logging
+from dataclasses import dataclass, field
+from typing import Any, TypeVar
+
+from openai import OpenAI, APIError, APIConnectionError, APITimeoutError
+from pydantic import BaseModel
+
+logger = logging.getLogger(__name__)
+T = TypeVar("T", bound=BaseModel)
 
 
 class OpenAIClientError(RuntimeError):
-    """OpenAI 兼容接口调用异常。
-    Error raised for OpenAI-compatible API failures.
-    """
+    """OpenAI 兼容接口调用异常。"""
 
 
 @dataclass(slots=True)
 class OpenAICompatibleClient:
-    """OpenAI 兼容聊天接口客户端模板。
-    Template client for OpenAI-compatible chat APIs.
-    """
+    """OpenAI 兼容聊天接口客户端，集成 instructor 结构化输出。"""
 
     api_key: str
     base_url: str
     model: str
     timeout_seconds: float = 45.0
+    embedding_model: str = ""
+    _raw_client: Any = field(init=False, repr=False, default=None)
+    _instructor_client: Any = field(init=False, repr=False, default=None)
+
+    def __post_init__(self) -> None:
+        if self.is_configured:
+            self._raw_client = OpenAI(
+                api_key=self.api_key,
+                base_url=self.base_url.rstrip("/"),
+                timeout=self.timeout_seconds,
+            )
+            try:
+                import instructor
+                self._instructor_client = instructor.from_openai(self._raw_client)
+            except Exception:
+                logger.warning("instructor patch failed, structured completions unavailable")
+                self._instructor_client = None
 
     @property
     def is_configured(self) -> bool:
-        """返回当前客户端是否已具备可用配置。
-        Return whether the client has enough configuration to run requests.
-        """
         return bool(self.api_key and self.base_url and self.model)
 
+    # ── backward-compatible JSON completion ──
     def create_json_completion(
         self,
         *,
@@ -38,75 +55,66 @@ class OpenAICompatibleClient:
         json_schema: dict[str, Any] | None = None,
         temperature: float = 0.0,
     ) -> dict[str, Any]:
-        """调用 OpenAI 兼容接口并返回 JSON 结果。
-        Call an OpenAI-compatible API and return a JSON result.
-        """
-        if not self.is_configured:
-            raise OpenAIClientError(
-                "OpenAI-compatible client is not configured. "
-                "Fill DOCFUSION_OPENAI_API_KEY / DOCFUSION_OPENAI_BASE_URL / DOCFUSION_OPENAI_MODEL first."
-            )
-
-        payload: dict[str, Any] = {
-            "model": self.model,
-            "temperature": temperature,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-        }
-        if json_schema is not None:
-            payload["response_format"] = {
-                "type": "json_schema",
-                "json_schema": {
-                    "name": "docfusion_response",
-                    "schema": json_schema,
-                },
+        if not self.is_configured or self._raw_client is None:
+            raise OpenAIClientError("OpenAI client is not configured.")
+        try:
+            kwargs: dict[str, Any] = {
+                "model": self.model,
+                "temperature": temperature,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
             }
-
-        raw_response = self._post_json("/chat/completions", payload)
-        content = self._extract_message_content(raw_response)
-        try:
+            if json_schema is not None:
+                kwargs["response_format"] = {
+                    "type": "json_schema",
+                    "json_schema": {"name": "docfusion_response", "schema": json_schema},
+                }
+            response = self._raw_client.chat.completions.create(**kwargs)
+            content = response.choices[0].message.content or ""
             return json.loads(content)
+        except (APIError, APIConnectionError, APITimeoutError) as exc:
+            raise OpenAIClientError(f"OpenAI API error: {exc}") from exc
         except json.JSONDecodeError as exc:
-            raise OpenAIClientError(f"OpenAI-compatible API did not return valid JSON: {content}") from exc
+            raise OpenAIClientError(f"Invalid JSON from API: {exc}") from exc
 
-    def _post_json(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
-        """向 OpenAI 兼容接口发送 JSON POST 请求。
-        Send a JSON POST request to an OpenAI-compatible API.
-        """
-        url = self.base_url.rstrip("/") + path
-        body = json.dumps(payload).encode("utf-8")
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-        }
-        req = request.Request(url, data=body, headers=headers, method="POST")
+    # ── NEW: instructor structured completion ──
+    def create_structured_completion(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        response_model: type[T],
+        temperature: float = 0.0,
+        max_retries: int = 2,
+    ) -> T:
+        if not self.is_configured:
+            raise OpenAIClientError("OpenAI client is not configured.")
+        if self._instructor_client is None:
+            raise OpenAIClientError("instructor client is not available.")
         try:
-            with request.urlopen(req, timeout=self.timeout_seconds) as response:
-                return json.loads(response.read().decode("utf-8"))
-        except error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")
-            raise OpenAIClientError(f"OpenAI-compatible API HTTP {exc.code}: {detail}") from exc
-        except error.URLError as exc:
-            raise OpenAIClientError(f"OpenAI-compatible API connection failed: {exc}") from exc
+            return self._instructor_client.chat.completions.create(
+                model=self.model,
+                temperature=temperature,
+                max_retries=max_retries,
+                response_model=response_model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+            )
+        except (APIError, APIConnectionError, APITimeoutError) as exc:
+            raise OpenAIClientError(f"OpenAI API error: {exc}") from exc
 
-    @staticmethod
-    def _extract_message_content(payload: dict[str, Any]) -> str:
-        """从聊天补全响应中提取首个消息文本。
-        Extract the first message content from a chat-completions payload.
-        """
+    # ── NEW: embeddings ──
+    def create_embedding(self, text: str) -> list[float]:
+        if not self.is_configured or self._raw_client is None:
+            raise OpenAIClientError("OpenAI client is not configured.")
+        model = self.embedding_model or self.model
         try:
-            content = payload["choices"][0]["message"]["content"]
-        except (KeyError, IndexError, TypeError) as exc:
-            raise OpenAIClientError(f"Unexpected OpenAI-compatible API response: {payload}") from exc
-
-        if isinstance(content, str):
-            return content
-        if isinstance(content, list):
-            parts: list[str] = []
-            for item in content:
-                if isinstance(item, dict) and item.get("type") == "text":
-                    parts.append(str(item.get("text", "")))
-            return "".join(parts)
-        return str(content)
+            response = self._raw_client.embeddings.create(model=model, input=[text])
+            return response.data[0].embedding
+        except Exception as exc:
+            logger.warning("Embedding API failed (%s), returning zero vector", exc)
+            return [0.0] * 1536

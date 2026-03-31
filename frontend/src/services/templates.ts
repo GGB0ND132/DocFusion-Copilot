@@ -12,6 +12,10 @@ export async function submitTemplateFill(payload: TemplateFillRequest): Promise<
     formData.append('document_ids', payload.documentIds.join(','));
   }
 
+  if (payload.userRequirement) {
+    formData.append('user_requirement', payload.userRequirement);
+  }
+
   return requestJson<TemplateFillAcceptedResponse>('/api/v1/templates/fill', {
     method: 'POST',
     body: formData,

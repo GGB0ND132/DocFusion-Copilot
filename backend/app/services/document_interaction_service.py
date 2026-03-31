@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 
@@ -49,6 +50,7 @@ class DocumentInteractionService:
         template_content: bytes | None = None,
         fill_mode: str = "canonical",
         auto_match: bool = True,
+        user_requirement: str = "",
     ) -> dict[str, object]:
         """执行自然语言描述的文档操作。    Execute a document operation described in natural language."""
 
@@ -65,6 +67,7 @@ class DocumentInteractionService:
                 document_ids=document_ids or None,
                 fill_mode=fill_mode,
                 auto_match=auto_match,
+                user_requirement=user_requirement,
             )
         elif intent in {"extract_facts", "query_facts"}:
             execution = self._query_facts(plan, resolved_document_ids)
@@ -110,7 +113,12 @@ class DocumentInteractionService:
         """解析需要操作的文档 id 列表。    Resolve the list of document ids targeted by the operation."""
 
         if explicit_document_ids:
-            return explicit_document_ids
+            return [
+                doc_id
+                for doc_id in explicit_document_ids
+                if (document := self._repository.get_document(doc_id)) is not None
+                and not bool(document.metadata.get("skip_fact_extraction"))
+            ]
         return self._template_service.resolve_document_ids(document_set_id, None)
 
     def _queue_template_fill(
@@ -123,6 +131,7 @@ class DocumentInteractionService:
         document_ids: list[str] | None,
         fill_mode: str,
         auto_match: bool,
+        user_requirement: str = "",
     ) -> dict[str, object]:
         """通过自然语言入口提交模板回填任务。    Queue a template fill task through the natural-language execution entry."""
 
@@ -136,6 +145,7 @@ class DocumentInteractionService:
             document_set_id=document_set_id,
             document_ids=document_ids,
             auto_match=auto_match,
+            user_requirement=user_requirement,
         )
         requested_document_ids = self._resolve_document_ids(document_ids, document_set_id) if not document_ids else document_ids
         summary = (
@@ -181,11 +191,36 @@ class DocumentInteractionService:
         deduplicated: dict[str, FactRecord] = {fact.fact_id: fact for fact in matched_facts}
         facts = list(deduplicated.values())
         summary = f"Matched {len(facts)} facts from {len(document_ids)} parsed documents."
+        artifacts: list[dict[str, object]] = []
+        if facts:
+            artifact_name = "facts_query_result.json"
+            output_path = self._settings.outputs_dir / artifact_name
+            fact_dicts = [
+                {
+                    "fact_id": f.fact_id,
+                    "entity_name": f.entity_name,
+                    "field_name": f.field_name,
+                    "value_num": f.value_num,
+                    "value_text": f.value_text,
+                    "unit": f.unit,
+                    "year": f.year,
+                    "confidence": f.confidence,
+                }
+                for f in facts
+            ]
+            output_path.write_text(json.dumps(fact_dicts, ensure_ascii=False, indent=2), encoding="utf-8")
+            artifacts.append({
+                "doc_id": "",
+                "operation": "query_facts",
+                "file_name": artifact_name,
+                "output_path": str(output_path),
+                "change_count": len(facts),
+            })
         return {
             "execution_type": "fact_query",
             "summary": summary,
             "facts": facts,
-            "artifacts": [],
+            "artifacts": artifacts,
             "document_ids": document_ids,
         }
 
@@ -213,7 +248,11 @@ class DocumentInteractionService:
         total_changes = 0
         for doc_id in document_ids:
             document = self._repository.get_document(doc_id)
-            if document is None or document.doc_type not in {"docx", "md", "txt"}:
+            if (
+                document is None
+                or document.doc_type not in {"docx", "md", "txt"}
+                or bool(document.metadata.get("skip_fact_extraction"))
+            ):
                 continue
 
             source_path = Path(document.stored_path)
@@ -250,6 +289,12 @@ class DocumentInteractionService:
     def _summarize_documents(self, plan: dict[str, object], document_ids: list[str]) -> dict[str, object]:
         """汇总文档块和事实，生成摘要。    Summarize document blocks and facts into a compact document summary."""
 
+        document_ids = [
+            doc_id
+            for doc_id in document_ids
+            if (document := self._repository.get_document(doc_id)) is not None
+            and not bool(document.metadata.get("skip_fact_extraction"))
+        ]
         blocks: list[DocumentBlock] = []
         facts = self._repository.list_facts(canonical_only=True, document_ids=set(document_ids))
         for doc_id in document_ids:
@@ -263,11 +308,22 @@ class DocumentInteractionService:
         else:
             summary = self._fallback_summary(blocks, facts, document_ids)
 
+        artifacts: list[dict[str, object]] = []
+        artifact_name = f"summary_{document_ids[0] if document_ids else 'all'}.md"
+        output_path = self._settings.outputs_dir / artifact_name
+        output_path.write_text(f"# 文档摘要\n\n{summary}\n", encoding="utf-8")
+        artifacts.append({
+            "doc_id": document_ids[0] if document_ids else "",
+            "operation": "summarize_document",
+            "file_name": artifact_name,
+            "output_path": str(output_path),
+            "change_count": None,
+        })
         return {
             "execution_type": "summary",
             "summary": summary,
             "facts": facts[:20],
-            "artifacts": [],
+            "artifacts": artifacts,
             "document_ids": document_ids,
         }
 
@@ -277,7 +333,11 @@ class DocumentInteractionService:
         artifacts: list[dict[str, object]] = []
         for doc_id in document_ids:
             document = self._repository.get_document(doc_id)
-            if document is None or document.doc_type not in {"docx", "md", "txt"}:
+            if (
+                document is None
+                or document.doc_type not in {"docx", "md", "txt"}
+                or bool(document.metadata.get("skip_fact_extraction"))
+            ):
                 continue
 
             source_path = Path(document.stored_path)

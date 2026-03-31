@@ -4,7 +4,7 @@ import re
 from collections import OrderedDict
 from dataclasses import replace
 
-from app.core.catalog import FIELD_ALIASES, FIELD_ENTITY_TYPES
+from app.core.catalog import FIELD_ALIASES, FIELD_CANONICAL_UNITS, FIELD_ENTITY_TYPES
 from app.models.domain import DocumentBlock, DocumentRecord, FactRecord
 from app.utils.ids import new_id
 from app.utils.normalizers import (
@@ -12,9 +12,12 @@ from app.utils.normalizers import (
     extract_numeric_with_unit,
     find_entity_mentions,
     infer_year,
+    is_date_column,
     is_entity_column,
     normalize_entity_name,
     normalize_field_name,
+    normalize_field_name_or_passthrough,
+    parse_date_value,
 )
 
 _BRACKET_UNIT_RE = re.compile(r"[（(](.*?)[)）]")
@@ -45,6 +48,7 @@ class FactExtractionService:
             return []
 
         entity_name = ""
+        row_date: str | None = None
         for header, value in row_values.items():
             if is_entity_column(str(header)) and value:
                 entity_name = normalize_entity_name(str(value))
@@ -55,11 +59,23 @@ class FactExtractionService:
                     entity_name = mentions[0]
                     break
 
+        # Detect date column and parse date value
+        for header, value in row_values.items():
+            if is_date_column(str(header)) and value:
+                row_date = parse_date_value(str(value))
+                break
+
         facts: list[FactRecord] = []
         year = infer_year(block.text) or infer_year(document.file_name)
 
         for header, raw_value in row_values.items():
-            field_name = normalize_field_name(str(header))
+            # Skip entity columns and date columns — don't create facts for them
+            if is_entity_column(str(header)):
+                continue
+            if is_date_column(str(header)):
+                continue
+
+            field_name = normalize_field_name_or_passthrough(str(header))
             raw_text = str(raw_value).strip()
             if not field_name or not raw_text:
                 continue
@@ -67,10 +83,21 @@ class FactExtractionService:
             entity = entity_name or self._fallback_entity_from_text(block.text)
             if not entity and FIELD_ENTITY_TYPES.get(field_name) == "city":
                 continue
+            # For dynamic (non-catalog) fields, skip unit conversion
+            is_catalog_field = field_name in FIELD_ENTITY_TYPES or field_name in FIELD_CANONICAL_UNITS
 
             header_unit = self._extract_unit_from_header(str(header))
             value_num, detected_unit = extract_numeric_with_unit(raw_text)
-            final_num, final_unit = convert_to_canonical_unit(field_name, value_num, detected_unit or header_unit)
+            if is_catalog_field:
+                final_num, final_unit = convert_to_canonical_unit(field_name, value_num, detected_unit or header_unit)
+            else:
+                final_num = value_num
+                final_unit = detected_unit or header_unit
+
+            fact_metadata: dict[str, object] = {}
+            if row_date:
+                fact_metadata["date"] = row_date
+
             facts.append(
                 FactRecord(
                     fact_id=new_id("fact"),
@@ -86,6 +113,7 @@ class FactExtractionService:
                     source_span=block.text,
                     confidence=0.95 if entity else 0.86,
                     status="confirmed",
+                    metadata=fact_metadata,
                 )
             )
         return facts

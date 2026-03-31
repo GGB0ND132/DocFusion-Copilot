@@ -16,22 +16,34 @@ build/
 .env.*
 
 # IDE
-.vscode/settings.json
+.vscode/
+
+# Copilot customizations
+.github/
 
 # OS
 .DS_Store
 Thumbs.db
 
 # Runtime data
-data/outputs/*
-!data/outputs/.gitkeep
+backend/storage/
+.tmp_test_runs/
 
-# Competition test set and local materials
-Excel/
-md/
-txt/
-word/
-包含模板文件/
+# Frontend build cache & compiled config
+*.tsbuildinfo
+frontend/vite.config.js
+frontend/vite.config.d.ts
+frontend/tailwind.config.js
+frontend/tailwind.config.d.ts
+
+# Competition PDFs and materials
+*.pdf
+测试集/Excel/
+测试集/md/
+测试集/txt/
+测试集/word/
+测试集/包含模板文件/
+承诺书/
 
 # Logs
 *.log

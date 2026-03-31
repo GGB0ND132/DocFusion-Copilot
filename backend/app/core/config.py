@@ -5,6 +5,12 @@ from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
 
+from dotenv import load_dotenv
+
+# 自动加载 backend/.env（存在即加载，不存在不报错）
+_backend_dir = Path(__file__).resolve().parents[2]
+load_dotenv(_backend_dir / ".env", override=False)
+
 
 def _workspace_root() -> Path:
     """根据当前文件位置解析仓库根目录。
