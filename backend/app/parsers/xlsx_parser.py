@@ -26,16 +26,18 @@ class XlsxParser(DocumentParser):
         for sheet in workbook.sheets:
             if not sheet.rows:
                 continue
-            headers = next((row.values for row in sheet.rows if any(cell.strip() for cell in row.values)), [])
+            raw_headers = next((row.values for row in sheet.rows if any(cell.strip() for cell in row.values)), [])
+            headers = self._normalize_headers(raw_headers)
             if not headers:
                 continue
 
             for row in sheet.rows[1:]:
-                if not any(cell.strip() for cell in row.values):
+                trimmed_values = self._trim_row_values(row.values, len(headers))
+                if not any(cell.strip() for cell in trimmed_values):
                     continue
                 index += 1
                 row_map = {
-                    header: row.values[position] if position < len(row.values) else ""
+                    header: trimmed_values[position] if position < len(trimmed_values) else ""
                     for position, header in enumerate(headers)
                 }
                 blocks.append(
@@ -43,7 +45,7 @@ class XlsxParser(DocumentParser):
                         block_id=new_id("blk"),
                         doc_id=doc_id,
                         block_type="table_row",
-                        text=" | ".join(row.values),
+                        text=" | ".join(trimmed_values),
                         section_path=[sheet.name],
                         page_or_index=index,
                         metadata={
@@ -56,3 +58,23 @@ class XlsxParser(DocumentParser):
                 )
 
         return blocks
+
+    @staticmethod
+    def _normalize_headers(headers: list[str]) -> list[str]:
+        """鍘婚櫎绌虹櫧琛ㄥご骞跺幓鎺夊熬閮ㄧ┖鍒椼€?   Drop blank headers and trim trailing empty columns."""
+
+        normalized = [header.strip() for header in headers]
+        while normalized and not normalized[-1]:
+            normalized.pop()
+        return normalized
+
+    @staticmethod
+    def _trim_row_values(values: list[str], header_count: int) -> list[str]:
+        """鎸夎〃澶村垪鏁版敹缂╄鍊煎垪琛ㄣ€?   Trim row values to the effective header width."""
+
+        if header_count <= 0:
+            return []
+        trimmed = list(values[:header_count])
+        if len(trimmed) < header_count:
+            trimmed.extend("" for _ in range(header_count - len(trimmed)))
+        return trimmed

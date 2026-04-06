@@ -32,6 +32,11 @@ class FactExtractionService:
 
     _logger = get_logger("fact_extraction")
 
+    def __init__(self) -> None:
+        """鍒濆鍖栬〃澶磋鍒欑紦瀛樸€?   Initialize caches for worksheet header profiles."""
+
+        self._table_profile_cache: dict[tuple[str, ...], dict[str, object]] = {}
+
     def extract(self, document: DocumentRecord, blocks: list[DocumentBlock]) -> list[FactRecord]:
         """执行块级抽取并返回去重后的事实列表。    Run block-level extraction and return deduplicated facts."""
 
@@ -51,52 +56,53 @@ class FactExtractionService:
             return result
 
     def _extract_from_table_row(self, document: DocumentRecord, block: DocumentBlock) -> list[FactRecord]:
-        """从标准化表格行块中抽取事实。    Extract facts from a normalized table row block."""
+        """从标准化表格行中抽取结构化事实。
+        Extract structured facts from a normalized table row block.
+        """
 
         row_values = block.metadata.get("row_values")
         if not isinstance(row_values, dict):
             return []
+        headers = block.metadata.get("headers")
+        if not isinstance(headers, list):
+            headers = list(row_values.keys())
+        profile = self._get_table_profile(headers)
 
         entity_name = ""
         row_date: str | None = None
-        for header, value in row_values.items():
-            if is_entity_column(str(header)) and value:
-                entity_name = normalize_entity_name(str(value))
+        for header in profile["entity_headers"]:
+            value = str(row_values.get(header, "")).strip()
+            if value:
+                entity_name = normalize_entity_name(value)
                 break
-            if normalize_field_name(str(header)) is None and value:
-                mentions = find_entity_mentions(str(value))
+        if not entity_name:
+            for header in profile["fallback_headers"]:
+                value = str(row_values.get(header, "")).strip()
+                if not value:
+                    continue
+                mentions = find_entity_mentions(value)
                 if mentions:
                     entity_name = mentions[0]
                     break
 
-        # Detect date column and parse date value
-        for header, value in row_values.items():
-            if is_date_column(str(header)) and value:
-                row_date = parse_date_value(str(value))
+        for header in profile["date_headers"]:
+            value = str(row_values.get(header, "")).strip()
+            if value:
+                row_date = parse_date_value(value)
                 break
 
         facts: list[FactRecord] = []
         year = infer_year(block.text) or infer_year(document.file_name)
 
-        for header, raw_value in row_values.items():
-            # Skip entity columns and date columns — don't create facts for them
-            if is_entity_column(str(header)):
-                continue
-            if is_date_column(str(header)):
-                continue
-
-            field_name = normalize_field_name_or_passthrough(str(header))
-            raw_text = str(raw_value).strip()
+        for header, field_name, header_unit, is_catalog_field in profile["value_columns"]:
+            raw_text = str(row_values.get(header, "")).strip()
             if not field_name or not raw_text:
                 continue
 
             entity = entity_name or self._fallback_entity_from_text(block.text)
             if not entity and FIELD_ENTITY_TYPES.get(field_name) == "city":
                 continue
-            # For dynamic (non-catalog) fields, skip unit conversion
-            is_catalog_field = field_name in FIELD_ENTITY_TYPES or field_name in FIELD_CANONICAL_UNITS
 
-            header_unit = self._extract_unit_from_header(str(header))
             value_num, detected_unit = extract_numeric_with_unit(raw_text)
             if is_catalog_field:
                 final_num, final_unit = convert_to_canonical_unit(field_name, value_num, detected_unit or header_unit)
@@ -127,6 +133,55 @@ class FactExtractionService:
                 )
             )
         return facts
+
+    def _get_table_profile(self, headers: list[str]) -> dict[str, object]:
+        """基于表头缓存表格抽取规则。
+        Cache extraction rules derived from worksheet headers.
+        """
+
+        normalized_headers = tuple(str(header).strip() for header in headers)
+        cached = self._table_profile_cache.get(normalized_headers)
+        if cached is not None:
+            return cached
+
+        entity_headers: list[str] = []
+        date_headers: list[str] = []
+        fallback_headers: list[str] = []
+        value_columns: list[tuple[str, str, str | None, bool]] = []
+
+        for header in normalized_headers:
+            if not header:
+                continue
+            if is_entity_column(header):
+                entity_headers.append(header)
+                continue
+            if is_date_column(header):
+                date_headers.append(header)
+                continue
+
+            field_name = normalize_field_name_or_passthrough(header)
+            if not field_name:
+                continue
+
+            value_columns.append(
+                (
+                    header,
+                    field_name,
+                    self._extract_unit_from_header(header),
+                    field_name in FIELD_ENTITY_TYPES or field_name in FIELD_CANONICAL_UNITS,
+                )
+            )
+            if normalize_field_name(header) is None:
+                fallback_headers.append(header)
+
+        profile = {
+            "entity_headers": tuple(entity_headers),
+            "date_headers": tuple(date_headers),
+            "fallback_headers": tuple(fallback_headers),
+            "value_columns": tuple(value_columns),
+        }
+        self._table_profile_cache[normalized_headers] = profile
+        return profile
 
     def _extract_from_text(self, document: DocumentRecord, block: DocumentBlock) -> list[FactRecord]:
         """从自由文本段落或标题中抽取事实。    Extract facts from free-form paragraph or heading text."""

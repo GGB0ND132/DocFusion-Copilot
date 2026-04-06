@@ -59,7 +59,15 @@ export async function requestFile(path: string, options: RequestOptions = {}): P
 
   const disposition = response.headers.get('content-disposition') ?? '';
   const matchedFileName = disposition.match(/filename\*=UTF-8''([^;]+)|filename="?([^";]+)"?/i);
-  const fileName = decodeURIComponent(matchedFileName?.[1] ?? matchedFileName?.[2] ?? 'download.xlsx');
+  const contentType = (response.headers.get('content-type') ?? '').toLowerCase();
+  const defaultExtension = contentType.includes('wordprocessingml.document')
+    ? '.docx'
+    : contentType.includes('spreadsheetml.sheet')
+      ? '.xlsx'
+      : '.bin';
+  const fileName = decodeURIComponent(
+    matchedFileName?.[1] ?? matchedFileName?.[2] ?? `download${defaultExtension}`,
+  );
 
   return {
     blob: await response.blob(),

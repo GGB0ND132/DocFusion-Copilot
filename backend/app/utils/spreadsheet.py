@@ -127,7 +127,6 @@ def load_xlsx(path: str | Path) -> SpreadsheetDocument:
                 sheets.append(SpreadsheetSheet(name=sheet_name, rows=[]))
                 continue
 
-            max_column = 0
             row_maps: list[tuple[int, dict[int, str]]] = []
             for row_el in sheet_data.findall("main:row", NS):
                 row_index = int(row_el.get("r", "0"))
@@ -138,11 +137,11 @@ def load_xlsx(path: str | Path) -> SpreadsheetDocument:
                         continue
                     _, column_index = split_cell_ref(cell_ref)
                     value_map[column_index] = _read_cell_value(cell_el, shared_strings)
-                    max_column = max(max_column, column_index)
                 row_maps.append((row_index, value_map))
 
             for row_index, value_map in row_maps:
-                values = [value_map.get(column_index, "") for column_index in range(1, max_column + 1)]
+                row_max_column = max(value_map.keys(), default=0)
+                values = [value_map.get(column_index, "") for column_index in range(1, row_max_column + 1)]
                 rows.append(SpreadsheetRow(row_index=row_index, values=values))
 
             sheets.append(SpreadsheetSheet(name=sheet_name, rows=rows))

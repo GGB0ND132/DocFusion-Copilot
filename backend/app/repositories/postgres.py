@@ -6,10 +6,11 @@ from dataclasses import asdict
 from datetime import datetime, timezone
 from typing import Iterator
 
-from sqlalchemy import Engine, create_engine, delete, select
+from sqlalchemy import Engine, and_, create_engine, delete, or_, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.models.domain import (
+    ConversationRecord,
     DocumentBlock,
     DocumentRecord,
     DocumentStatus,
@@ -21,6 +22,7 @@ from app.models.domain import (
 )
 from app.repositories.sqlalchemy_models import (
     Base,
+    ConversationRow,
     DocumentBlockRow,
     DocumentRow,
     FactRow,
@@ -51,6 +53,7 @@ class PostgresRepository:
         Create the database tables required by the repository.
         """
         Base.metadata.create_all(self._engine)
+        self._ensure_indexes()
 
     @contextmanager
     def _session(self) -> Iterator[Session]:
@@ -216,17 +219,21 @@ class PostgresRepository:
             return []
 
         with self._session() as session:
-            session.add_all(self._fact_to_row(fact) for fact in facts)
+            rows = [self._fact_to_row(fact) for fact in facts]
+            session.add_all(rows)
             session.flush()
             affected_groups = {
-                (fact.entity_type, fact.entity_name, fact.field_name, fact.year, fact.unit)
-                for fact in facts
+                row.conflict_group_id: (
+                    row.entity_type,
+                    row.entity_name,
+                    row.field_name,
+                    row.year,
+                    row.unit,
+                )
+                for row in rows
             }
             self._recompute_canonical_flags(session, affected_groups)
-            reloaded = [
-                session.get(FactRow, fact.fact_id)
-                for fact in facts
-            ]
+            reloaded = [session.get(FactRow, fact.fact_id) for fact in facts]
             return [self._fact_from_row(row) for row in reloaded if row is not None]
 
     def list_facts(
@@ -277,7 +284,9 @@ class PostgresRepository:
         status: str | None = None,
         metadata_updates: dict[str, object] | None = None,
     ) -> FactRecord | None:
-        """更新事实状态或元数据并重算 canonical 结果。    Update one fact and recompute canonical winners."""
+        """????????????? canonical ???
+        Update one fact and recompute canonical winners.
+        """
 
         with self._session() as session:
             row = session.get(FactRow, fact_id)
@@ -287,10 +296,23 @@ class PostgresRepository:
                 row.status = status
             if metadata_updates:
                 row.metadata_json = {**(row.metadata_json or {}), **metadata_updates}
+            row.conflict_group_id = self._build_conflict_group_id(
+                row.entity_type,
+                row.entity_name,
+                row.field_name,
+                row.year,
+                row.unit,
+            )
             session.add(row)
             session.flush()
             affected_groups = {
-                (row.entity_type, row.entity_name, row.field_name, row.year, row.unit),
+                row.conflict_group_id: (
+                    row.entity_type,
+                    row.entity_name,
+                    row.field_name,
+                    row.year,
+                    row.unit,
+                ),
             }
             self._recompute_canonical_flags(session, affected_groups)
             session.flush()
@@ -347,40 +369,176 @@ class PostgresRepository:
             stmt = select(TemplateResultRow).order_by(TemplateResultRow.created_at.desc())
             return [self._template_result_from_row(row) for row in session.scalars(stmt).all()]
 
+    def create_conversation(self, record: ConversationRecord) -> ConversationRecord:
+        """鍒涘缓瀵硅瘽璁板綍銆?   Persist a new conversation record."""
+        with self._session() as session:
+            session.add(self._conversation_to_row(record))
+            return self._clone_conversation(record)
+
+    def get_conversation(self, conversation_id: str) -> ConversationRecord | None:
+        """鎸?id 鏌ヨ瀵硅瘽璁板綍銆?   Fetch a conversation by id."""
+        with self._session() as session:
+            row = session.get(ConversationRow, conversation_id)
+            return self._conversation_from_row(row) if row else None
+
+    def update_conversation(self, record: ConversationRecord) -> ConversationRecord | None:
+        """鏇存柊瀵硅瘽璁板綍銆?   Update an existing conversation record."""
+        with self._session() as session:
+            row = session.get(ConversationRow, record.conversation_id)
+            if row is None:
+                return None
+            row.title = record.title
+            row.created_at = record.created_at
+            row.updated_at = record.updated_at
+            row.messages = [dict(message) for message in record.messages]
+            row.metadata_json = dict(record.metadata)
+            session.add(row)
+            session.flush()
+            return self._conversation_from_row(row)
+
+    def list_conversations(self) -> list[ConversationRecord]:
+        """鍒楀嚭鍏ㄩ儴瀵硅瘽锛屾寜鏇存柊鏃堕棿鍊掑簭銆?   List all conversations ordered by updated_at DESC."""
+        with self._session() as session:
+            stmt = select(ConversationRow).order_by(
+                ConversationRow.updated_at.desc(),
+                ConversationRow.created_at.desc(),
+            )
+            return [self._conversation_from_row(row) for row in session.scalars(stmt).all()]
+
+    def delete_conversation(self, conversation_id: str) -> ConversationRecord | None:
+        """鍒犻櫎瀵硅瘽璁板綍銆?   Delete a conversation record."""
+        with self._session() as session:
+            row = session.get(ConversationRow, conversation_id)
+            if row is None:
+                return None
+            record = self._conversation_from_row(row)
+            session.delete(row)
+            return record
+
     def _recompute_canonical_flags(
         self,
         session: Session,
-        affected_groups: set[tuple[str, str, str, int | None, str | None]],
+        affected_groups: dict[str, tuple[str, str, str, int | None, str | None]],
     ) -> None:
         """重算受影响冲突组的 canonical 事实标记。
         Recompute canonical fact flags for affected conflict groups.
         """
-        for entity_type, entity_name, field_name, year, unit in affected_groups:
-            conflict_group_id = f"{entity_type}::{entity_name}::{field_name}::{year}::{unit}"
-            stmt = select(FactRow).where(
+        if not affected_groups:
+            return
+
+        group_filters = []
+        for entity_type, entity_name, field_name, year, unit in affected_groups.values():
+            predicates = [
                 FactRow.entity_type == entity_type,
                 FactRow.entity_name == entity_name,
                 FactRow.field_name == field_name,
+            ]
+            predicates.append(FactRow.year.is_(None) if year is None else FactRow.year == year)
+            predicates.append(FactRow.unit.is_(None) if unit is None else FactRow.unit == unit)
+            group_filters.append(and_(*predicates))
+
+        rows = list(session.scalars(select(FactRow).where(or_(*group_filters))).all())
+        grouped_rows: dict[str, list[FactRow]] = defaultdict(list)
+        for row in rows:
+            conflict_group_id = self._build_conflict_group_id(
+                row.entity_type,
+                row.entity_name,
+                row.field_name,
+                row.year,
+                row.unit,
             )
-            # NULL-safe comparisons: SQL requires IS NULL instead of = NULL
-            if year is None:
-                stmt = stmt.where(FactRow.year.is_(None))
-            else:
-                stmt = stmt.where(FactRow.year == year)
-            if unit is None:
-                stmt = stmt.where(FactRow.unit.is_(None))
-            else:
-                stmt = stmt.where(FactRow.unit == unit)
-            stmt = stmt.order_by(FactRow.confidence.desc(), FactRow.value_num.is_not(None).desc(), FactRow.source_doc_id.desc())
-            rows = list(session.scalars(stmt).all())
-            for row in rows:
-                row.is_canonical = False
-                row.conflict_group_id = conflict_group_id
-                session.add(row)
-            ordered_rows = [row for row in rows if row.status != "rejected"]
-            for index, row in enumerate(ordered_rows):
-                row.is_canonical = index == 0
-                session.add(row)
+            row.conflict_group_id = conflict_group_id
+            row.is_canonical = False
+            grouped_rows[conflict_group_id].append(row)
+            session.add(row)
+
+        for group_rows in grouped_rows.values():
+            ordered_rows = sorted(
+                (row for row in group_rows if row.status != "rejected"),
+                key=lambda item: (
+                    item.confidence,
+                    1 if item.value_num is not None else 0,
+                    item.source_doc_id,
+                    item.fact_id,
+                ),
+                reverse=True,
+            )
+            if ordered_rows:
+                ordered_rows[0].is_canonical = True
+                session.add(ordered_rows[0])
+
+    def _ensure_indexes(self) -> None:
+        """为热路径查询补建缺失的 PostgreSQL 索引。
+        Create missing PostgreSQL indexes used by hot paths.
+        """
+        statements = [
+            (
+                "CREATE INDEX IF NOT EXISTS ix_facts_group_lookup "
+                "ON facts (entity_type, entity_name, field_name, year, unit)"
+            ),
+            (
+                "CREATE INDEX IF NOT EXISTS ix_facts_conflict_group_confidence "
+                "ON facts (conflict_group_id, status, confidence DESC)"
+            ),
+        ]
+        with self._engine.begin() as connection:
+            for statement in statements:
+                connection.exec_driver_sql(statement)
+
+    @staticmethod
+    def _build_conflict_group_id(
+        entity_type: str,
+        entity_name: str,
+        field_name: str,
+        year: int | None,
+        unit: str | None,
+    ) -> str:
+        """根据事实关键组合生成冲突组标识。
+        Build a stable conflict-group id from fact dimensions.
+        """
+        return f"{entity_type}::{entity_name}::{field_name}::{year}::{unit}"
+
+    @staticmethod
+    def _clone_conversation(record: ConversationRecord) -> ConversationRecord:
+        """澶嶅埗瀵硅瘽棰嗗煙瀵硅薄锛岄伩鍏嶅叡浜彲鍙樺紩鐢ㄣ€?
+        Clone a conversation domain object to avoid shared mutable references.
+        """
+        return ConversationRecord(
+            conversation_id=record.conversation_id,
+            title=record.title,
+            created_at=record.created_at,
+            updated_at=record.updated_at,
+            messages=[dict(message) for message in record.messages],
+            metadata=dict(record.metadata),
+        )
+
+    @staticmethod
+    def _conversation_to_row(record: ConversationRecord) -> ConversationRow:
+        """灏嗗璇濋鍩熷璞¤浆鎹负 ORM 琛屽璞°€?
+        Convert a conversation domain object into an ORM row object.
+        """
+        return ConversationRow(
+            conversation_id=record.conversation_id,
+            title=record.title,
+            created_at=record.created_at,
+            updated_at=record.updated_at,
+            messages=[dict(message) for message in record.messages],
+            metadata_json=dict(record.metadata),
+        )
+
+    @staticmethod
+    def _conversation_from_row(row: ConversationRow) -> ConversationRecord:
+        """灏?ORM 瀵硅瘽琛岃浆鎹负棰嗗煙瀵硅薄銆?
+        Convert an ORM conversation row into a domain object.
+        """
+        return ConversationRecord(
+            conversation_id=row.conversation_id,
+            title=row.title,
+            created_at=row.created_at,
+            updated_at=row.updated_at,
+            messages=[dict(message) for message in (row.messages or [])],
+            metadata=dict(row.metadata_json or {}),
+        )
 
     @staticmethod
     def _clone_document(record: DocumentRecord) -> DocumentRecord:
@@ -511,7 +669,14 @@ class PostgresRepository:
             source_block_id=fact.source_block_id,
             source_span=fact.source_span,
             confidence=fact.confidence,
-            conflict_group_id=fact.conflict_group_id,
+            conflict_group_id=fact.conflict_group_id
+            or PostgresRepository._build_conflict_group_id(
+                fact.entity_type,
+                fact.entity_name,
+                fact.field_name,
+                fact.year,
+                fact.unit,
+            ),
             is_canonical=fact.is_canonical,
             status=fact.status,
             metadata_json=dict(fact.metadata),

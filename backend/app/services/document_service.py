@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
+from time import perf_counter
 
 from app.core.config import Settings
 from app.models.domain import DocumentRecord, DocumentStatus, TaskRecord, TaskStatus, TaskType
@@ -130,6 +131,7 @@ class DocumentService:
         """解析单个上传文档、抽取事实并更新任务状态。
         Parse one uploaded document, extract facts and update task state.
         """
+        started_at = perf_counter()
         self._repository.update_document(doc_id, status=DocumentStatus.parsing)
         self._repository.update_task(
             task_id,
@@ -138,13 +140,18 @@ class DocumentService:
             message="Parsing document structure.",
         )
         try:
+            parse_started_at = perf_counter()
             blocks = self._parser_registry.parse(file_path, doc_id)
+            parse_elapsed = round(perf_counter() - parse_started_at, 3)
             self._repository.replace_blocks(doc_id, blocks)
             self._repository.update_task(
                 task_id,
                 progress=0.55,
-                message=f"Parsed {len(blocks)} blocks, extracting facts.",
-                result_updates={"block_count": len(blocks)},
+                message=f"Parsed {len(blocks)} blocks in {parse_elapsed:.2f}s, extracting facts.",
+                result_updates={
+                    "block_count": len(blocks),
+                    "parse_seconds": parse_elapsed,
+                },
             )
 
             document = self._repository.get_document(doc_id)
@@ -152,12 +159,15 @@ class DocumentService:
                 raise RuntimeError(f"Document {doc_id} disappeared during parsing.")
 
             if self._should_skip_fact_extraction(document):
+                total_elapsed = round(perf_counter() - started_at, 3)
                 self._repository.update_document(
                     doc_id,
                     status=DocumentStatus.parsed,
                     metadata_updates={
                         "block_count": len(blocks),
                         "fact_count": 0,
+                        "parse_seconds": parse_elapsed,
+                        "total_seconds": total_elapsed,
                         "processing_note": "Prompt/instruction text detected, skipped fact extraction.",
                     },
                 )
@@ -168,28 +178,41 @@ class DocumentService:
                     message="Instruction text parsed and excluded from fact extraction.",
                     result_updates={
                         "fact_count": 0,
+                        "total_seconds": total_elapsed,
                         "skipped_fact_extraction": True,
                     },
                 )
                 return
 
+            extraction_started_at = perf_counter()
             facts = self._extraction_service.extract(document, blocks)
+            extraction_elapsed = round(perf_counter() - extraction_started_at, 3)
+            storage_started_at = perf_counter()
             stored_facts = self._repository.add_facts(facts)
+            storage_elapsed = round(perf_counter() - storage_started_at, 3)
+            total_elapsed = round(perf_counter() - started_at, 3)
             self._repository.update_document(
                 doc_id,
                 status=DocumentStatus.parsed,
                 metadata_updates={
                     "block_count": len(blocks),
                     "fact_count": len(stored_facts),
+                    "parse_seconds": parse_elapsed,
+                    "extract_seconds": extraction_elapsed,
+                    "store_seconds": storage_elapsed,
+                    "total_seconds": total_elapsed,
                 },
             )
             self._repository.update_task(
                 task_id,
                 status=TaskStatus.succeeded,
                 progress=1.0,
-                message="Document parsed successfully.",
+                message=f"Document parsed successfully in {total_elapsed:.2f}s.",
                 result_updates={
                     "fact_count": len(stored_facts),
+                    "extract_seconds": extraction_elapsed,
+                    "store_seconds": storage_elapsed,
+                    "total_seconds": total_elapsed,
                 },
             )
         except Exception as exc:

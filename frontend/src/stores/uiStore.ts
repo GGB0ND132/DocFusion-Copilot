@@ -31,6 +31,9 @@ export type ChatMessage =
   | { role: 'assistant'; text: string; timestamp: number; data?: AgentExecuteResponse | null; taskId?: string }
   | { role: 'system'; text: string; timestamp: number };
 
+const AGENT_WELCOME_MESSAGE =
+  '你好，我是 DocFusion Agent。我可以帮你总结已上传文档、查询结构化事实、追溯来源，也可以在你上传 Word 或 Excel 模板后自动回填。';
+
 type UiState = {
   uploadedDocuments: UploadedDocumentEntry[];
   currentDocumentSetId: string | null;
@@ -187,7 +190,7 @@ export const useUiStore = create<UiState>((set) => ({
       uploadedDocuments: state.uploadedDocuments.filter((item) => item.document.doc_id !== docId),
     })),
   agentMessages: [
-    { role: 'system' as const, text: '欢迎使用 DocFusion Agent。上传模板文件并输入需求，或直接输入自然语言指令。', timestamp: Date.now() },
+    { role: 'system' as const, text: AGENT_WELCOME_MESSAGE, timestamp: Date.now() },
   ],
   agentContextId: null,
   addAgentMessage: (msg) =>
@@ -196,7 +199,7 @@ export const useUiStore = create<UiState>((set) => ({
   clearAgentConversation: () =>
     set({
       agentMessages: [
-        { role: 'system' as const, text: '欢迎使用 DocFusion Agent。上传模板文件并输入需求，或直接输入自然语言指令。', timestamp: Date.now() },
+        { role: 'system' as const, text: AGENT_WELCOME_MESSAGE, timestamp: Date.now() },
       ],
       agentContextId: null,
     }),
@@ -205,7 +208,7 @@ export const useUiStore = create<UiState>((set) => ({
   switchConversation: (conv) =>
     set(() => {
       const restored: ChatMessage[] = [
-        { role: 'system' as const, text: '欢迎使用 DocFusion Agent。上传模板文件并输入需求，或直接输入自然语言指令。', timestamp: new Date(conv.created_at).getTime() },
+        { role: 'system' as const, text: AGENT_WELCOME_MESSAGE, timestamp: new Date(conv.created_at).getTime() },
         ...conv.messages.map((m) => ({
           role: (String(m.role) === 'user' ? 'user' : 'assistant') as 'user' | 'assistant',
           text: String(m.content ?? ''),
@@ -217,7 +220,7 @@ export const useUiStore = create<UiState>((set) => ({
   startNewConversation: () =>
     set({
       agentMessages: [
-        { role: 'system' as const, text: '欢迎使用 DocFusion Agent。上传模板文件并输入需求，或直接输入自然语言指令。', timestamp: Date.now() },
+        { role: 'system' as const, text: AGENT_WELCOME_MESSAGE, timestamp: Date.now() },
       ],
       agentContextId: null,
     }),

@@ -6,7 +6,7 @@ from pathlib import Path
 
 from app.core.config import Settings
 from app.core.openai_client import OpenAIClientError, OpenAICompatibleClient
-from app.models.domain import DocumentBlock, FactRecord
+from app.models.domain import DocumentBlock, DocumentRecord, FactRecord
 from app.repositories.base import Repository
 from app.services.agent_service import AgentService
 from app.services.template_service import TemplateService
@@ -54,7 +54,7 @@ class DocumentInteractionService:
     ) -> dict[str, object]:
         """执行自然语言描述的文档操作。    Execute a document operation described in natural language."""
 
-        plan = self._agent_service.chat(message, context_id)
+        plan = self._agent_service.chat(message, context_id, store_preview_message=False)
         resolved_document_ids = self._resolve_document_ids(document_ids, document_set_id)
         intent = str(plan["intent"])
 
@@ -90,6 +90,8 @@ class DocumentInteractionService:
             }
         elif intent == "query_status":
             execution = self._query_status(resolved_document_ids)
+        elif intent == "small_talk":
+            execution = self._small_talk(message, resolved_document_ids, bool(template_content))
         elif intent == "general_qa":
             execution = self._general_qa(message, plan, resolved_document_ids)
         elif intent == "extract_fields":
@@ -108,10 +110,12 @@ class DocumentInteractionService:
                 "template_name": None,
             }
 
-        return {
+        merged = {
             **plan,
             **execution,
         }
+        self._agent_service.record_execution_result(context_id, str(merged.get("summary", "")))
+        return merged
 
     def _resolve_document_ids(
         self,
@@ -145,6 +149,8 @@ class DocumentInteractionService:
 
         if not template_name:
             raise ValueError("Missing template file name for template filling.")
+        if not document_ids and not document_set_id:
+            raise ValueError("请先上传并解析源文档，再提交模板回填。")
 
         task = self._template_service.submit_fill_task(
             template_name=template_name,
@@ -314,13 +320,7 @@ class DocumentInteractionService:
         for doc_id in document_ids:
             blocks.extend(self._repository.list_blocks(doc_id))
 
-        if self._openai_client.is_configured:
-            try:
-                summary = self._summarize_with_openai(plan, blocks, facts)
-            except OpenAIClientError:
-                summary = self._fallback_summary(blocks, facts, document_ids)
-        else:
-            summary = self._fallback_summary(blocks, facts, document_ids)
+        summary = self._build_summary_text(plan, blocks, facts, document_ids)
 
         artifacts: list[dict[str, object]] = []
         artifact_name = f"summary_{document_ids[0] if document_ids else 'all'}.md"
@@ -340,6 +340,22 @@ class DocumentInteractionService:
             "artifacts": artifacts,
             "document_ids": document_ids,
         }
+
+    def _build_summary_text(
+        self,
+        plan: dict[str, object],
+        blocks: list[DocumentBlock],
+        facts: list[FactRecord],
+        document_ids: list[str],
+    ) -> str:
+        """缁熶竴鐢熸垚鎽樿鏂囨湰銆?   Build summary text through the LLM path with a natural fallback."""
+
+        if self._openai_client.is_configured:
+            try:
+                return self._summarize_with_openai(plan, blocks, facts)
+            except OpenAIClientError:
+                pass
+        return self._fallback_summary(blocks, facts, document_ids)
 
     def _reformat_documents(self, plan: dict[str, object], document_ids: list[str]) -> dict[str, object]:
         """对支持的文本类文档执行基础格式整理，支持 LLM 解析用户格式要求。
@@ -723,11 +739,84 @@ class DocumentInteractionService:
             "document_ids": document_ids,
         }
 
-    def _general_qa(self, message: str, plan: dict[str, object], document_ids: list[str]) -> dict[str, object]:
+    def _small_talk_legacy(
+        self,
+        message: str,
+        document_ids: list[str],
+        has_template_file: bool,
+    ) -> dict[str, object]:
+        """鐢熸垚鏇磋嚜鐒剁殑瀵掓殏涓庡姛鑳借鏄庡洖澶嶃€?
+        Generate a more natural reply for greetings and lightweight chit-chat.
+        """
+
+        normalized = message.strip().lower()
+        if any(keyword in normalized for keyword in ("谢谢", "感谢", "多谢", "辛苦了")):
+            summary = "不客气，我们继续。你可以让我总结文档、查询已抽取事实，或者上传模板后直接帮你回填。"
+        elif any(keyword in normalized for keyword in ("你是谁", "你能做什么", "你可以做什么", "怎么用", "如何使用", "帮助", "help")):
+            if document_ids:
+                summary = (
+                    f"我是 DocFusion Agent。当前我已经能访问 {len(document_ids)} 份已解析文档，"
+                    "可以帮你总结内容、查询指标、追溯事实来源，也可以在你上传 Word/Excel 模板后自动回填。"
+                )
+            else:
+                summary = (
+                    "我是 DocFusion Agent。你可以先上传原始文档，然后让我总结、查询、导出结果；"
+                    "如果你已经有 Word/Excel 模板，也可以上传后让我自动回填。"
+                )
+        else:
+            parts = ["你好，我在。"]
+            if document_ids:
+                parts.append(f"当前这轮我能使用 {len(document_ids)} 份已解析文档。")
+            else:
+                parts.append("你可以先上传原始文档，或者直接告诉我想查询、总结什么。")
+            if has_template_file:
+                parts.append("我也收到了模板文件，继续描述要求就可以开始回填。")
+            else:
+                parts.append("如果有模板，也可以上传 Word 或 Excel 后让我自动回填。")
+            summary = " ".join(parts)
+
+        return {
+            "execution_type": "conversation",
+            "summary": summary,
+            "facts": [],
+            "artifacts": [],
+            "document_ids": document_ids,
+        }
+
+    def _general_qa_legacy(self, message: str, plan: dict[str, object], document_ids: list[str]) -> dict[str, object]:
         """基于已有事实回答用户的通用问题。    Answer general questions using available facts."""
         entities = [str(e) for e in plan.get("entities", [])]
         fields = [str(f) for f in plan.get("fields", [])]
         facts = self._repository.list_facts(canonical_only=True, document_ids=set(document_ids) if document_ids else None)
+        scoped_blocks = [
+            block
+            for doc_id in document_ids
+            for block in self._repository.list_blocks(doc_id)
+        ]
+
+        if document_ids and self._looks_like_content_summary_request(message):
+            summary = self._build_summary_text(
+                {**plan, "intent": "summarize_document"},
+                scoped_blocks,
+                facts,
+                document_ids,
+            )
+            return {
+                "execution_type": "qa",
+                "summary": summary,
+                "facts": facts[:10],
+                "artifacts": [],
+                "document_ids": document_ids,
+            }
+
+        if not facts:
+            return {
+                "execution_type": "qa",
+                "summary": self._fallback_no_data_qa(),
+                "facts": [],
+                "artifacts": [],
+                "document_ids": document_ids,
+            }
 
         # Filter to relevant facts if entities/fields specified
         relevant = facts
@@ -770,6 +859,655 @@ class DocumentInteractionService:
             "artifacts": [],
             "document_ids": document_ids,
         }
+
+    def _answer_with_openai(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        fallback: str,
+    ) -> str:
+        """使用 OpenAI 生成自然语言回复，失败时回退。  Use OpenAI for replies with fallback."""
+
+        if not self._openai_client.is_configured:
+            return fallback
+        try:
+            payload = self._openai_client.create_json_completion(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                json_schema={
+                    "type": "object",
+                    "properties": {
+                        "answer": {"type": "string"},
+                    },
+                    "required": ["answer"],
+                    "additionalProperties": False,
+                },
+            )
+        except OpenAIClientError:
+            return fallback
+        answer = str(payload.get("answer", "")).strip()
+        return answer or fallback
+
+    def _fallback_small_talk(
+        self,
+        message: str,
+        document_ids: list[str],
+        has_template_file: bool,
+    ) -> str:
+        """本地兜底的轻对话回复。  Local fallback reply for light conversation."""
+
+        normalized = message.strip().lower()
+        if any(keyword in normalized for keyword in ("谢谢", "感谢", "多谢", "辛苦了")):
+            return "不客气，我们继续。你可以让我总结文档、查询事实，或者上传模板后直接帮你回填。"
+        if any(keyword in normalized for keyword in ("你是谁", "你能做什么", "你可以做什么", "怎么用", "如何使用", "帮助", "help")):
+            if document_ids:
+                return (
+                    f"我是 DocFusion Agent。当前这轮我能访问 {len(document_ids)} 份已解析文档，"
+                    "可以帮你总结内容、查询结构化事实、追溯来源，也可以在上传 Word 或 Excel 模板后自动回填。"
+                )
+            return (
+                "我是 DocFusion Agent。你可以先上传原始文档，然后让我总结、查询、导出结果；"
+                "如果你已经有 Word 或 Excel 模板，也可以上传后让我自动回填。"
+            )
+        parts = ["你好，我在。"]
+        if document_ids:
+            parts.append(f"当前我可以使用 {len(document_ids)} 份已解析文档。")
+        else:
+            parts.append("当前还没有可直接引用的已解析文档。")
+        if has_template_file:
+            parts.append("我也收到了模板文件，你继续描述需求就可以开始处理。")
+        else:
+            parts.append("如果你有 Word 或 Excel 模板，也可以上传后让我自动回填。")
+        return " ".join(parts)
+
+    def _fallback_no_data_qa(self) -> str:
+        """本地兜底的无数据问答回复。  Local fallback reply when no facts are available."""
+
+        return "我暂时还没有可参考的数据。你可以先上传文档，或者直接告诉我想总结、查询或回填什么。"
+
+    def _small_talk(
+        self,
+        message: str,
+        document_ids: list[str],
+        has_template_file: bool,
+    ) -> dict[str, object]:
+        """优先用模型生成寒暄回复。  Prefer model-generated replies for greetings and chit-chat."""
+
+        fallback = self._fallback_small_talk(message, document_ids, has_template_file)
+        summary = self._answer_with_openai(
+            system_prompt=(
+                "You are DocFusion Agent. Reply in natural, concise Chinese. "
+                "The user is greeting you, making light chit-chat, or asking what you can do. "
+                "Do not invent facts or claim documents were analyzed when they were not."
+            ),
+            user_prompt=(
+                f"User message: {message}\n"
+                f"Parsed document count: {len(document_ids)}\n"
+                f"Template file attached: {'yes' if has_template_file else 'no'}\n"
+                "Respond warmly and helpfully."
+            ),
+            fallback=fallback,
+        )
+        return {
+            "execution_type": "conversation",
+            "summary": summary,
+            "facts": [],
+            "artifacts": [],
+            "document_ids": document_ids,
+        }
+
+    def _general_qa(self, message: str, plan: dict[str, object], document_ids: list[str]) -> dict[str, object]:
+        """优先用模型回答通用问题。  Prefer model-generated answers for general QA."""
+
+        entities = [str(e) for e in plan.get("entities", [])]
+        fields = [str(f) for f in plan.get("fields", [])]
+        facts = self._repository.list_facts(canonical_only=True, document_ids=set(document_ids) if document_ids else None)
+
+        if not facts:
+            scoped_documents = self._get_scoped_documents(document_ids)
+            if scoped_documents:
+                summary = self._answer_with_openai(
+                    system_prompt=(
+                        "You are DocFusion Agent. The workspace has parsed documents, but there may be no extracted facts yet. "
+                        "Answer in natural Chinese based on the document list and block previews only. "
+                        "Be honest about what is available and suggest useful next steps."
+                    ),
+                    user_prompt=(
+                        f"User question: {message}\n\n"
+                        f"Workspace document summary:\n{self._build_document_scope_prompt(scoped_documents)}"
+                    ),
+                    fallback=self._fallback_document_qa(scoped_documents),
+                )
+                return {
+                    "execution_type": "qa",
+                    "summary": summary,
+                    "facts": [],
+                    "artifacts": [],
+                    "document_ids": document_ids,
+                }
+            summary = self._answer_with_openai(
+                system_prompt=(
+                    "You are DocFusion Agent. There is currently no extracted fact data available for this request. "
+                    "Reply in natural Chinese, be honest about the limitation, and suggest the next best step."
+                ),
+                user_prompt=(
+                    f"User question: {message}\n"
+                    f"Parsed document count in scope: {len(document_ids)}\n"
+                    "Explain that there is no usable structured data yet and guide the user."
+                ),
+                fallback=self._fallback_no_data_qa(),
+            )
+            return {
+                "execution_type": "qa",
+                "summary": summary,
+                "facts": [],
+                "artifacts": [],
+                "document_ids": document_ids,
+            }
+
+        relevant = facts
+        if entities:
+            relevant = [f for f in relevant if f.entity_name in entities or any(e in f.entity_name for e in entities)]
+        if fields:
+            relevant = [f for f in relevant if f.field_name in fields]
+        if not relevant:
+            relevant = facts[:20]
+
+        if self._openai_client.is_configured:
+            try:
+                fact_text = "\n".join(
+                    f"- {f.entity_name} / {f.field_name} = {format_value(f.value_num) or f.value_text} {f.unit or ''}".strip()
+                    for f in relevant[:30]
+                )
+                payload = self._openai_client.create_json_completion(
+                    system_prompt=(
+                        "You are DocFusion Agent. Answer the user's question in Chinese using only the provided facts. "
+                        "Be concise, helpful, and do not invent missing data."
+                    ),
+                    user_prompt=f"Known facts:\n{fact_text}\n\nUser question: {message}",
+                    json_schema={
+                        "type": "object",
+                        "properties": {"answer": {"type": "string"}},
+                        "required": ["answer"],
+                        "additionalProperties": False,
+                    },
+                )
+                summary = str(payload.get("answer", "")).strip() or self._fallback_qa(relevant)
+            except OpenAIClientError:
+                summary = self._fallback_qa(relevant)
+        else:
+            summary = self._fallback_qa(relevant)
+
+        return {
+            "execution_type": "qa",
+            "summary": summary,
+            "facts": relevant[:10],
+            "artifacts": [],
+            "document_ids": document_ids,
+        }
+
+    def _get_scoped_documents(self, document_ids: list[str]) -> list[DocumentRecord]:
+        """返回当前问答范围内的已解析文档。  Return parsed documents in the current QA scope."""
+
+        documents: list[DocumentRecord] = []
+        seen: set[str] = set()
+        for doc_id in document_ids:
+            if doc_id in seen:
+                continue
+            seen.add(doc_id)
+            document = self._repository.get_document(doc_id)
+            if document is None or bool(document.metadata.get("skip_fact_extraction")):
+                continue
+            documents.append(document)
+        return documents
+
+    def _build_document_scope_prompt(self, documents: list[DocumentRecord]) -> str:
+        """构建用于模型问答的文档范围摘要。  Build a scoped document summary for LLM prompts."""
+
+        lines: list[str] = []
+        for document in documents[:5]:
+            blocks = self._repository.list_blocks(document.doc_id)
+            heading = next(
+                (block.text.strip() for block in blocks if block.block_type == "heading" and block.text.strip()),
+                "",
+            )
+            snippet = next(
+                (block.text.strip().replace("\n", " ")[:120] for block in blocks if block.text.strip()),
+                "",
+            )
+            line = f"- {document.file_name} ({document.doc_type}, {len(blocks)} blocks)"
+            if heading:
+                line += f"\n  heading: {heading}"
+            if snippet:
+                line += f"\n  preview: {snippet}"
+            lines.append(line)
+        return "\n".join(lines)
+
+    def _fallback_document_qa(self, documents: list[DocumentRecord]) -> str:
+        """基于文档清单生成兜底回复。  Generate a fallback reply from document scope information."""
+
+        names = [document.file_name for document in documents[:5]]
+        lines = [f"当前工作台里有 {len(documents)} 份已解析文档：{'、'.join(names)}。"]
+        first_document = documents[0] if documents else None
+        if first_document is not None:
+            blocks = self._repository.list_blocks(first_document.doc_id)
+            if blocks:
+                heading = next(
+                    (block.text.strip() for block in blocks if block.block_type == "heading" and block.text.strip()),
+                    "",
+                )
+                preview = next((block.text.strip() for block in blocks if block.text.strip()), "")
+                if heading:
+                    lines.append(f"其中《{first_document.file_name}》的标题是“{heading}”。")
+                elif preview:
+                    lines.append(f"我已经能读取《{first_document.file_name}》的内容，开头大致是：{preview[:80]}。")
+        lines.append("这批文档目前可能还没抽取出结构化事实，但我已经可以继续帮你总结、检索内容或继续做字段抽取。")
+        return "".join(lines)
+
+    def _general_qa(self, message: str, plan: dict[str, object], document_ids: list[str]) -> dict[str, object]:
+        """浼樺厛鐢ㄦā鍨嬪洖绛旈€氱敤闂锛屽鍐呭绫婚棶棰樹紭鍏堣浆涓烘枃妗ｆ憳瑕併€?
+        Prefer model-generated answers for general QA, and redirect content questions to document summaries."""
+
+        entities = [str(e) for e in plan.get("entities", [])]
+        fields = [str(f) for f in plan.get("fields", [])]
+        facts = self._repository.list_facts(canonical_only=True, document_ids=set(document_ids) if document_ids else None)
+        scoped_blocks = [
+            block
+            for doc_id in document_ids
+            for block in self._repository.list_blocks(doc_id)
+        ]
+
+        if document_ids and self._looks_like_content_summary_request(message):
+            summary = self._build_summary_text(
+                {**plan, "intent": "summarize_document"},
+                scoped_blocks,
+                facts,
+                document_ids,
+            )
+            return {
+                "execution_type": "qa",
+                "summary": summary,
+                "facts": facts[:10],
+                "artifacts": [],
+                "document_ids": document_ids,
+            }
+
+        if not facts:
+            scoped_documents = self._get_scoped_documents(document_ids)
+            if scoped_documents:
+                summary = self._answer_with_openai(
+                    system_prompt=(
+                        "You are DocFusion Agent. The workspace has parsed documents, but there may be no extracted facts yet. "
+                        "Answer in natural Chinese based on the document list and block previews only. "
+                        "Be honest about what is available and suggest useful next steps."
+                    ),
+                    user_prompt=(
+                        f"User question: {message}\n\n"
+                        f"Workspace document summary:\n{self._build_document_scope_prompt(scoped_documents)}"
+                    ),
+                    fallback=self._fallback_document_qa(scoped_documents),
+                )
+                return {
+                    "execution_type": "qa",
+                    "summary": summary,
+                    "facts": [],
+                    "artifacts": [],
+                    "document_ids": document_ids,
+                }
+            summary = self._answer_with_openai(
+                system_prompt=(
+                    "You are DocFusion Agent. There is currently no extracted fact data available for this request. "
+                    "Reply in natural Chinese, be honest about the limitation, and suggest the next best step."
+                ),
+                user_prompt=(
+                    f"User question: {message}\n"
+                    f"Parsed document count in scope: {len(document_ids)}\n"
+                    "Explain that there is no usable structured data yet and guide the user."
+                ),
+                fallback=self._fallback_no_data_qa(),
+            )
+            return {
+                "execution_type": "qa",
+                "summary": summary,
+                "facts": [],
+                "artifacts": [],
+                "document_ids": document_ids,
+            }
+
+        relevant = facts
+        if entities:
+            relevant = [f for f in relevant if f.entity_name in entities or any(e in f.entity_name for e in entities)]
+        if fields:
+            relevant = [f for f in relevant if f.field_name in fields]
+        if not relevant:
+            relevant = facts[:20]
+
+        if self._openai_client.is_configured:
+            try:
+                fact_text = "\n".join(
+                    f"- {f.entity_name} / {f.field_name} = {format_value(f.value_num) or f.value_text} {f.unit or ''}".strip()
+                    for f in relevant[:30]
+                )
+                payload = self._openai_client.create_json_completion(
+                    system_prompt=(
+                        "You are DocFusion Agent. Answer the user's question in Chinese using only the provided facts. "
+                        "Be concise, helpful, and do not invent missing data."
+                    ),
+                    user_prompt=f"Known facts:\n{fact_text}\n\nUser question: {message}",
+                    json_schema={
+                        "type": "object",
+                        "properties": {"answer": {"type": "string"}},
+                        "required": ["answer"],
+                        "additionalProperties": False,
+                    },
+                )
+                summary = str(payload.get("answer", "")).strip() or self._fallback_qa(relevant)
+            except OpenAIClientError:
+                summary = self._fallback_qa(relevant)
+        else:
+            summary = self._fallback_qa(relevant)
+
+        return {
+            "execution_type": "qa",
+            "summary": summary,
+            "facts": relevant[:10],
+            "artifacts": [],
+            "document_ids": document_ids,
+        }
+
+    @staticmethod
+    def _looks_like_content_summary_request(message: str) -> bool:
+        """鍒ゆ柇鐢ㄦ埛鏄惁鍦ㄨ姹傛枃妗ｅ唴瀹规鎷€?   Detect whether the user is asking for a content-oriented summary."""
+
+        normalized = " ".join(message.strip().split())
+        direct_keywords = (
+            "总结",
+            "概括",
+            "概述",
+            "摘要",
+            "主要内容",
+            "内容总结",
+            "文档总结",
+        )
+        question_keywords = (
+            "说了什么",
+            "讲了什么",
+            "写了什么",
+            "主要讲什么",
+            "讲的是什么",
+            "内容是什么",
+        )
+        return any(keyword in normalized for keyword in (*direct_keywords, *question_keywords))
+
+    def _fallback_summary(
+        self,
+        blocks: list[DocumentBlock],
+        facts: list[FactRecord],
+        document_ids: list[str],
+    ) -> str:
+        """浣跨敤瑙勫垯鏂瑰紡鐢熸垚鏇磋嚜鐒剁殑鍐呭鎽樿銆?   Generate a more natural content-first summary with deterministic rules."""
+
+        scoped_documents = self._get_scoped_documents(document_ids)
+        if not scoped_documents:
+            return "当前还没有可用于总结的已解析文档。你可以先上传文档，或指定要我概括的文档范围。"
+
+        blocks_by_doc: dict[str, list[DocumentBlock]] = {}
+        for block in blocks:
+            blocks_by_doc.setdefault(block.doc_id, []).append(block)
+
+        facts_by_doc: dict[str, list[FactRecord]] = {}
+        for fact in facts:
+            facts_by_doc.setdefault(fact.source_doc_id, []).append(fact)
+
+        summaries: list[str] = []
+        for document in scoped_documents[:3]:
+            doc_blocks = blocks_by_doc.get(document.doc_id, [])
+            doc_facts = facts_by_doc.get(document.doc_id, [])
+            title = self._pick_document_title(document, doc_blocks)
+            lead = self._collect_summary_lead(doc_blocks)
+            sections = self._collect_section_titles(doc_blocks)
+            indicators = self._collect_indicator_preview(doc_facts)
+
+            parts = [f"《{title}》"]
+            if lead:
+                parts.append(f"主要讲的是{lead}")
+            elif sections:
+                parts.append(f"主要围绕{'、'.join(sections[:3])}展开")
+            else:
+                parts.append("已经完成了解析，但还需要更具体的问题，我再继续细化概括")
+            if sections:
+                parts.append(f"后续重点包括{'、'.join(sections[:4])}")
+            if indicators:
+                parts.append(f"当前能提取到的关键指标有{'；'.join(indicators[:3])}")
+            summaries.append("，".join(parts).rstrip("，") + "。")
+
+        if len(scoped_documents) > 3:
+            summaries.append(f"当前范围内共 {len(scoped_documents)} 份文档，其余文档我也可以继续逐份细化摘要。")
+        elif not facts:
+            summaries.append("这批文档目前还没有稳定的结构化事实，但我已经可以继续按章节总结、检索原文或帮你提取指定字段。")
+
+        return " ".join(summaries).strip()
+
+    @staticmethod
+    def _clean_summary_text(text: str) -> str:
+        """娓呯悊鐢ㄤ簬鎽樿鐨勬枃鏈墖娈点€?   Clean text fragments used by fallback summaries."""
+
+        normalized = " ".join(text.replace("\r", " ").replace("\n", " ").split())
+        return normalized.strip("，。；： ")
+
+    def _pick_document_title(self, document: DocumentRecord, blocks: list[DocumentBlock]) -> str:
+        """閫夋嫨鏇存槗璇荤殑鏂囨。鏍囬銆?   Pick the most human-readable title for a document."""
+
+        for block in blocks:
+            text = self._clean_summary_text(block.text)
+            if block.block_type == "heading" and text:
+                return text
+        return Path(document.file_name).stem or document.file_name
+
+    def _collect_summary_lead(self, blocks: list[DocumentBlock]) -> str:
+        """鎻愬彇鏂囨。寮€澶寸殑鍐呭瑕佺偣銆?   Extract leading content snippets for a natural summary lead."""
+
+        lead_fragments: list[str] = []
+        for block in blocks:
+            if block.block_type not in {"paragraph", "table_row"}:
+                continue
+            text = self._clean_summary_text(block.text)
+            if len(text) < 12:
+                continue
+            lead_fragments.append(text[:80])
+            if len(lead_fragments) >= 2:
+                break
+        if not lead_fragments:
+            return ""
+        if len(lead_fragments) == 1:
+            return lead_fragments[0]
+        return f"{lead_fragments[0]}；并提到{lead_fragments[1]}"
+
+    def _collect_section_titles(self, blocks: list[DocumentBlock]) -> list[str]:
+        """鎻愬彇鏂囨。涓殑涓昏绔犺妭銆?   Extract the main section titles from document blocks."""
+
+        titles: list[str] = []
+        seen: set[str] = set()
+        for block in blocks:
+            if block.block_type != "heading":
+                continue
+            title = self._clean_summary_text(block.text or (block.section_path[-1] if block.section_path else ""))
+            if not title or title in seen:
+                continue
+            seen.add(title)
+            titles.append(title)
+        return titles[:5]
+
+    def _collect_indicator_preview(self, facts: list[FactRecord]) -> list[str]:
+        """鏀堕泦鍙敤浜庢憳瑕佺殑鎸囨爣棰勮銆?   Collect a small indicator preview for fallback summaries."""
+
+        previews: list[str] = []
+        seen: set[tuple[str, str]] = set()
+        for fact in facts:
+            key = (fact.entity_name, fact.field_name)
+            if key in seen:
+                continue
+            seen.add(key)
+            value = format_value(fact.value_num) if fact.value_num is not None else fact.value_text
+            if not value:
+                continue
+            unit = f" {fact.unit}" if fact.unit else ""
+            previews.append(f"{fact.entity_name}{fact.field_name}为{value}{unit}")
+        return previews[:5]
+
+    @staticmethod
+    def _looks_like_content_summary_request(message: str) -> bool:
+        """鍒ゆ柇鐢ㄦ埛鏄惁鍦ㄨ姹傛枃妗ｅ唴瀹规鎷€?   Detect whether the user is asking for a content-oriented summary."""
+
+        normalized = " ".join(message.strip().split())
+        direct_keywords = (
+            "\u603b\u7ed3",
+            "\u6982\u62ec",
+            "\u6982\u8ff0",
+            "\u6458\u8981",
+            "\u4e3b\u8981\u5185\u5bb9",
+            "\u5185\u5bb9\u603b\u7ed3",
+            "\u6587\u6863\u603b\u7ed3",
+        )
+        question_keywords = (
+            "\u8bf4\u4e86\u4ec0\u4e48",
+            "\u8bb2\u4e86\u4ec0\u4e48",
+            "\u5199\u4e86\u4ec0\u4e48",
+            "\u4e3b\u8981\u8bb2\u4ec0\u4e48",
+            "\u8bb2\u7684\u662f\u4ec0\u4e48",
+            "\u5185\u5bb9\u662f\u4ec0\u4e48",
+        )
+        return any(keyword in normalized for keyword in (*direct_keywords, *question_keywords))
+
+    def _fallback_summary(
+        self,
+        blocks: list[DocumentBlock],
+        facts: list[FactRecord],
+        document_ids: list[str],
+    ) -> str:
+        """浣跨敤鏇村亸涓婚褰掔撼鐨勫厹搴曟憳瑕併€?   Generate a topic-oriented fallback summary instead of copying the opening text."""
+
+        scoped_documents = self._get_scoped_documents(document_ids)
+        if not scoped_documents:
+            return "当前还没有可用于总结的已解析文档。你可以先上传文档，或指定要我概括的文档范围。"
+
+        blocks_by_doc: dict[str, list[DocumentBlock]] = {}
+        for block in blocks:
+            blocks_by_doc.setdefault(block.doc_id, []).append(block)
+
+        facts_by_doc: dict[str, list[FactRecord]] = {}
+        for fact in facts:
+            facts_by_doc.setdefault(fact.source_doc_id, []).append(fact)
+
+        summaries: list[str] = []
+        for document in scoped_documents[:3]:
+            doc_blocks = blocks_by_doc.get(document.doc_id, [])
+            doc_facts = facts_by_doc.get(document.doc_id, [])
+            title = self._pick_document_title(document, doc_blocks)
+            sections = self._collect_section_titles(doc_blocks)
+            lead = self._collect_summary_lead(doc_blocks)
+            indicators = self._collect_indicator_preview(doc_facts)
+            kind = self._infer_document_kind(title)
+            topic = self._derive_topic_from_title(title)
+
+            parts = [f"《{title}》"]
+            if topic:
+                parts.append(f"是一份关于{topic}的{kind}")
+            elif kind:
+                parts.append(f"是一份{kind}")
+
+            if lead:
+                parts.append(f"主要讲的是{lead}")
+            elif sections:
+                parts.append(f"重点包括{self._format_list_phrase(sections[:4])}")
+            else:
+                parts.append("已经完成了解析，如需更细的摘要我可以继续按章节展开")
+
+            if indicators:
+                parts.append(f"当前识别到的关键指标有{self._format_list_phrase(indicators[:3], delimiter='；')}")
+
+            summaries.append("，".join(parts).rstrip("，") + "。")
+
+        if len(scoped_documents) > 3:
+            summaries.append(f"当前范围内共 {len(scoped_documents)} 份文档，其余文档我也可以继续逐份细化摘要。")
+        elif not facts:
+            summaries.append("这批文档目前还没有稳定的结构化事实，但我已经可以继续按章节总结、检索原文或帮你提取指定字段。")
+
+        return " ".join(summaries).strip()
+
+    def _collect_summary_lead(self, blocks: list[DocumentBlock]) -> str:
+        """鎻愬彇鐢ㄤ簬鍏滃簳鎽樿鐨勪富棰樺紑鍦恒€?   Extract a short thematic lead for fallback summaries."""
+
+        lead_fragments: list[str] = []
+        for block in blocks:
+            if block.block_type not in {"paragraph", "table_row"}:
+                continue
+            text = self._clean_summary_text(block.text)
+            if len(text) < 12 or self._is_summary_boilerplate(text):
+                continue
+            lead_fragments.append(text[:48])
+            if len(lead_fragments) >= 2:
+                break
+        if not lead_fragments:
+            return ""
+        if len(lead_fragments) == 1:
+            return lead_fragments[0]
+        return f"{lead_fragments[0]}，并提到{lead_fragments[1]}"
+
+    @staticmethod
+    def _is_summary_boilerplate(text: str) -> bool:
+        """鍒ゆ柇鏄惁涓烘憳瑕佷腑搴斿敖閲忚烦杩囩殑鍏枃濂楄瘽銆?   Detect boilerplate lines that should be skipped in summaries."""
+
+        boilerplates = (
+            "发布时间",
+            "发布单位",
+            "中华人民共和国",
+            "文化和旅游部",
+            "发布日期",
+            "作者",
+            "来源",
+        )
+        return any(keyword in text for keyword in boilerplates)
+
+    @staticmethod
+    def _infer_document_kind(title: str) -> str:
+        """鏍规嵁鏍囬鎺ㄦ柇鏂囨。绫诲瀷銆?   Infer a document kind from the title."""
+
+        kind_map = (
+            ("统计公报", "统计公报"),
+            ("公报", "公报"),
+            ("报告", "报告"),
+            ("通报", "通报"),
+            ("方案", "方案"),
+            ("白皮书", "白皮书"),
+            ("年报", "年度报告"),
+            ("季报", "季度报告"),
+        )
+        for keyword, label in kind_map:
+            if keyword in title:
+                return label
+        return "文档"
+
+    def _derive_topic_from_title(self, title: str) -> str:
+        """浠庢爣棰樹腑鎻愮偧涓婚鐭銆?   Derive a topic phrase from the title."""
+
+        cleaned = self._clean_summary_text(title)
+        cleaned = re.sub(r"^\d{4}年", "", cleaned)
+        cleaned = re.sub(r"[一二三四五六七八九十]+、", "", cleaned)
+        generic_words = ("统计公报", "公报", "报告", "通报", "方案", "白皮书", "年报", "季报")
+        for word in generic_words:
+            cleaned = cleaned.replace(word, "")
+        cleaned = cleaned.strip("关于")
+        cleaned = self._clean_summary_text(cleaned)
+        return cleaned or title
+
+    @staticmethod
+    def _format_list_phrase(items: list[str], delimiter: str = "、") -> str:
+        """鏍煎紡鍖栨憳瑕佷腑鐨勫垪琛ㄧ煭璇€?   Format list phrases used inside summaries."""
+
+        cleaned = [item.strip() for item in items if item.strip()]
+        return delimiter.join(cleaned)
 
     @staticmethod
     def _fallback_qa(facts: list[FactRecord]) -> str:

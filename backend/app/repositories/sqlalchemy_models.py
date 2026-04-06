@@ -82,6 +82,7 @@ class FactRow(Base):
 
     __table_args__ = (
         Index("ix_facts_lookup", "entity_name", "field_name", "year", "unit"),
+        Index("ix_facts_group_lookup_model", "entity_type", "entity_name", "field_name", "year", "unit"),
     )
 
 
@@ -122,3 +123,18 @@ class TemplateResultRow(Base):
     fill_mode: Mapped[str] = mapped_column(String(64), nullable=False)
     document_ids: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
     filled_cells: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False, default=list)
+
+
+class ConversationRow(Base):
+    """瀵硅瘽琛?ORM 妯″瀷銆?
+    ORM model for the conversations table.
+    """
+
+    __tablename__ = "conversations"
+
+    conversation_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    title: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    messages: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False, default=list)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column("metadata", JSONB, nullable=False, default=dict)

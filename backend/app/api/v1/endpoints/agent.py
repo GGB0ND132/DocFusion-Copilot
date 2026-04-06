@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from dataclasses import asdict
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, HTTPException, Request
@@ -91,7 +92,7 @@ def clear_conversation(context_id: str) -> dict:
 def list_conversations() -> list[ConversationResponse]:
     """列出全部对话记录（按更新时间倒序）。    List all conversations ordered by updated_at DESC."""
     records = get_container().agent_service.list_conversations()
-    return [ConversationResponse.model_validate(r.__dict__) for r in records]
+    return [ConversationResponse.model_validate(asdict(record)) for record in records]
 
 
 @router.post("/conversations", response_model=ConversationResponse, status_code=201)
@@ -109,7 +110,7 @@ def create_conversation(payload: ConversationCreateRequest) -> ConversationRespo
         metadata=dict(payload.metadata),
     )
     saved = get_container().repository.create_conversation(record)
-    return ConversationResponse.model_validate(saved.__dict__)
+    return ConversationResponse.model_validate(asdict(saved))
 
 
 @router.get("/conversations/{conversation_id}", response_model=ConversationResponse)
@@ -118,7 +119,7 @@ def get_conversation(conversation_id: str) -> ConversationResponse:
     record = get_container().repository.get_conversation(conversation_id)
     if record is None:
         raise HTTPException(status_code=404, detail="Conversation not found.")
-    return ConversationResponse.model_validate(record.__dict__)
+    return ConversationResponse.model_validate(asdict(record))
 
 
 @router.put("/conversations/{conversation_id}", response_model=ConversationResponse)
@@ -138,7 +139,7 @@ def update_conversation(conversation_id: str, payload: ConversationUpdateRequest
     updated = repo.update_conversation(record)
     if updated is None:
         raise HTTPException(status_code=404, detail="Conversation not found.")
-    return ConversationResponse.model_validate(updated.__dict__)
+    return ConversationResponse.model_validate(asdict(updated))
 
 
 async def _parse_multipart_execute_request(request: Request) -> dict[str, object]:

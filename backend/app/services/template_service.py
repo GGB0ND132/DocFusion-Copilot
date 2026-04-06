@@ -426,7 +426,7 @@ class TemplateService:
 
         candidate_ids = self.resolve_document_ids(document_set_id, None)
         if not candidate_ids:
-            raise ValueError("No parsed documents are available for template filling.")
+            raise ValueError("当前没有可用于回填的已解析源文档，请先上传并完成解析。")
 
         if not auto_match:
             return candidate_ids, {

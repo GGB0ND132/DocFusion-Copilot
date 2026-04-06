@@ -32,14 +32,16 @@ import {
   getTaskStatus,
   runAgentExecute,
   downloadAgentArtifact,
-  submitTemplateFill,
   downloadTemplateResult,
   clearAgentConversation,
+  listDocuments,
   listConversations,
   createConversation,
+  getConversation,
   deleteConversation,
   type AgentExecuteResponse,
   type ConversationResponse,
+  type DocumentResponse,
   type FilledCellResponse,
   type TaskResponse,
 } from '@/services';
@@ -61,6 +63,8 @@ export default function AgentPage() {
   const [fillTaskId, setFillTaskId] = useState<string | null>(null);
   const [fillTask, setFillTask] = useState<TaskResponse | null>(null);
   const [traceInput, setTraceInput] = useState('');
+  const [availableDocuments, setAvailableDocuments] = useState<DocumentResponse[]>([]);
+  const [documentsHydrated, setDocumentsHydrated] = useState(false);
 
   const uploadedDocuments = useUiStore((s) => s.uploadedDocuments);
   const currentDocumentSetId = useUiStore((s) => s.currentDocumentSetId);
@@ -74,7 +78,32 @@ export default function AgentPage() {
 
   const [sidebarOpen, setSidebarOpen] = useState(true);
 
-  const uploadedDocIds = useMemo(() => uploadedDocuments.map((d) => d.document.doc_id), [uploadedDocuments]);
+  const refreshAvailableDocuments = useCallback(async () => {
+    const docs = await listDocuments();
+    setAvailableDocuments(docs);
+    setDocumentsHydrated(true);
+    return docs;
+  }, []);
+
+  const knownDocuments = useMemo(
+    () => mergeKnownDocuments(availableDocuments, uploadedDocuments),
+    [availableDocuments, uploadedDocuments],
+  );
+  const documentScope = useMemo(
+    () => resolveAgentDocumentScope(knownDocuments, currentDocumentSetId),
+    [knownDocuments, currentDocumentSetId],
+  );
+  const scopedDocuments = documentScope.scopedDocuments;
+  const effectiveDocumentSetId = documentScope.effectiveDocumentSetId;
+  const scopedDocumentIds = useMemo(() => scopedDocuments.map((doc) => doc.doc_id), [scopedDocuments]);
+  const parsedScopedDocuments = useMemo(
+    () => scopedDocuments.filter((doc) => doc.status === 'parsed'),
+    [scopedDocuments],
+  );
+  const parsedScopedDocIds = useMemo(
+    () => parsedScopedDocuments.map((doc) => doc.doc_id),
+    [parsedScopedDocuments],
+  );
 
   // Auto-scroll to bottom
   useEffect(() => {
@@ -85,6 +114,22 @@ export default function AgentPage() {
   useEffect(() => {
     listConversations().then(setConversationList).catch(() => {});
   }, [setConversationList]);
+
+  useEffect(() => {
+    refreshAvailableDocuments().catch(() => {
+      setDocumentsHydrated(true);
+    });
+  }, [refreshAvailableDocuments]);
+
+  useEffect(() => {
+    if (!documentsHydrated) return;
+    const hasPendingDocuments = scopedDocuments.some((doc) => doc.status === 'uploaded' || doc.status === 'parsing');
+    if (!hasPendingDocuments) return;
+    const timer = window.setInterval(() => {
+      refreshAvailableDocuments().catch(() => {});
+    }, 3000);
+    return () => window.clearInterval(timer);
+  }, [documentsHydrated, scopedDocuments, refreshAvailableDocuments]);
 
   // Refresh conversation list when context changes
   const refreshConversations = useCallback(() => {
@@ -97,11 +142,22 @@ export default function AgentPage() {
     setFillTask(null);
   }, [startNewConversation]);
 
-  const handleSwitchConversation = useCallback((conv: ConversationResponse) => {
+  const handleSwitchConversation = useCallback(async (conv: ConversationResponse) => {
     switchConversation(conv);
     setFillTaskId(null);
     setFillTask(null);
-  }, [switchConversation]);
+    try {
+      const fullConversation = await getConversation(conv.conversation_id);
+      switchConversation(fullConversation);
+      setConversationList(
+        conversationList.map((item) => (
+          item.conversation_id === fullConversation.conversation_id ? fullConversation : item
+        )),
+      );
+    } catch {
+      toast.error('?????????????????????');
+    }
+  }, [switchConversation, setConversationList, conversationList]);
 
   const handleDeleteConversation = useCallback(async (convId: string) => {
     try {
@@ -137,6 +193,11 @@ export default function AgentPage() {
     return () => window.clearInterval(timer);
   }, [fillTaskId, fillTask, upsertTaskSnapshot]);
 
+  useEffect(() => {
+    if (!templateFile || !documentsHydrated || parsedScopedDocIds.length > 0) return;
+    toast.info('当前还没有已解析的源文档。请先上传并完成原始文档解析，再回填模板。');
+  }, [templateFile, documentsHydrated, parsedScopedDocIds.length]);
+
   const handleTemplateSelect = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0] ?? null;
     setTemplateFile(file);
@@ -154,17 +215,62 @@ export default function AgentPage() {
     if (textareaRef.current) textareaRef.current.style.height = 'auto';
     addAgentMessage({ role: 'user', text, timestamp: Date.now() });
 
+    let activeContextId = agentContextId;
+    if (!activeContextId) {
+      try {
+        const conversation = await createConversation();
+        activeContextId = conversation.conversation_id;
+        setAgentContextId(activeContextId);
+        refreshConversations();
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : '创建对话失败';
+        addAgentMessage({ role: 'assistant', text: `错误：${msg}`, timestamp: Date.now() });
+        toast.error(msg);
+        return;
+      }
+    }
+
+    let runtimeParsedDocIds = parsedScopedDocIds;
+    let runtimeDocumentSetId = effectiveDocumentSetId;
+    try {
+      const latestDocuments = await refreshAvailableDocuments();
+      const latestScope = resolveAgentDocumentScope(
+        mergeKnownDocuments(latestDocuments, uploadedDocuments),
+        currentDocumentSetId,
+      );
+      runtimeParsedDocIds = latestScope.scopedDocuments
+        .filter((doc) => doc.status === 'parsed')
+        .map((doc) => doc.doc_id);
+      runtimeDocumentSetId = latestScope.effectiveDocumentSetId;
+    } catch {
+      // Keep the locally derived scope if refresh fails.
+    }
+
+    if (templateFile && runtimeParsedDocIds.length === 0) {
+      const warning = '当前还没有已解析的源文档。请先上传并完成原始文档解析，再回填模板。';
+      addAgentMessage({ role: 'assistant', text: warning, timestamp: Date.now() });
+      toast.info(warning);
+      return;
+    }
+
     // If there's a template file, do template fill instead of agent execute
     if (templateFile) {
       setIsExecuting(true);
       try {
-        const resp = await submitTemplateFill({
-          templateFile,
-          documentSetId: currentDocumentSetId ?? 'default',
-          fillMode: 'canonical',
+        const resp = await runAgentExecute({
+          message: text,
+          contextId: activeContextId ?? undefined,
+          documentSetId: runtimeDocumentSetId ?? undefined,
+          documentIds: runtimeParsedDocIds,
           autoMatch: true,
-          userRequirement: text,
+          templateFile,
         });
+        if (resp.context_id && resp.context_id !== agentContextId) {
+          setAgentContextId(resp.context_id);
+        }
+        if (!resp.task_id) {
+          throw new Error('未返回模板回填任务 ID');
+        }
         setFillTaskId(resp.task_id);
         const task = await getTaskStatus(resp.task_id);
         setFillTask(task);
@@ -175,6 +281,7 @@ export default function AgentPage() {
           timestamp: Date.now(),
           taskId: resp.task_id,
         });
+        refreshConversations();
       } catch (err) {
         const msg = err instanceof Error ? err.message : '模板回填失败';
         addAgentMessage({ role: 'assistant', text: `错误：${msg}`, timestamp: Date.now() });
@@ -190,29 +297,21 @@ export default function AgentPage() {
     try {
       const r = await runAgentExecute({
         message: text,
-        contextId: agentContextId ?? undefined,
-        documentSetId: currentDocumentSetId ?? undefined,
+        contextId: activeContextId ?? undefined,
+        documentSetId: runtimeDocumentSetId ?? undefined,
+        documentIds: runtimeParsedDocIds,
         autoMatch: true,
       });
       if (r.context_id && r.context_id !== agentContextId) {
         setAgentContextId(r.context_id);
       }
-      const isDirectAnswer = ['qa', 'status', 'summary'].includes(r.execution_type);
-      const summary = isDirectAnswer
-        ? r.summary
-        : [
-            `意图：${r.intent}`,
-            r.entities.length ? `实体：${r.entities.join(', ')}` : null,
-            r.fields.length ? `字段：${r.fields.join(', ')}` : null,
-            `执行类型：${r.execution_type}`,
-            r.summary,
-            r.facts.length ? `提取了 ${r.facts.length} 条事实。` : null,
-            r.artifacts.length ? `生成了 ${r.artifacts.length} 个产物文件。` : null,
-          ]
-            .filter(Boolean)
-            .join('\n');
-
-      addAgentMessage({ role: 'assistant', text: summary, timestamp: Date.now(), data: r });
+      const summary = formatAgentReply(r);
+      addAgentMessage({
+        role: 'assistant',
+        text: summary,
+        timestamp: Date.now(),
+        data: shouldRenderOperationCard(r) ? r : undefined,
+      });
       refreshConversations();
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Agent 执行失败';
@@ -221,7 +320,7 @@ export default function AgentPage() {
     } finally {
       setIsExecuting(false);
     }
-  }, [inputText, isExecuting, templateFile, currentDocumentSetId, upsertTaskSnapshot, addAgentMessage, agentContextId, setAgentContextId]);
+  }, [inputText, isExecuting, templateFile, parsedScopedDocIds, effectiveDocumentSetId, refreshAvailableDocuments, uploadedDocuments, currentDocumentSetId, upsertTaskSnapshot, addAgentMessage, agentContextId, setAgentContextId, refreshConversations]);
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
@@ -319,7 +418,12 @@ export default function AgentPage() {
                 className={`group flex items-center gap-1 rounded px-2 py-1.5 text-xs cursor-pointer hover:bg-muted ${agentContextId === conv.conversation_id ? 'bg-muted font-medium' : ''}`}
                 onClick={() => handleSwitchConversation(conv)}
               >
-                <span className="flex-1 truncate">{conv.title || '未命名对话'}</span>
+                <div className="min-w-0 flex-1">
+                  <div className="truncate">{getConversationDisplayTitle(conv)}</div>
+                  <div className="truncate text-[10px] text-muted-foreground">
+                    {getConversationPreview(conv)}
+                  </div>
+                </div>
                 <button
                   className="invisible group-hover:visible shrink-0 text-muted-foreground hover:text-destructive"
                   onClick={(e) => { e.stopPropagation(); handleDeleteConversation(conv.conversation_id); }}
@@ -526,23 +630,24 @@ export default function AgentPage() {
           </TabsContent>
 
           {/* ── Context tab ── */}
+          {/* ?? Context tab ?? */}
           <TabsContent value="context" className="flex-1 overflow-hidden m-0">
             <ScrollArea className="h-full">
               <div className="p-3 space-y-3 text-xs">
                 <div className="space-y-1">
                   <span className="text-muted-foreground">document_set_id</span>
-                  <p className="font-mono text-[10px] break-all">{currentDocumentSetId ?? '未设置'}</p>
+                  <p className="font-mono text-[10px] break-all">{effectiveDocumentSetId ?? currentDocumentSetId ?? '未设置'}</p>
                 </div>
                 <Separator />
                 <div className="space-y-1">
-                  <span className="text-muted-foreground">已上传文档 ({uploadedDocIds.length})</span>
-                  {uploadedDocuments.length === 0 ? (
+                  <span className="text-muted-foreground">可用源文档 ({scopedDocumentIds.length})</span>
+                  {scopedDocuments.length === 0 ? (
                     <p className="text-muted-foreground">无。请先在工作台上传文档。</p>
                   ) : (
-                    uploadedDocuments.map((d) => (
-                      <div key={d.document.doc_id} className="flex items-center gap-1.5 py-0.5">
-                        <StatusDot status={d.status} />
-                        <span className="truncate">{d.document.file_name}</span>
+                    scopedDocuments.map((doc) => (
+                      <div key={doc.doc_id} className="flex items-center gap-1.5 py-0.5">
+                        <StatusDot status={doc.status} />
+                        <span className="truncate">{doc.file_name}</span>
                       </div>
                     ))
                   )}
@@ -556,7 +661,7 @@ export default function AgentPage() {
             </ScrollArea>
           </TabsContent>
 
-          {/* ── Trace tab ── */}
+          {/* ?? Trace tab ?? */}
           <TabsContent value="trace" className="flex-1 overflow-hidden m-0">
             <div className="p-3 space-y-3">
               <div className="flex gap-1">
@@ -581,7 +686,7 @@ export default function AgentPage() {
   );
 }
 
-/* ── Helpers ── */
+/* ?? Helpers ?? */
 
 function TaskStatusBadge({ status }: { status: string }) {
   if (['succeeded', 'completed', 'success'].includes(status))
@@ -597,15 +702,131 @@ function StatusDot({ status }: { status: string }) {
   return <span className={`inline-block h-1.5 w-1.5 rounded-full ${color}`} />;
 }
 
+function mergeKnownDocuments(
+  documents: DocumentResponse[],
+  uploadedEntries: Array<{ document: DocumentResponse; status: string }>,
+): DocumentResponse[] {
+  const merged = new Map<string, DocumentResponse>();
+  documents.forEach((doc) => {
+    merged.set(doc.doc_id, doc);
+  });
+  uploadedEntries.forEach((entry) => {
+    const existing = merged.get(entry.document.doc_id);
+    merged.set(entry.document.doc_id, {
+      ...(existing ?? entry.document),
+      ...entry.document,
+      status: entry.status || entry.document.status || existing?.status || 'uploaded',
+    });
+  });
+  return Array.from(merged.values());
+}
+
+function getDocumentSetId(document: DocumentResponse): string | null {
+  const rawValue = document.metadata?.document_set_id;
+  return typeof rawValue === 'string' && rawValue.trim().length > 0 ? rawValue : null;
+}
+
+function isSourceDocument(document: DocumentResponse): boolean {
+  return document.metadata?.document_role !== 'prompt_instruction';
+}
+
+function resolveAgentDocumentScope(
+  documents: DocumentResponse[],
+  currentDocumentSetId: string | null,
+): { scopedDocuments: DocumentResponse[]; effectiveDocumentSetId: string | null } {
+  const sourceDocuments = documents.filter(isSourceDocument);
+  if (!currentDocumentSetId) {
+    return { scopedDocuments: sourceDocuments, effectiveDocumentSetId: null };
+  }
+
+  const sameSetDocuments = sourceDocuments.filter((doc) => getDocumentSetId(doc) === currentDocumentSetId);
+  if (sameSetDocuments.length > 0) {
+    return {
+      scopedDocuments: sameSetDocuments,
+      effectiveDocumentSetId: currentDocumentSetId,
+    };
+  }
+
+  return { scopedDocuments: sourceDocuments, effectiveDocumentSetId: null };
+}
+
+
+function getConversationDisplayTitle(conv: ConversationResponse): string {
+  const title = typeof conv.title === 'string' ? conv.title.trim() : '';
+  if (title) {
+    return title;
+  }
+  const firstUserMessage = conv.messages.find((message) => String(message.role ?? '') === 'user');
+  const fallback = String(firstUserMessage?.content ?? '').trim();
+  return fallback || '未命名对话';
+}
+
+function getConversationPreview(conv: ConversationResponse): string {
+  const messages = Array.isArray(conv.messages) ? conv.messages : [];
+  const lastMessage = [...messages].reverse().find((message) => {
+    const content = String(message.content ?? '').trim();
+    return content.length > 0 && String(message.role ?? '') !== 'system';
+  });
+  if (!lastMessage) {
+    return '暂无消息';
+  }
+  return String(lastMessage.content ?? '').replace(/\s+/g, ' ').trim();
+}
+
+function formatAgentReply(data: AgentExecuteResponse): string {
+  const { execution_type, summary, facts, artifacts, entities, fields, template_name } = data;
+
+  if (['conversation', 'qa', 'status', 'summary'].includes(execution_type)) {
+    return summary;
+  }
+
+  if (execution_type === 'template_fill_task') {
+    return [template_name ? `\u5df2\u63d0\u4ea4\u6a21\u677f\u56de\u586b\u4efb\u52a1\uff1a${template_name}` : '\u5df2\u63d0\u4ea4\u6a21\u677f\u56de\u586b\u4efb\u52a1\u3002', summary]
+      .filter(Boolean)
+      .join('\n');
+  }
+
+  if (execution_type === 'fact_query') {
+    const scope = [
+      entities.length ? `\u5b9e\u4f53\uff1a${entities.join('\u3001')}` : null,
+      fields.length ? `\u5b57\u6bb5\uff1a${fields.join('\u3001')}` : null,
+    ]
+      .filter(Boolean)
+      .join('\uff1b');
+    const lead = facts.length > 0 ? `\u5df2\u5339\u914d ${facts.length} \u6761\u4e8b\u5b9e\u3002` : '\u6682\u672a\u5339\u914d\u5230\u53ef\u5c55\u793a\u7684\u4e8b\u5b9e\u3002';
+    return [lead, scope || null, summary].filter(Boolean).join('\n');
+  }
+
+  if (execution_type === 'extract') {
+    return `\u5df2\u5b8c\u6210\u5b57\u6bb5\u63d0\u53d6\u3002\n${summary}`;
+  }
+
+  if (execution_type === 'export') {
+    return ['\u5df2\u751f\u6210\u5bfc\u51fa\u7ed3\u679c\u3002', summary, artifacts.length ? `\u4ea7\u7269\u6570\u91cf\uff1a${artifacts.length}` : null]
+      .filter(Boolean)
+      .join('\n');
+  }
+
+  if (execution_type === 'edit' || execution_type === 'reformat') {
+    return `\u5df2\u5b8c\u6210\u6587\u6863\u5904\u7406\u3002\n${summary}`;
+  }
+
+  return summary;
+}
+
+function shouldRenderOperationCard(data: AgentExecuteResponse): boolean {
+  return ['extract', 'fact_query', 'edit', 'reformat', 'export'].includes(data.execution_type);
+}
+
 const EXECUTION_LABELS: Record<string, string> = {
-  edit: '文档编辑',
-  reformat: '格式整理',
-  extract: '字段提取',
-  export: '数据导出',
-  fact_query: '事实查询',
-  summary: '文档摘要',
-  qa: '智能问答',
-  status: '系统状态',
+  edit: '\u6587\u6863\u7f16\u8f91',
+  reformat: '\u683c\u5f0f\u6574\u7406',
+  extract: '\u5b57\u6bb5\u63d0\u53d6',
+  export: '\u7ed3\u679c\u5bfc\u51fa',
+  fact_query: '\u4e8b\u5b9e\u67e5\u8be2',
+  summary: '\u6587\u6863\u6458\u8981',
+  qa: '\u667a\u80fd\u95ee\u7b54',
+  status: '\u7cfb\u7edf\u72b6\u6001',
 };
 
 function OperationResultCard({
@@ -621,7 +842,6 @@ function OperationResultCard({
 
   return (
     <div className="mt-2 space-y-2">
-      {/* Operation type badge + stats */}
       {label && (
         <div className="flex items-center gap-2 flex-wrap">
           <Badge variant="secondary" className="text-[9px] h-4">{label}</Badge>
@@ -629,13 +849,13 @@ function OperationResultCard({
             art.change_count != null ? (
               <span key={art.file_name} className="text-[10px] text-muted-foreground">
                 {art.operation === 'edit_document'
-                  ? `${art.change_count} 处替换`
+                  ? `${art.change_count} \u5904\u66ff\u6362`
                   : art.operation === 'extract_fields'
-                    ? `${art.change_count} 条记录`
+                    ? `${art.change_count} \u6761\u8bb0\u5f55`
                     : art.operation === 'export_results'
-                      ? `${art.change_count} 条导出`
+                      ? `${art.change_count} \u6761\u5bfc\u51fa`
                       : art.operation === 'query_facts'
-                        ? `${art.change_count} 条匹配`
+                        ? `${art.change_count} \u6761\u5339\u914d`
                         : null}
               </span>
             ) : null,
@@ -643,16 +863,15 @@ function OperationResultCard({
         </div>
       )}
 
-      {/* Extracted facts mini-table (for extract / fact_query) */}
       {['extract', 'fact_query'].includes(execution_type) && facts.length > 0 && (
         <div className="rounded border text-[10px] overflow-x-auto">
           <table className="w-full">
             <thead>
               <tr className="border-b bg-muted/50">
-                <th className="px-1.5 py-0.5 text-left font-medium">实体</th>
-                <th className="px-1.5 py-0.5 text-left font-medium">字段</th>
-                <th className="px-1.5 py-0.5 text-right font-medium">值</th>
-                <th className="px-1.5 py-0.5 text-left font-medium">单位</th>
+                <th className="px-1.5 py-0.5 text-left font-medium">{'\u5b9e\u4f53'}</th>
+                <th className="px-1.5 py-0.5 text-left font-medium">{'\u5b57\u6bb5'}</th>
+                <th className="px-1.5 py-0.5 text-right font-medium">{'\u503c'}</th>
+                <th className="px-1.5 py-0.5 text-left font-medium">{'\u5355\u4f4d'}</th>
               </tr>
             </thead>
             <tbody>
@@ -667,12 +886,11 @@ function OperationResultCard({
             </tbody>
           </table>
           {facts.length > 8 && (
-            <div className="px-1.5 py-0.5 text-muted-foreground text-center">…及其他 {facts.length - 8} 条</div>
+            <div className="px-1.5 py-0.5 text-center text-muted-foreground">{`\u2026\u53ca\u5176\u4ed6 ${facts.length - 8} \u6761`}</div>
           )}
         </div>
       )}
 
-      {/* Artifact download buttons */}
       {artifacts.length > 0 && (
         <div className="flex flex-wrap gap-1">
           {artifacts.map((art) => (

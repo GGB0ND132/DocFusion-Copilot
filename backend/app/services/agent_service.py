@@ -10,6 +10,53 @@ from app.models.domain import ConversationRecord
 from app.repositories.base import Repository
 from app.utils.normalizers import find_entity_mentions
 
+_ALLOWED_INTENTS = {
+    "small_talk",
+    "extract_facts",
+    "query_facts",
+    "extract_and_fill_template",
+    "trace_fact",
+    "edit_document",
+    "summarize_document",
+    "reformat_document",
+    "query_status",
+    "general_qa",
+    "extract_fields",
+    "export_results",
+}
+
+_SMALL_TALK_EXACT = {
+    "你好",
+    "您好",
+    "hi",
+    "hello",
+    "嗨",
+    "哈喽",
+    "在吗",
+    "在不在",
+    "早上好",
+    "上午好",
+    "中午好",
+    "下午好",
+    "晚上好",
+    "早安",
+    "晚安",
+    "谢谢",
+    "多谢",
+    "感谢",
+    "辛苦了",
+    "help",
+}
+_SMALL_TALK_CONTAINS = (
+    "你是谁",
+    "你能做什么",
+    "你可以做什么",
+    "怎么用",
+    "如何使用",
+    "能帮我做什么",
+    "帮助",
+)
+
 _REPLACE_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"[将把](?P<old>.+?)(?:替换为|改为|改成)(?P<new>.+)"),
     re.compile(r"把文中(?P<old>.+?)(?:替换为|改为|改成)(?P<new>.+)"),
@@ -43,6 +90,15 @@ class AgentService:
             self._conversations[context_id] = msgs
             return list(msgs)
         return []
+
+    def _get_cached_history_ref(self, context_id: str) -> list[dict[str, str]]:
+        """???????????????    Return a mutable cached history reference."""
+        history = self._conversations.get(context_id)
+        if history is not None:
+            return history
+        history = self.get_conversation(context_id)
+        self._conversations[context_id] = history
+        return history
 
     def clear_conversation(self, context_id: str) -> None:
         """清空指定对话的历史记录。    Clear the message history for a conversation."""
@@ -84,7 +140,7 @@ class AgentService:
     def _append_message(self, context_id: str, role: str, content: str) -> None:
         """向指定对话追加一条消息，超长时自动截断。    Append a message and auto-trim when the history grows too long."""
         self._ensure_conversation(context_id)
-        history = self._conversations.setdefault(context_id, [])
+        history = self._get_cached_history_ref(context_id)
         history.append({"role": role, "content": content})
         if len(history) > self._MAX_HISTORY:
             self._conversations[context_id] = history[-self._TRIM_TO:]
@@ -92,10 +148,16 @@ class AgentService:
 
     def _get_history_for_llm(self, context_id: str) -> list[dict[str, str]]:
         """返回用于传入 LLM 的最近 N 条历史消息。    Return recent history messages for LLM context."""
-        history = self._conversations.get(context_id, [])
+        history = self._get_cached_history_ref(context_id)
         return history[-self._CONTEXT_WINDOW:]
 
-    def chat(self, message: str, context_id: str | None = None) -> dict[str, object]:
+    def chat(
+        self,
+        message: str,
+        context_id: str | None = None,
+        *,
+        store_preview_message: bool = True,
+    ) -> dict[str, object]:
         """将用户消息转换为轻量意图与预览结果。    Turn a user message into a lightweight intent and preview payload."""
 
         with log_operation(self._logger, "agent_chat"):
@@ -123,22 +185,39 @@ class AgentService:
                 "planner": "openai" if plan.get("planner") == "openai" else "rules",
             }
 
-            if context_id:
-                self._append_message(context_id, "assistant", f"intent={intent}, entities={entities}, fields={fields}")
+            if context_id and store_preview_message:
+                self._append_message(context_id, "assistant", self._build_preview_message(result))
 
             return result
+
+    def record_execution_result(self, context_id: str | None, summary: str) -> None:
+        """灏嗘墽琛岀殑鏈€缁堝洖澶嶅悓姝ュ埌瀵硅瘽璁板綍銆?
+        Persist the final execution reply into the conversation history.
+        """
+
+        if not context_id:
+            return
+        cleaned = summary.strip()
+        if not cleaned:
+            return
+        history = self._conversations.setdefault(context_id, self.get_conversation(context_id))
+        if history and history[-1].get("role") == "assistant":
+            history[-1]["content"] = cleaned
+            self._sync_to_repo(context_id)
+            return
+        self._append_message(context_id, "assistant", cleaned)
 
     def _plan_message(self, message: str, *, context_id: str | None = None) -> dict[str, object]:
         """为自然语言消息生成结构化执行计划。    Generate a structured execution plan for a natural-language message."""
 
         if self._openai_client.is_configured:
             try:
-                return self._plan_with_openai(message, context_id=context_id)
+                return self._plan_with_openai_llm(message, context_id=context_id)
             except OpenAIClientError:
                 pass
         return self._fallback_plan(message)
 
-    def _plan_with_openai(self, message: str, *, context_id: str | None = None) -> dict[str, object]:
+    def _plan_with_openai_legacy(self, message: str, *, context_id: str | None = None) -> dict[str, object]:
         """使用 OpenAI 兼容接口生成结构化计划。    Generate a structured plan using an OpenAI-compatible API."""
 
         extra_messages = self._get_history_for_llm(context_id) if context_id else None
@@ -190,12 +269,75 @@ class AgentService:
         payload["planner"] = "openai"
         return payload
 
+    def _plan_with_openai_llm(self, message: str, *, context_id: str | None = None) -> dict[str, object]:
+        """使用 OpenAI 优先分析用户意图。  Use OpenAI first for intent analysis."""
+
+        extra_messages = self._get_history_for_llm(context_id) if context_id else None
+        payload = self._openai_client.create_json_completion(
+            system_prompt=(
+                "You are the intent planner for the DocFusion backend. "
+                "Convert the user's latest message into a concise executable JSON plan. "
+                "Allowed intents are: small_talk, extract_facts, query_facts, "
+                "extract_and_fill_template, trace_fact, edit_document, summarize_document, "
+                "reformat_document, query_status, general_qa, extract_fields, export_results. "
+                "Use small_talk for greetings, thanks, capability questions, and light chit-chat. "
+                "Use general_qa for open-ended questions that still need a natural-language answer. "
+                "Use extract_and_fill_template when the user wants a template, spreadsheet, or table filled. "
+                "Keep entities and fields short and literal. Return JSON only."
+            ),
+            user_prompt=f"User message:\n{message}",
+            json_schema={
+                "type": "object",
+                "properties": {
+                    "intent": {"type": "string"},
+                    "entities": {"type": "array", "items": {"type": "string"}},
+                    "fields": {"type": "array", "items": {"type": "string"}},
+                    "target": {"type": "string"},
+                    "need_db_store": {"type": "boolean"},
+                    "edits": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "old_text": {"type": "string"},
+                                "new_text": {"type": "string"},
+                            },
+                            "required": ["old_text", "new_text"],
+                            "additionalProperties": False,
+                        },
+                    },
+                },
+                "required": ["intent", "entities", "fields", "target", "need_db_store", "edits"],
+                "additionalProperties": False,
+            },
+            extra_messages=extra_messages,
+        )
+        intent = str(payload.get("intent", "general_qa")).strip() or "general_qa"
+        if intent not in _ALLOWED_INTENTS:
+            intent = "general_qa"
+        return {
+            "intent": intent,
+            "entities": [str(entity).strip() for entity in payload.get("entities", []) if str(entity).strip()],
+            "fields": [str(field).strip() for field in payload.get("fields", []) if str(field).strip()],
+            "target": str(
+                payload.get("target")
+                or ("uploaded_template" if intent == "extract_and_fill_template" else "fact_store")
+            ),
+            "need_db_store": bool(
+                payload.get("need_db_store", intent in {"extract_and_fill_template", "extract_facts"})
+            ),
+            "edits": self._normalize_edits(payload.get("edits", [])),
+            "planner": "openai",
+        }
+
     def _infer_intent(self, message: str) -> str:
         """根据关键词规则推断最匹配的意图。    Infer the best-matching intent from keyword rules."""
 
         edits = self._infer_edits(message)
         if edits:
             return "edit_document"
+        if self._is_small_talk(message):
+            return "small_talk"
 
         lowered = message.lower()
         best_intent: str | None = None
@@ -207,11 +349,22 @@ class AgentService:
                     best_intent = intent
         if best_intent is not None:
             return best_intent
+        if any(
+            keyword in message
+            for keyword in (
+                "\u8bf4\u4e86\u4ec0\u4e48",
+                "\u8bb2\u4e86\u4ec0\u4e48",
+                "\u5199\u4e86\u4ec0\u4e48",
+                "\u4e3b\u8981\u8bb2\u4ec0\u4e48",
+                "\u5185\u5bb9\u662f\u4ec0\u4e48",
+            )
+        ):
+            return "summarize_document"
         if any(keyword in message for keyword in ("摘要", "总结", "概述")):
             return "summarize_document"
         if any(keyword in message for keyword in ("排版", "格式", "整理", "规范", "重排", "清理")):
             return "reformat_document"
-        return "query_facts"
+        return "general_qa"
 
     def _fallback_plan(self, message: str) -> dict[str, object]:
         """使用本地规则生成执行计划。    Generate an execution plan using local rules."""
@@ -259,6 +412,51 @@ class AgentService:
         while cleaned and cleaned[-1] in _TRAILING_PUNCTUATION:
             cleaned = cleaned[:-1].rstrip()
         return cleaned.strip(_QUOTE_CHARS).strip()
+
+    def _is_small_talk(self, message: str) -> bool:
+        """鍒ゆ柇娑堟伅鏄惁灞炰簬瀵掓殏銆佹眰鍔╂垨绠€鍗曢棽鑱娿€?
+        Determine whether a message is a greeting, help request, or light chit-chat.
+        """
+
+        lowered = message.lower().strip()
+        collapsed = re.sub(r"\s+", "", lowered).strip("!?,.，。！？~～")
+        if collapsed in _SMALL_TALK_EXACT:
+            return True
+        return any(keyword in lowered or keyword in message for keyword in _SMALL_TALK_CONTAINS)
+
+    def _build_preview_message(self, result: dict[str, object]) -> str:
+        """涓虹粨鏋勫寲璁″垝鐢熸垚鏇磋嚜鐒剁殑瀵硅瘽棰勮銆?
+        Build a more natural assistant preview message for a structured plan.
+        """
+
+        intent = str(result.get("intent", ""))
+        entities = [str(entity) for entity in result.get("entities", [])]
+        fields = [str(field) for field in result.get("fields", [])]
+        if intent == "small_talk":
+            return "我已识别为日常对话，会直接用自然语言回复你。"
+        if intent == "extract_and_fill_template":
+            return "我已理解为模板回填请求，等待模板文件或继续执行填表。"
+        if intent == "query_facts":
+            scope_parts: list[str] = []
+            if entities:
+                scope_parts.append(f"实体：{', '.join(entities)}")
+            if fields:
+                scope_parts.append(f"字段：{', '.join(fields)}")
+            suffix = f"（{'；'.join(scope_parts)}）" if scope_parts else ""
+            return f"我会先从已解析事实中检索相关数据{suffix}。"
+        if intent == "summarize_document":
+            return "我会先阅读已解析内容，并给出简洁摘要。"
+        if intent == "reformat_document":
+            return "我会按你的要求整理文档格式并生成结果文件。"
+        if intent == "edit_document":
+            return "我会根据你的编辑要求生成修改后的文档。"
+        if intent == "query_status":
+            return "我会先汇总当前文档、事实和任务状态。"
+        if intent == "extract_fields":
+            return "我会按你指定的字段范围提取结构化结果。"
+        if intent == "export_results":
+            return "我会把当前结果整理成可下载文件。"
+        return "我已理解你的请求，正在准备合适的处理方式。"
 
     def _normalize_edits(self, raw_edits: object) -> list[dict[str, str]]:
         """把计划中的编辑描述标准化为替换对。    Normalize edit descriptions from a plan into replacement pairs."""

@@ -15,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.core.config import Settings
 from app.core.openai_client import OpenAICompatibleClient
-from app.models.domain import DocumentRecord, DocumentStatus, FactRecord
+from app.models.domain import DocumentBlock, DocumentRecord, DocumentStatus, FactRecord
 from app.parsers.factory import ParserRegistry
 from app.repositories.memory import InMemoryRepository
 from app.services.agent_service import AgentService
@@ -30,6 +30,24 @@ from app.tasks.executor import TaskExecutor
 from app.utils.spreadsheet import load_xlsx
 from app.utils.wordprocessing import load_docx_tables
 from app.utils.evaluation import generate_benchmark_markdown
+
+
+class FakeOpenAIClient:
+    """测试用的 OpenAI 假客户端。  Fake OpenAI client for deterministic tests."""
+
+    def __init__(self, responses: list[dict[str, object]]) -> None:
+        self._responses = list(responses)
+        self.calls: list[dict[str, object]] = []
+
+    @property
+    def is_configured(self) -> bool:
+        return True
+
+    def create_json_completion(self, **kwargs: object) -> dict[str, object]:
+        self.calls.append(dict(kwargs))
+        if not self._responses:
+            raise AssertionError("No fake OpenAI responses left.")
+        return dict(self._responses.pop(0))
 
 
 class BackendPipelineTests(unittest.TestCase):
@@ -113,6 +131,27 @@ class BackendPipelineTests(unittest.TestCase):
         self.assertEqual(4, len(facts))
         self.assertEqual({"GDP总量", "常住人口", "人均GDP", "一般公共预算收入"}, fields)
         self.assertTrue(all(fact.entity_name == "上海" for fact in facts))
+
+    def test_document_parse_task_records_stage_timings(self) -> None:
+        """解析任务结果应记录解析、抽取、入库和总耗时。   Parse tasks should record parse, extract, store and total timings."""
+
+        content = "Synthetic timing probe for XLSX-style ingestion coverage."
+        document, task = self.document_service.upload_document("timed_city_report.txt", content.encode("utf-8"))
+        self.executor.wait(task.task_id, timeout=5)
+
+        stored_task = self.repository.get_task(task.task_id)
+        stored_document = self.repository.get_document(document.doc_id)
+
+        self.assertIsNotNone(stored_task)
+        self.assertIsNotNone(stored_document)
+        self.assertIn("parse_seconds", stored_task.result)
+        self.assertIn("extract_seconds", stored_task.result)
+        self.assertIn("store_seconds", stored_task.result)
+        self.assertIn("total_seconds", stored_task.result)
+        self.assertIn("parse_seconds", stored_document.metadata)
+        self.assertIn("extract_seconds", stored_document.metadata)
+        self.assertIn("store_seconds", stored_document.metadata)
+        self.assertIn("total_seconds", stored_document.metadata)
 
     def test_template_fill_populates_xlsx_cells(self) -> None:
         """XLSX 模板回填应把事实写回单元格。    XLSX template filling should write facts back into cells."""
@@ -200,21 +239,88 @@ class BackendPipelineTests(unittest.TestCase):
         self.assertEqual("B2", trace["usages"][0]["cell_ref"])
 
     def test_document_interaction_service_can_summarize_documents(self) -> None:
-        """文档交互服务应能输出规则摘要。    The document interaction service should produce a deterministic summary."""
+        """Document summaries should read like content summaries, not processing logs."""
 
         content = (
-            "# 城市发展报告\n\n"
-            "2025年，上海GDP总量56,708.71亿元，常住人口2,487.45万人。"
+            "# \u57ce\u5e02\u53d1\u5c55\u62a5\u544a\n\n"
+            "2025\u5e74\uff0c\u4e0a\u6d77GDP\u603b\u91cf56,708.71\u4ebf\u5143\uff0c\u5e38\u4f4f\u4eba\u53e32,487.45\u4e07\u4eba\u3002"
         )
         _, task = self.document_service.upload_document("summary.md", content.encode("utf-8"))
         self.executor.wait(task.task_id, timeout=5)
 
-        result = self.document_interaction_service.execute(message="请总结这份文档", context_id="ctx_demo")
+        result = self.document_interaction_service.execute(message="\u8bf7\u603b\u7ed3\u8fd9\u4efd\u6587\u6863", context_id="ctx_demo")
 
         self.assertEqual("summarize_document", result["intent"])
         self.assertEqual("summary", result["execution_type"])
-        self.assertIn("共处理", result["summary"])
+        self.assertIn("\u57ce\u5e02\u53d1\u5c55\u62a5\u544a", result["summary"])
+        self.assertIn("\u4e3b\u8981\u8bb2\u7684\u662f", result["summary"])
         self.assertEqual("ctx_demo", result["context_id"])
+
+    def test_document_interaction_service_content_question_prefers_document_summary(self) -> None:
+        """Content questions should prefer a document summary over a workspace inventory."""
+
+        self.repository.add_document(
+            DocumentRecord(
+                doc_id="doc_summary_only",
+                file_name="\u0032\u0030\u0032\u0033\u5e74\u6587\u5316\u548c\u65c5\u6e38\u53d1\u5c55\u7edf\u8ba1\u516c\u62a5.md",
+                stored_path="2023-report.md",
+                doc_type="md",
+                upload_time=datetime.now(timezone.utc),
+                status=DocumentStatus.parsed,
+                metadata={},
+            )
+        )
+        self.repository.replace_blocks(
+            "doc_summary_only",
+            [
+                DocumentBlock(
+                    block_id="blk_heading",
+                    doc_id="doc_summary_only",
+                    block_type="heading",
+                    text="\u0032\u0030\u0032\u0033\u5e74\u6587\u5316\u548c\u65c5\u6e38\u53d1\u5c55\u7edf\u8ba1\u516c\u62a5",
+                    section_path=["\u0032\u0030\u0032\u0033\u5e74\u6587\u5316\u548c\u65c5\u6e38\u53d1\u5c55\u7edf\u8ba1\u516c\u62a5"],
+                    page_or_index=1,
+                    metadata={},
+                ),
+                DocumentBlock(
+                    block_id="blk_para_1",
+                    doc_id="doc_summary_only",
+                    block_type="paragraph",
+                    text="\u0032\u0030\u0032\u0033\u5e74\uff0c\u5168\u56fd\u6587\u5316\u548c\u65c5\u6e38\u4f53\u7cfb\u7ee7\u7eed\u6062\u590d\u53d1\u5c55\uff0c\u6587\u5316\u4f9b\u7ed9\u548c\u65c5\u6e38\u6d88\u8d39\u6d3b\u529b\u7a33\u6b65\u589e\u5f3a\u3002",
+                    section_path=["\u0032\u0030\u0032\u0033\u5e74\u6587\u5316\u548c\u65c5\u6e38\u53d1\u5c55\u7edf\u8ba1\u516c\u62a5"],
+                    page_or_index=2,
+                    metadata={},
+                ),
+                DocumentBlock(
+                    block_id="blk_heading_2",
+                    doc_id="doc_summary_only",
+                    block_type="heading",
+                    text="\u4e00\u3001\u827a\u672f\u521b\u4f5c\u751f\u4ea7\u6301\u7eed\u7e41\u8363",
+                    section_path=["\u0032\u0030\u0032\u0033\u5e74\u6587\u5316\u548c\u65c5\u6e38\u53d1\u5c55\u7edf\u8ba1\u516c\u62a5", "\u4e00\u3001\u827a\u672f\u521b\u4f5c\u751f\u4ea7\u6301\u7eed\u7e41\u8363"],
+                    page_or_index=3,
+                    metadata={},
+                ),
+                DocumentBlock(
+                    block_id="blk_para_2",
+                    doc_id="doc_summary_only",
+                    block_type="paragraph",
+                    text="\u6587\u6863\u8fd8\u56f4\u7ed5\u827a\u672f\u521b\u4f5c\u3001\u516c\u5171\u670d\u52a1\u4f53\u7cfb\u548c\u6587\u5316\u673a\u6784\u5efa\u8bbe\u7b49\u5185\u5bb9\u5c55\u5f00\u3002",
+                    section_path=["\u0032\u0030\u0032\u0033\u5e74\u6587\u5316\u548c\u65c5\u6e38\u53d1\u5c55\u7edf\u8ba1\u516c\u62a5", "\u4e00\u3001\u827a\u672f\u521b\u4f5c\u751f\u4ea7\u6301\u7eed\u7e41\u8363"],
+                    page_or_index=4,
+                    metadata={},
+                ),
+            ],
+        )
+
+        result = self.document_interaction_service.execute(
+            message="\u8fd9\u4e2a\u6587\u6863\u8bf4\u4e86\u4ec0\u4e48\uff1f",
+            document_ids=["doc_summary_only"],
+        )
+
+        self.assertIn(result["execution_type"], {"qa", "summary"})
+        self.assertIn("\u0032\u0030\u0032\u0033\u5e74\u6587\u5316\u548c\u65c5\u6e38\u53d1\u5c55\u7edf\u8ba1\u516c\u62a5", result["summary"])
+        self.assertIn("\u4e3b\u8981\u8bb2\u7684\u662f", result["summary"])
+        self.assertNotIn("\u5de5\u4f5c\u53f0\u91cc\u6709", result["summary"])
 
     def test_document_interaction_service_can_reformat_text_documents(self) -> None:
         """文本整理应输出规范化的 Markdown。    Text cleanup should output normalized Markdown."""
@@ -327,6 +433,21 @@ class BackendPipelineTests(unittest.TestCase):
         rows = {row.row_index: row.values for row in first_sheet.rows}
         self.assertEqual("56708.71", rows[2][1])
         self.assertEqual("2487.45", rows[2][2])
+
+    def test_template_fill_requires_source_documents(self) -> None:
+        """未提供源文档时应给出明确提示。  Template filling should require source documents."""
+
+        template_bytes = build_simple_template_xlsx(
+            headers=["鍩庡競", "GDP鎬婚噺锛堜嚎鍏冿級"],
+            rows=[["涓婃捣", ""]],
+        )
+
+        with self.assertRaisesRegex(ValueError, "请先上传并解析源文档"):
+            self.document_interaction_service.execute(
+                message="璇锋妸杩欎釜妯℃澘濉ソ",
+                template_name="city_template.xlsx",
+                template_content=template_bytes,
+            )
 
     def test_fact_review_can_recompute_canonical_selection(self) -> None:
         """人工复核应能更新事实状态并重算 canonical 结果。    Manual review should update fact status and recompute the canonical winner."""
@@ -665,6 +786,173 @@ class BackendPipelineTests(unittest.TestCase):
 
     # ── T-1: 对话 CRUD 测试 ──
 
+    def test_agent_small_talk_returns_conversation_reply(self) -> None:
+        """寒暄类消息应返回自然对话回复。    Greeting messages should return a conversational reply."""
+
+        result = self.document_interaction_service.execute(
+            message="你好",
+            context_id="ctx_small_talk",
+        )
+
+        self.assertEqual("small_talk", result["intent"])
+        self.assertEqual("conversation", result["execution_type"])
+        self.assertIn("你好", result["summary"])
+
+        record = self.repository.get_conversation("ctx_small_talk")
+        self.assertIsNotNone(record)
+        self.assertEqual("user", record.messages[0]["role"])
+        self.assertEqual("assistant", record.messages[-1]["role"])
+        self.assertNotIn("intent=", str(record.messages[-1]["content"]))
+
+    def test_agent_service_uses_openai_for_greeting_intent_when_configured(self) -> None:
+        """已配置 OpenAI 时，寒暄意图应优先由模型判定。  Greeting intent should be planned by OpenAI first when configured."""
+
+        fake_client = FakeOpenAIClient([
+            {
+                "intent": "small_talk",
+                "entities": [],
+                "fields": [],
+                "target": "fact_store",
+                "need_db_store": False,
+                "edits": [],
+            }
+        ])
+        agent_service = AgentService(repository=self.repository, openai_client=fake_client)  # type: ignore[arg-type]
+
+        result = agent_service.chat("你好")
+
+        self.assertEqual("small_talk", result["intent"])
+        self.assertEqual("openai", result["planner"])
+        self.assertEqual(1, len(fake_client.calls))
+
+    def test_document_interaction_service_uses_openai_for_small_talk_reply_when_configured(self) -> None:
+        """已配置 OpenAI 时，寒暄回复应优先由模型生成。  Small-talk replies should be model-generated when configured."""
+
+        fake_client = FakeOpenAIClient([
+            {
+                "intent": "small_talk",
+                "entities": [],
+                "fields": [],
+                "target": "fact_store",
+                "need_db_store": False,
+                "edits": [],
+            },
+            {"answer": "你好，我在。当前还没有已解析文档，你可以先上传文档或模板。"},
+        ])
+        agent_service = AgentService(repository=self.repository, openai_client=fake_client)  # type: ignore[arg-type]
+        interaction_service = DocumentInteractionService(
+            repository=self.repository,
+            agent_service=agent_service,
+            template_service=self.template_service,
+            settings=self.settings,
+            openai_client=fake_client,  # type: ignore[arg-type]
+        )
+
+        result = interaction_service.execute(message="你好", context_id="ctx_llm_small_talk")
+
+        self.assertEqual("small_talk", result["intent"])
+        self.assertEqual("conversation", result["execution_type"])
+        self.assertEqual("你好，我在。当前还没有已解析文档，你可以先上传文档或模板。", result["summary"])
+        self.assertEqual(2, len(fake_client.calls))
+
+    def test_document_interaction_service_uses_openai_for_no_data_qa_when_configured(self) -> None:
+        """无数据时应优先由模型生成解释回复。  No-data QA should prefer an OpenAI-generated explanation."""
+
+        fake_client = FakeOpenAIClient([
+            {
+                "intent": "general_qa",
+                "entities": [],
+                "fields": [],
+                "target": "fact_store",
+                "need_db_store": False,
+                "edits": [],
+            },
+            {"answer": "当前还没有可用的解析数据。你可以先上传文档，我再帮你分析。"},
+        ])
+        agent_service = AgentService(repository=self.repository, openai_client=fake_client)  # type: ignore[arg-type]
+        interaction_service = DocumentInteractionService(
+            repository=self.repository,
+            agent_service=agent_service,
+            template_service=self.template_service,
+            settings=self.settings,
+            openai_client=fake_client,  # type: ignore[arg-type]
+        )
+
+        result = interaction_service.execute(message="我们的工作台中有文档吗？")
+
+        self.assertEqual("general_qa", result["intent"])
+        self.assertEqual("qa", result["execution_type"])
+        self.assertEqual("当前还没有可用的解析数据。你可以先上传文档，我再帮你分析。", result["summary"])
+        self.assertEqual(2, len(fake_client.calls))
+
+    def test_document_interaction_service_answers_from_documents_when_facts_are_missing(self) -> None:
+        """有文档但无 facts 时应基于文档内容回答。  QA should answer from documents when facts are missing."""
+
+        self.repository.add_document(
+            DocumentRecord(
+                doc_id="doc_blocks_only",
+                file_name="2023年文化和旅游发展统计公报.md",
+                stored_path="2023-report.md",
+                doc_type="md",
+                upload_time=datetime.now(timezone.utc),
+                status=DocumentStatus.parsed,
+                metadata={},
+            )
+        )
+        self.repository.replace_blocks(
+            "doc_blocks_only",
+            [
+                DocumentBlock(
+                    block_id="blk_heading",
+                    doc_id="doc_blocks_only",
+                    block_type="heading",
+                    text="2023年文化和旅游发展统计公报",
+                    section_path=["2023年文化和旅游发展统计公报"],
+                    page_or_index=1,
+                    metadata={},
+                ),
+                DocumentBlock(
+                    block_id="blk_para",
+                    doc_id="doc_blocks_only",
+                    block_type="paragraph",
+                    text="中华人民共和国文化和旅游部 发布时间：2024年08月30日",
+                    section_path=["2023年文化和旅游发展统计公报"],
+                    page_or_index=2,
+                    metadata={},
+                ),
+            ],
+        )
+
+        fake_client = FakeOpenAIClient([
+            {
+                "intent": "general_qa",
+                "entities": [],
+                "fields": [],
+                "target": "fact_store",
+                "need_db_store": False,
+                "edits": [],
+            },
+            {"answer": "当前工作台里有 1 份已解析文档，包括《2023年文化和旅游发展统计公报.md》。我已经能读取它的标题和正文开头内容。"},
+        ])
+        agent_service = AgentService(repository=self.repository, openai_client=fake_client)  # type: ignore[arg-type]
+        interaction_service = DocumentInteractionService(
+            repository=self.repository,
+            agent_service=agent_service,
+            template_service=self.template_service,
+            settings=self.settings,
+            openai_client=fake_client,  # type: ignore[arg-type]
+        )
+
+        result = interaction_service.execute(
+            message="我们的工作台有什么",
+            document_ids=["doc_blocks_only"],
+        )
+
+        self.assertEqual("general_qa", result["intent"])
+        self.assertEqual("qa", result["execution_type"])
+        self.assertIn("2023年文化和旅游发展统计公报.md", result["summary"])
+        self.assertEqual(2, len(fake_client.calls))
+
     def test_conversation_crud_lifecycle(self) -> None:
         """创建 / 列表 / 获取 / 更新 / 删除对话应正常工作。
         Conversation CRUD lifecycle should work correctly."""
@@ -729,6 +1017,35 @@ class BackendPipelineTests(unittest.TestCase):
         # Clear conversation
         self.agent_service.clear_conversation(context_id)
         self.assertIsNone(self.repository.get_conversation(context_id))
+
+    def test_agent_service_preserves_persisted_history_after_reinitialization(self) -> None:
+        """?? AgentService ??????????????????
+        Reinitialized AgentService instances should preserve persisted history when appending messages."""
+
+        context_id = "ctx_history_resume"
+        self.agent_service.chat("??", context_id=context_id)
+
+        first_record = self.repository.get_conversation(context_id)
+        self.assertIsNotNone(first_record)
+        first_length = len(first_record.messages)
+        self.assertGreaterEqual(first_length, 2)
+
+        resumed_service = AgentService(
+            repository=self.repository,
+            openai_client=OpenAICompatibleClient(
+                api_key="",
+                base_url="",
+                model="gpt-4o-mini",
+            ),
+        )
+        resumed_service.chat("?????", context_id=context_id)
+
+        updated_record = self.repository.get_conversation(context_id)
+        self.assertIsNotNone(updated_record)
+        self.assertGreaterEqual(len(updated_record.messages), first_length + 2)
+        contents = [str(message.get("content", "")) for message in updated_record.messages]
+        self.assertIn("??", contents)
+        self.assertIn("?????", contents)
 
     # ── T-1: Fact 复核测试 ──
 
