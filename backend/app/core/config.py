@@ -176,7 +176,7 @@ class Settings:
 
     @property
     def cors_expose_headers(self) -> list[str]:
-        """杩斿洖鍏佽鍓嶇璇诲彇鐨勫搷搴斿ご鍒楄〃銆?
+        """返回允许前端读取的响应头列表。
         Return the response headers exposed to the frontend via CORS.
         """
         return list(self.cors_expose_headers_raw)

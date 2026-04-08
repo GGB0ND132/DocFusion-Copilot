@@ -32,10 +32,11 @@ class FactExtractionService:
 
     _logger = get_logger("fact_extraction")
 
-    def __init__(self) -> None:
-        """鍒濆鍖栬〃澶磋鍒欑紦瀛樸€?   Initialize caches for worksheet header profiles."""
+    def __init__(self, openai_client: object | None = None) -> None:
+        """初始化表头规则缓存。   Initialize caches for worksheet header profiles."""
 
         self._table_profile_cache: dict[tuple[str, ...], dict[str, object]] = {}
+        self._openai_client = openai_client
 
     def extract(self, document: DocumentRecord, blocks: list[DocumentBlock]) -> list[FactRecord]:
         """执行块级抽取并返回去重后的事实列表。    Run block-level extraction and return deduplicated facts."""
@@ -48,6 +49,10 @@ class FactExtractionService:
                     continue
                 facts.extend(self._extract_from_text(document, block))
             result = list(self._deduplicate(facts).values())
+            if not result and blocks:
+                llm_facts = self._extract_with_llm_fallback(document, blocks)
+                if llm_facts:
+                    result = list(self._deduplicate(llm_facts).values())
             if not result:
                 self._logger.warning(
                     "No facts extracted",
@@ -359,3 +364,104 @@ class FactExtractionService:
         """判断当前命中是否与已接受命中重叠。    Return whether the current match overlaps an accepted span."""
 
         return any(start < existing_end and end > existing_start for existing_start, existing_end in spans)
+
+    def _extract_with_llm_fallback(self, document: DocumentRecord, blocks: list[DocumentBlock]) -> list[FactRecord]:
+        """当规则引擎未抽取到事实时，使用 LLM 进行语义抽取。
+        Use LLM to extract facts when the rule engine yields nothing.
+        """
+
+        if self._openai_client is None or not getattr(self._openai_client, "is_configured", False):
+            return []
+
+        text_blocks = [b for b in blocks if b.block_type in {"paragraph", "heading", "page"}]
+        if not text_blocks:
+            return []
+
+        preview = "\n".join(b.text[:300] for b in text_blocks[:8])[:3000]
+        year = infer_year(preview) or infer_year(document.file_name)
+
+        try:
+            from app.core.openai_client import OpenAIClientError
+            payload = self._openai_client.create_json_completion(
+                system_prompt=(
+                    "你是结构化信息抽取引擎。从给定文本中提取所有可量化的事实三元组。"
+                    "每条事实包含 entity_name（实体名，如城市/国家/公司）、field_name（指标名）、"
+                    "value（数值或文本值）、unit（单位，可为空）。"
+                    "只输出文本中明确给出的事实，不要编造。最多输出 30 条。"
+                ),
+                user_prompt=f"文档名: {document.file_name}\n\n文本内容:\n{preview}",
+                json_schema={
+                    "type": "object",
+                    "properties": {
+                        "facts": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "entity_name": {"type": "string"},
+                                    "field_name": {"type": "string"},
+                                    "value": {"type": "string"},
+                                    "unit": {"type": "string"},
+                                },
+                                "required": ["entity_name", "field_name", "value"],
+                            },
+                        },
+                    },
+                    "required": ["facts"],
+                    "additionalProperties": False,
+                },
+            )
+        except Exception:
+            self._logger.debug("LLM fact extraction fallback failed", exc_info=True)
+            return []
+
+        raw_facts = payload.get("facts", [])
+        if not isinstance(raw_facts, list):
+            return []
+
+        results: list[FactRecord] = []
+        first_block_id = blocks[0].block_id if blocks else ""
+        for item in raw_facts:
+            if not isinstance(item, dict):
+                continue
+            entity = str(item.get("entity_name", "")).strip()
+            field = str(item.get("field_name", "")).strip()
+            raw_value = str(item.get("value", "")).strip()
+            unit = str(item.get("unit", "")).strip() or None
+            if not entity or not field or not raw_value:
+                continue
+
+            value_num, detected_unit = extract_numeric_with_unit(raw_value)
+            if value_num is not None:
+                canonical_field = normalize_field_name(field)
+                if canonical_field:
+                    value_num, unit = convert_to_canonical_unit(canonical_field, value_num, detected_unit or unit)
+                    field = canonical_field
+
+            entity = normalize_entity_name(entity) or entity
+
+            results.append(
+                FactRecord(
+                    fact_id=new_id("fact"),
+                    entity_type=FIELD_ENTITY_TYPES.get(field, "generic"),
+                    entity_name=entity,
+                    field_name=field,
+                    value_num=value_num,
+                    value_text=raw_value,
+                    unit=unit if value_num is not None else None,
+                    year=year,
+                    source_doc_id=document.doc_id,
+                    source_block_id=first_block_id,
+                    source_span=preview[:200],
+                    confidence=0.75,
+                    status="pending_review",
+                    metadata={"extraction_method": "llm_fallback"},
+                )
+            )
+
+        self._logger.info(
+            "LLM fallback extracted %d facts",
+            len(results),
+            extra={"doc_id": document.doc_id},
+        )
+        return results
