@@ -61,7 +61,7 @@ class XlsxParser(DocumentParser):
 
     @staticmethod
     def _normalize_headers(headers: list[str]) -> list[str]:
-        """鍘婚櫎绌虹櫧琛ㄥご骞跺幓鎺夊熬閮ㄧ┖鍒椼€?   Drop blank headers and trim trailing empty columns."""
+        """去除空白表头并去掉尾部空列。   Drop blank headers and trim trailing empty columns."""
 
         normalized = [header.strip() for header in headers]
         while normalized and not normalized[-1]:
@@ -70,7 +70,7 @@ class XlsxParser(DocumentParser):
 
     @staticmethod
     def _trim_row_values(values: list[str], header_count: int) -> list[str]:
-        """鎸夎〃澶村垪鏁版敹缂╄鍊煎垪琛ㄣ€?   Trim row values to the effective header width."""
+        """按表头列数收缩行值列表。   Trim row values to the effective header width."""
 
         if header_count <= 0:
             return []

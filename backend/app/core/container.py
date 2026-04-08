@@ -56,7 +56,7 @@ def get_container() -> ServiceContainer:
         timeout_seconds=settings.openai_timeout_seconds,
     )
     parser_registry = ParserRegistry()
-    extraction_service = FactExtractionService()
+    extraction_service = FactExtractionService(openai_client=openai_client)
     document_service = DocumentService(
         repository=repository,
         parser_registry=parser_registry,
