@@ -20,6 +20,7 @@ import {
   Trash2,
   PanelLeftClose,
   PanelLeftOpen,
+  Sparkles,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
@@ -72,6 +73,7 @@ export default function AgentPage() {
   const currentDocumentSetId = useUiStore((s) => s.currentDocumentSetId);
   const upsertTaskSnapshot = useUiStore((s) => s.upsertTaskSnapshot);
   const openTraceByFactId = useUiStore((s) => s.openTraceByFactId);
+  const tracePanel = useUiStore((s) => s.tracePanel);
   const conversationList = useUiStore((s) => s.conversationList);
   const setConversationList = useUiStore((s) => s.setConversationList);
   const switchConversation = useUiStore((s) => s.switchConversation);
@@ -456,6 +458,37 @@ export default function AgentPage() {
         {/* Chat messages */}
         <ScrollArea className="flex-1" ref={scrollRef}>
           <div className="mx-auto max-w-3xl space-y-4 p-4">
+            {messages.length === 0 && !isExecuting && (
+              <div className="flex flex-col items-center justify-center py-12 text-center">
+                <Bot className="h-10 w-10 text-primary/40 mb-3" />
+                <h3 className="text-sm font-medium mb-1">欢迎使用 DocFusion Agent</h3>
+                <p className="text-xs text-muted-foreground mb-4 max-w-md">
+                  上传文档后，您可以用自然语言指令完成以下操作：
+                </p>
+                <div className="grid grid-cols-2 gap-2 text-[11px] text-left max-w-sm">
+                  {[
+                    ['📊', '帮我智能填表', '上传模板 + 发送指令'],
+                    ['🔍', '查询上海的 GDP', '按实体/字段精确查询'],
+                    ['📝', '总结一下这些文档', '自动生成文档摘要'],
+                    ['✂️', '把甲方替换为乙方', '编辑/删除/替换内容'],
+                    ['📥', '导出为 Excel', '将事实数据导出为文件'],
+                    ['📁', '当前系统状态', '查看文档/解析进度'],
+                  ].map(([icon, title, desc]) => (
+                    <button
+                      key={title}
+                      className="flex items-start gap-1.5 rounded-md border p-2 hover:bg-muted transition-colors text-left"
+                      onClick={() => { setInputText(title); textareaRef.current?.focus(); }}
+                    >
+                      <span>{icon}</span>
+                      <div>
+                        <div className="font-medium">{title}</div>
+                        <div className="text-muted-foreground text-[10px]">{desc}</div>
+                      </div>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
             {messages.map((msg, i) => (
               <div key={i} className={`flex gap-3 ${msg.role === 'user' ? 'justify-end' : ''}`}>
                 {msg.role !== 'user' && (
@@ -500,8 +533,22 @@ export default function AgentPage() {
           </div>
         </ScrollArea>
 
-        {/* Input bar */}
+        {/* Quick prompt chips + Input bar */}
         <div className="border-t bg-card p-3">
+          {!templateFile && messages.length > 0 && (
+            <div className="mx-auto max-w-3xl mb-2 flex gap-1.5 overflow-x-auto pb-1 scrollbar-none">
+              {['总结一下这些文档', '查询事实数据', '导出为 Excel', '当前系统状态'].map((prompt) => (
+                <button
+                  key={prompt}
+                  className="shrink-0 rounded-full border px-2.5 py-0.5 text-[10px] text-muted-foreground hover:bg-muted hover:text-foreground transition-colors flex items-center gap-1"
+                  onClick={() => { setInputText(prompt); textareaRef.current?.focus(); }}
+                >
+                  <Sparkles className="h-2.5 w-2.5" />
+                  {prompt}
+                </button>
+              ))}
+            </div>
+          )}
           <div className="mx-auto flex max-w-3xl items-end gap-2">
             <input ref={templateInputRef} type="file" accept=".xlsx,.docx,.txt,.md" className="hidden" onChange={handleTemplateSelect} />
             <Button
@@ -624,6 +671,16 @@ export default function AgentPage() {
                           <div className="text-[9px] font-mono text-muted-foreground/60 truncate">
                             {cell.fact_id}
                           </div>
+                          {cell.fact_id && (
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              className="h-5 text-[9px] px-1.5 text-primary hover:text-primary/80"
+                              onClick={() => openTraceByFactId(cell.fact_id, `${cell.sheet_name}/${cell.cell_ref}`)}
+                            >
+                              <Search className="h-2.5 w-2.5 mr-0.5" /> 追溯来源
+                            </Button>
+                          )}
                         </CardContent>
                       </Card>
                     ))}
@@ -669,8 +726,9 @@ export default function AgentPage() {
             </ScrollArea>
           </TabsContent>
 
-          {/* ?? Trace tab ?? */}
+          {/* ── Trace tab ── */}
           <TabsContent value="trace" className="flex-1 overflow-hidden m-0">
+            <ScrollArea className="h-full">
             <div className="p-3 space-y-3">
               <div className="flex gap-1">
                 <Input
@@ -683,8 +741,134 @@ export default function AgentPage() {
                   <Search className="h-3.5 w-3.5" />
                 </Button>
               </div>
-              <p className="text-[10px] text-muted-foreground">输入事实 ID 后查询其来源追溯信息。</p>
+
+              {/* Trace loading */}
+              {tracePanel.loading && (
+                <div className="flex items-center gap-2 text-xs text-muted-foreground py-4 justify-center">
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" /> 正在查询追溯信息…
+                </div>
+              )}
+
+              {/* Trace error */}
+              {tracePanel.error && (
+                <div className="text-xs text-destructive bg-destructive/10 rounded p-2">
+                  {tracePanel.error}
+                </div>
+              )}
+
+              {/* Trace results */}
+              {tracePanel.data && !tracePanel.loading && (
+                <div className="space-y-3">
+                  {tracePanel.cellLabel && (
+                    <div className="text-[10px] text-muted-foreground">
+                      单元格：<span className="font-medium text-foreground">{tracePanel.cellLabel}</span>
+                    </div>
+                  )}
+
+                  {/* Fact info card */}
+                  <Card className="p-0 shadow-none">
+                    <CardContent className="p-2.5 space-y-1.5">
+                      <div className="text-[10px] font-medium text-primary">事实详情</div>
+                      <div className="grid grid-cols-2 gap-x-3 gap-y-1 text-[10px]">
+                        <div>
+                          <span className="text-muted-foreground">实体：</span>
+                          <span className="font-medium">{tracePanel.data.fact.entity_name}</span>
+                        </div>
+                        <div>
+                          <span className="text-muted-foreground">字段：</span>
+                          <span className="font-medium">{tracePanel.data.fact.field_name}</span>
+                        </div>
+                        <div>
+                          <span className="text-muted-foreground">值：</span>
+                          <span className="font-medium">
+                            {tracePanel.data.fact.value_num ?? tracePanel.data.fact.value_text}
+                            {tracePanel.data.fact.unit ? ` ${tracePanel.data.fact.unit}` : ''}
+                          </span>
+                        </div>
+                        <div>
+                          <span className="text-muted-foreground">年份：</span>
+                          <span className="font-medium">{tracePanel.data.fact.year ?? '—'}</span>
+                        </div>
+                        <div className="col-span-2">
+                          <span className="text-muted-foreground">置信度：</span>
+                          <Badge
+                            variant={tracePanel.data.fact.confidence < 0.7 ? 'destructive' : 'outline'}
+                            className="text-[9px] h-4 ml-1"
+                          >
+                            {(tracePanel.data.fact.confidence * 100).toFixed(0)}%
+                          </Badge>
+                        </div>
+                      </div>
+                      <div className="text-[9px] font-mono text-muted-foreground/60 break-all">
+                        ID: {tracePanel.data.fact.fact_id}
+                      </div>
+                    </CardContent>
+                  </Card>
+
+                  {/* Source document card */}
+                  {tracePanel.data.document && (
+                    <Card className="p-0 shadow-none">
+                      <CardContent className="p-2.5 space-y-1">
+                        <div className="text-[10px] font-medium text-primary">源文档</div>
+                        <div className="text-[10px]">
+                          <span className="text-muted-foreground">文件名：</span>
+                          <span className="font-medium">{tracePanel.data.document.file_name}</span>
+                        </div>
+                        <div className="text-[10px]">
+                          <span className="text-muted-foreground">类型：</span>
+                          <span>{tracePanel.data.document.doc_type}</span>
+                        </div>
+                        <div className="text-[9px] font-mono text-muted-foreground/60 break-all">
+                          doc_id: {tracePanel.data.document.doc_id}
+                        </div>
+                      </CardContent>
+                    </Card>
+                  )}
+
+                  {/* Source block card */}
+                  {tracePanel.data.block && (
+                    <Card className="p-0 shadow-none border-blue-200 dark:border-blue-900">
+                      <CardContent className="p-2.5 space-y-1">
+                        <div className="text-[10px] font-medium text-primary">源文档块</div>
+                        <div className="text-[10px]">
+                          <span className="text-muted-foreground">类型：</span>
+                          <span>{tracePanel.data.block.block_type}</span>
+                        </div>
+                        {tracePanel.data.block.section_path?.length > 0 && (
+                          <div className="text-[10px]">
+                            <span className="text-muted-foreground">章节路径：</span>
+                            <span>{tracePanel.data.block.section_path.join(' > ')}</span>
+                          </div>
+                        )}
+                        <div className="text-[10px] bg-muted/50 rounded p-1.5 mt-1 max-h-32 overflow-y-auto whitespace-pre-wrap break-words">
+                          {tracePanel.data.block.text}
+                        </div>
+                        <div className="text-[9px] font-mono text-muted-foreground/60 break-all">
+                          block_id: {tracePanel.data.block.block_id}
+                        </div>
+                      </CardContent>
+                    </Card>
+                  )}
+
+                  {/* Evidence text */}
+                  {tracePanel.data.fact.source_span && (
+                    <Card className="p-0 shadow-none border-amber-200 dark:border-amber-900">
+                      <CardContent className="p-2.5 space-y-1">
+                        <div className="text-[10px] font-medium text-amber-600 dark:text-amber-400">证据文本</div>
+                        <div className="text-[10px] italic">
+                          {tracePanel.data.fact.source_span}
+                        </div>
+                      </CardContent>
+                    </Card>
+                  )}
+                </div>
+              )}
+
+              {!tracePanel.data && !tracePanel.loading && !tracePanel.error && (
+                <p className="text-[10px] text-muted-foreground">输入事实 ID 或点击回填结果的"追溯来源"按钮查看完整追溯链。</p>
+              )}
             </div>
+            </ScrollArea>
           </TabsContent>
         </Tabs>
       </div>

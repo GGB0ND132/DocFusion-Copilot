@@ -23,6 +23,8 @@ _CLEAR_CONTENT_RE = re.compile(
     r"(删除|清空|清除|移除).{0,6}(内容|文本|全部|所有)|"
     r"(内容|文本|全部).{0,4}(删除|清空|清除|移除)",
 )
+_DOC_TYPE_HINT_RE = re.compile(r"\.(docx|doc|xlsx|xls|pdf|txt|md|csv)\s*文件")
+_DOC_TYPE_ALIASES: dict[str, str] = {"doc": "docx", "xls": "xlsx"}
 
 
 def _soft_sort_facts(
@@ -320,7 +322,14 @@ class DocumentInteractionService:
         Apply content edits to text-like documents, with LLM-assisted complex edit parsing."""
 
         user_intent = str(plan.get("target", "") or plan.get("original_message", ""))
+        original_message = str(plan.get("original_message", ""))
         clear_all = bool(_CLEAR_CONTENT_RE.search(user_intent))
+
+        # Detect target document type from user message (e.g. ".docx文件")
+        type_hints = _DOC_TYPE_HINT_RE.findall(original_message)
+        target_doc_types: set[str] | None = None
+        if type_hints:
+            target_doc_types = {_DOC_TYPE_ALIASES.get(h, h) for h in type_hints}
 
         raw_edits = plan.get("edits", [])
         edits: list[tuple[str, str]] = [
@@ -353,6 +362,8 @@ class DocumentInteractionService:
                 or bool(document.metadata.get("skip_fact_extraction"))
             ):
                 continue
+            if target_doc_types and document.doc_type not in target_doc_types:
+                continue
 
             source_path = Path(document.stored_path)
             artifact_name = f"{doc_id}_edited_{safe_filename(document.file_name)}"
@@ -374,22 +385,24 @@ class DocumentInteractionService:
                 output_path.write_text(updated_content, encoding="utf-8")
 
             total_changes += change_count
-            artifacts.append(
-                {
-                    "doc_id": doc_id,
-                    "operation": "edit_document",
-                    "file_name": artifact_name,
-                    "output_path": str(output_path),
-                    "change_count": change_count,
-                }
-            )
+            if change_count > 0 or clear_all:
+                artifacts.append(
+                    {
+                        "doc_id": doc_id,
+                        "operation": "edit_document",
+                        "file_name": artifact_name,
+                        "output_path": str(output_path),
+                        "change_count": change_count,
+                    }
+                )
 
         if clear_all:
             summary = f"已清空 {len(artifacts)} 份文档的内容。请点击下方按钮下载编辑后的文件。"
         elif total_changes > 0:
             summary = f"已编辑 {len(artifacts)} 份文档，共完成 {total_changes} 处替换。请点击下方按钮下载编辑后的文件。"
         else:
-            summary = f"已处理 {len(artifacts)} 份文档，但未找到匹配的替换内容。请检查原文中是否存在指定的文本。"
+            edit_targets = "、".join(f'"{old}"' for old, _ in edits[:3])
+            summary = f"已处理 {len(artifacts)} 份文档，但未找到匹配的替换内容（搜索: {edit_targets}）。请检查原文中是否存在指定的文本。"
         return {
             "execution_type": "edit",
             "summary": summary,

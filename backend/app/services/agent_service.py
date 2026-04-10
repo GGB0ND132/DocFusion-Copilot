@@ -58,8 +58,13 @@ _SMALL_TALK_CONTAINS = (
 )
 
 _REPLACE_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"[将把].+?(?:中的?|里的?|里面的?)(?P<old>.+?)(?:替换为|改为|改成)(?P<new>.+)"),
     re.compile(r"[将把](?P<old>.+?)(?:替换为|改为|改成)(?P<new>.+)"),
     re.compile(r"把文中(?P<old>.+?)(?:替换为|改为|改成)(?P<new>.+)"),
+)
+_DELETE_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"(?:删除|删掉|去掉|去除|移除)(?:文[档件].*?(?:中的?|里的?|的))?(?P<old>.+?)(?:[。！？!?\s]|$)"),
+    re.compile(r"[将把](?:文[档件].*?(?:中的?|里的?|的))?(?P<old>.+?)(?:删除|删掉|去掉|去除|移除)"),
 )
 _TRAILING_PUNCTUATION = "。！？!?，,；;：:"
 _QUOTE_CHARS = "\"'“”‘’《》「」『』"
@@ -232,6 +237,7 @@ class AgentService:
                 '用户：帮我智能填表 → {"intent":"extract_and_fill_template","entities":[],"fields":[],"target":"uploaded_template","need_db_store":true,"edits":[]}\n'
                 '用户：查一下上海的GDP → {"intent":"query_facts","entities":["上海"],"fields":["GDP总量"],"target":"fact_store","need_db_store":false,"edits":[]}\n'
                 '用户：将南京甲公司替换为南京采购中心 → {"intent":"edit_document","entities":[],"fields":[],"target":"fact_store","need_db_store":false,"edits":[{"old_text":"南京甲公司","new_text":"南京采购中心"}]}\n'
+                '用户：删除文档中的山东省 → {"intent":"edit_document","entities":[],"fields":[],"target":"fact_store","need_db_store":false,"edits":[{"old_text":"山东省","new_text":""}]}\n'
                 '用户：请总结这份文档 → {"intent":"summarize_document","entities":[],"fields":[],"target":"fact_store","need_db_store":false,"edits":[]}\n'
                 '用户：请帮我整理一下格式 → {"intent":"reformat_document","entities":[],"fields":[],"target":"fact_store","need_db_store":false,"edits":[]}\n'
                 '用户：从这些报告中提取各城市的常住人口和GDP数据 → {"intent":"extract_facts","entities":["城市"],"fields":["常住人口","GDP总量"],"target":"fact_store","need_db_store":true,"edits":[]}\n'
@@ -286,7 +292,7 @@ class AgentService:
                 "- extract_and_fill_template: 模板回填、表格填充、智能填表\n"
                 "- query_facts: 查询特定实体的特定字段值\n"
                 "- extract_facts: 从文档中抽取新事实\n"
-                "- edit_document: 文本替换\n"
+                "- edit_document: 文本替换或删除\n"
                 "- extract_fields: 提取指定字段导出\n"
                 "- export_results: 导出为文件\n"
                 "- reformat_document: 排版整理\n"
@@ -303,6 +309,8 @@ class AgentService:
                 '用户：帮我智能填表 → {"intent":"extract_and_fill_template","entities":[],"fields":[],"target":"uploaded_template","need_db_store":true,"edits":[]}\n'
                 '用户：帮我用这些数据回填模板 → {"intent":"extract_and_fill_template","entities":[],"fields":[],"target":"uploaded_template","need_db_store":true,"edits":[]}\n'
                 '用户：将南京甲公司替换为南京采购中心 → {"intent":"edit_document","entities":[],"fields":[],"target":"fact_store","need_db_store":false,"edits":[{"old_text":"南京甲公司","new_text":"南京采购中心"}]}\n'
+                '用户：删除文档中的山东省 → {"intent":"edit_document","entities":[],"fields":[],"target":"fact_store","need_db_store":false,"edits":[{"old_text":"山东省","new_text":""}]}\n'
+                '用户：把甲方删掉 → {"intent":"edit_document","entities":[],"fields":[],"target":"fact_store","need_db_store":false,"edits":[{"old_text":"甲方","new_text":""}]}\n'
                 '用户：从这些报告中提取各城市的常住人口和GDP数据 → {"intent":"extract_facts","entities":["城市"],"fields":["常住人口","GDP总量"],"target":"fact_store","need_db_store":true,"edits":[]}\n'
                 '用户：提取所有城市的GDP和人均收入字段 → {"intent":"extract_fields","entities":["城市"],"fields":["GDP总量","人均收入"],"target":"fact_store","need_db_store":false,"edits":[]}\n'
                 '用户：把提取结果导出为xlsx → {"intent":"export_results","entities":[],"fields":[],"target":"fact_store","need_db_store":false,"edits":[]}\n'
@@ -418,7 +426,7 @@ class AgentService:
         return fields
 
     def _infer_edits(self, message: str) -> list[dict[str, str]]:
-        """从消息中提取简单文本替换指令。    Extract simple text-replacement edits from the message."""
+        """从消息中提取简单文本替换或删除指令。    Extract text-replacement or deletion edits from the message."""
 
         edits: list[dict[str, str]] = []
         for pattern in _REPLACE_PATTERNS:
@@ -427,8 +435,16 @@ class AgentService:
                 continue
             old_text = self._clean_edit_text(match.group("old"))
             new_text = self._clean_edit_text(match.group("new"))
-            if old_text and new_text and old_text != new_text:
+            if old_text and old_text != new_text:
                 edits.append({"old_text": old_text, "new_text": new_text})
+        if not edits:
+            for pattern in _DELETE_PATTERNS:
+                match = pattern.search(message)
+                if not match:
+                    continue
+                old_text = self._clean_edit_text(match.group("old"))
+                if old_text:
+                    edits.append({"old_text": old_text, "new_text": ""})
         return edits
 
     def _clean_edit_text(self, value: str) -> str:
@@ -495,7 +511,7 @@ class AgentService:
                 continue
             old_text = self._clean_edit_text(str(item.get("old_text", "")))
             new_text = self._clean_edit_text(str(item.get("new_text", "")))
-            if old_text and new_text and old_text != new_text:
+            if old_text and old_text != new_text:
                 normalized.append({"old_text": old_text, "new_text": new_text})
         return normalized
 

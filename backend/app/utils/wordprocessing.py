@@ -225,27 +225,36 @@ def replace_text_in_docx_document(
     destination_file = Path(output_path)
     destination_file.parent.mkdir(parents=True, exist_ok=True)
 
+    _CONTENT_PART_RE = re.compile(r"^word/(document|header\d*|footer\d*)\.xml$")
+
     total_changes = 0
     with zipfile.ZipFile(template_file, "r") as source_archive:
-        root = ET.fromstring(source_archive.read("word/document.xml"))
-        for paragraph_el in root.findall(".//w:p", W):
-            text = _text_from_element(paragraph_el)
-            if not text:
-                continue
-            updated_text, change_count = _apply_replacements(text, replacements)
-            if change_count <= 0:
-                continue
-            _set_paragraph_text(paragraph_el, updated_text)
-            total_changes += change_count
+        target_parts = [
+            info.filename
+            for info in source_archive.infolist()
+            if _CONTENT_PART_RE.match(info.filename)
+        ]
 
-        document_payload = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+        modified_parts: dict[str, bytes] = {}
+        for part_name in target_parts:
+            root = ET.fromstring(source_archive.read(part_name))
+            part_changes = 0
+            for paragraph_el in root.findall(".//w:p", W):
+                text = _text_from_element(paragraph_el)
+                if not text:
+                    continue
+                updated_text, change_count = _apply_replacements(text, replacements)
+                if change_count <= 0:
+                    continue
+                _set_paragraph_text(paragraph_el, updated_text)
+                part_changes += change_count
+            if part_changes > 0:
+                modified_parts[part_name] = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+                total_changes += part_changes
+
         with zipfile.ZipFile(destination_file, "w", compression=zipfile.ZIP_DEFLATED) as destination_archive:
             for file_info in source_archive.infolist():
-                payload = (
-                    document_payload
-                    if file_info.filename == "word/document.xml"
-                    else source_archive.read(file_info.filename)
-                )
+                payload = modified_parts.get(file_info.filename, source_archive.read(file_info.filename))
                 destination_archive.writestr(file_info, payload)
     return total_changes
 

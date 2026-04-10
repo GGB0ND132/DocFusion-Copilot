@@ -20,6 +20,13 @@ export interface BlockResponse {
   metadata: Record<string, unknown>;
 }
 
+export interface PaginatedBlocksResponse {
+  items: BlockResponse[];
+  total: number;
+  offset: number;
+  limit: number | null;
+}
+
 export interface FactResponse {
   fact_id: string;
   entity_type: string;
@@ -51,13 +58,6 @@ export interface TaskResponse {
   result: Record<string, unknown>;
 }
 
-export interface DocumentUploadAcceptedResponse {
-  task_id: string;
-  status: string;
-  document: DocumentResponse;
-  document_set_id?: string | null;
-}
-
 export interface DocumentBatchUploadItemResponse {
   task_id: string;
   status: string;
@@ -67,14 +67,6 @@ export interface DocumentBatchUploadItemResponse {
 export interface DocumentBatchUploadAcceptedResponse {
   document_set_id: string;
   items: DocumentBatchUploadItemResponse[];
-}
-
-export interface TemplateFillAcceptedResponse {
-  task_id: string;
-  status: string;
-  template_name: string;
-  document_set_id?: string | null;
-  auto_match?: boolean;
 }
 
 export interface FilledCellResponse {
@@ -99,43 +91,11 @@ export interface TemplateResultResponse {
   filled_cells: FilledCellResponse[];
 }
 
-export interface FactReviewRequest {
-  status: string;
-  reviewer?: string;
-  note?: string;
-}
-
-export interface FactQueryParams {
-  entityName?: string;
-  fieldName?: string;
-  status?: string;
-  minConfidence?: number;
-  canonicalOnly?: boolean;
-  documentIds?: string[];
-}
-
 export interface FactTraceResponse {
   fact: FactResponse;
   document: DocumentResponse | null;
   block: BlockResponse | null;
   usages: Array<Record<string, unknown>>;
-}
-
-export interface AgentChatRequest {
-  message: string;
-  contextId?: string;
-}
-
-export interface AgentChatResponse {
-  intent: string;
-  entities: string[];
-  fields: string[];
-  target: string;
-  need_db_store: boolean;
-  context_id: string | null;
-  preview: Array<Record<string, unknown>>;
-  edits: Array<Record<string, string>>;
-  planner: string;
 }
 
 export interface AgentExecuteRequest {
@@ -177,49 +137,6 @@ export interface AgentExecuteResponse {
   template_name?: string | null;
 }
 
-export interface FactEvaluationAcceptedResponse {
-  task_id: string;
-  status: string;
-  annotation_name: string;
-}
-
-export interface TemplateBenchmarkAcceptedResponse {
-  task_id: string;
-  status: string;
-  template_name: string;
-  expected_result_name: string;
-}
-
-export interface BenchmarkReportResponse {
-  task_id: string;
-  task_type: string;
-  report: Record<string, unknown>;
-}
-
-export interface FactEvaluationRequest {
-  annotationFile: File;
-  documentIds?: string[];
-  canonicalOnly?: boolean;
-  minConfidence?: number;
-}
-
-export interface TemplateBenchmarkRequest {
-  templateFile: File;
-  expectedResultFile: File;
-  documentSetId?: string;
-  fillMode?: string;
-  documentIds?: string[];
-}
-
-export interface TemplateFillRequest {
-  templateFile: File;
-  documentSetId?: string;
-  fillMode?: string;
-  documentIds?: string[];
-  autoMatch?: boolean;
-  userRequirement?: string;
-}
-
 export interface DownloadFileResult {
   blob: Blob;
   fileName: string;
@@ -238,11 +155,5 @@ export interface ConversationResponse {
 
 export interface ConversationCreateRequest {
   title?: string;
-  metadata?: Record<string, unknown>;
-}
-
-export interface ConversationUpdateRequest {
-  title?: string;
-  messages?: Array<Record<string, unknown>>;
   metadata?: Record<string, unknown>;
 }

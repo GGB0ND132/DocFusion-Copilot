@@ -1,13 +1,11 @@
 export { ApiError, API_BASE_URL } from '@/services/http';
-export { runAgentChat, runAgentExecute, downloadAgentArtifact, clearAgentConversation, listConversations, createConversation, getConversation, updateConversation, deleteConversation } from '@/services/agent';
-export { listDocuments, getDocumentDetail, getDocumentBlocks, getDocumentFacts, deleteDocument, getDocumentRawUrl } from '@/services/documentDetails';
-export { uploadDocument, uploadDocumentBatch } from '@/services/documents';
+export { runAgentExecute, downloadAgentArtifact, clearAgentConversation, listConversations, createConversation, getConversation, deleteConversation } from '@/services/agent';
+export { listDocuments, getDocumentBlocks, getDocumentFacts, deleteDocument, batchDeleteDocuments, getDocumentRawUrl } from '@/services/documentDetails';
+export { uploadDocumentBatch } from '@/services/documents';
 export { getTaskStatus } from '@/services/tasks';
-export { submitTemplateFill, downloadTemplateResult } from '@/services/templates';
-export { getFactTrace, listLowConfidenceFacts, reviewFact } from '@/services/trace';
+export { downloadTemplateResult } from '@/services/templates';
+export { getFactTrace } from '@/services/trace';
 export type {
-  AgentChatRequest,
-  AgentChatResponse,
   AgentExecuteRequest,
   AgentExecuteResponse,
   AgentExecutionArtifactResponse,
@@ -16,13 +14,11 @@ export type {
   DocumentBatchUploadAcceptedResponse,
   DocumentBatchUploadItemResponse,
   DocumentResponse,
-  DocumentUploadAcceptedResponse,
   DownloadFileResult,
   FactResponse,
   FactTraceResponse,
   FilledCellResponse,
+  PaginatedBlocksResponse,
   TaskResponse,
-  TemplateFillAcceptedResponse,
-  TemplateFillRequest,
   TemplateResultResponse,
 } from '@/services/types';

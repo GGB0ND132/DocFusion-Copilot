@@ -1,27 +1,11 @@
 import { requestFile, requestJson } from '@/services/http';
 import type {
-  AgentChatRequest,
-  AgentChatResponse,
   AgentExecuteRequest,
   AgentExecuteResponse,
   ConversationCreateRequest,
   ConversationResponse,
-  ConversationUpdateRequest,
   DownloadFileResult,
 } from '@/services/types';
-
-export async function runAgentChat(payload: AgentChatRequest): Promise<AgentChatResponse> {
-  return requestJson<AgentChatResponse>('/api/v1/agent/chat', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      message: payload.message,
-      context_id: payload.contextId ?? null,
-    }),
-  });
-}
 
 export async function runAgentExecute(payload: AgentExecuteRequest): Promise<AgentExecuteResponse> {
   if (payload.templateFile) {
@@ -93,20 +77,6 @@ export async function createConversation(payload?: ConversationCreateRequest): P
 export async function getConversation(conversationId: string): Promise<ConversationResponse> {
   return requestJson<ConversationResponse>(
     `/api/v1/agent/conversations/${encodeURIComponent(conversationId)}`,
-  );
-}
-
-export async function updateConversation(
-  conversationId: string,
-  payload: ConversationUpdateRequest,
-): Promise<ConversationResponse> {
-  return requestJson<ConversationResponse>(
-    `/api/v1/agent/conversations/${encodeURIComponent(conversationId)}`,
-    {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    },
   );
 }
 

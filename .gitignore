@@ -27,14 +27,9 @@ Thumbs.db
 
 # Runtime data
 backend/storage/
-.tmp_test_runs/
 
-# Frontend build cache & compiled config
+# Frontend build cache
 *.tsbuildinfo
-frontend/vite.config.js
-frontend/vite.config.d.ts
-frontend/tailwind.config.js
-frontend/tailwind.config.d.ts
 
 # Competition PDFs and materials
 *.pdf

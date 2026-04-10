@@ -41,7 +41,6 @@ type UiState = {
   selectedTemplateName: string | null;
   taskSnapshots: Record<string, TaskResponse>;
   latestDocumentTaskId: string | null;
-  latestTemplateTaskId: string | null;
   tracePanel: TracePanelState;
   toasts: ToastItem[];
   addUploadedDocument: (entry: UploadedDocumentEntry) => void;
@@ -49,7 +48,6 @@ type UiState = {
   setCurrentDocumentSetId: (documentSetId: string | null) => void;
   setSelectedTemplateFile: (file: File | null) => void;
   upsertTaskSnapshot: (task: TaskResponse) => void;
-  setLatestTemplateTaskId: (taskId: string | null) => void;
   openTraceByFactId: (factId: string, cellLabel?: string | null) => Promise<void>;
   closeTrace: () => void;
   pushToast: (toast: Omit<ToastItem, 'id'>) => void;
@@ -75,7 +73,6 @@ export const useUiStore = create<UiState>((set) => ({
   selectedTemplateName: null,
   taskSnapshots: {},
   latestDocumentTaskId: null,
-  latestTemplateTaskId: null,
   tracePanel: {
     factId: null,
     cellLabel: null,
@@ -114,7 +111,6 @@ export const useUiStore = create<UiState>((set) => ({
         [task.task_id]: task,
       },
     })),
-  setLatestTemplateTaskId: (taskId) => set({ latestTemplateTaskId: taskId }),
   openTraceByFactId: async (factId, cellLabel) => {
     set({
       tracePanel: {
@@ -183,7 +179,6 @@ export const useUiStore = create<UiState>((set) => ({
       selectedTemplateName: null,
       taskSnapshots: {},
       latestDocumentTaskId: null,
-      latestTemplateTaskId: null,
     }),
   removeUploadedDocument: (docId) =>
     set((state) => ({

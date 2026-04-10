@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useCallback } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { getDocumentRawUrl, getDocumentBlocks } from '@/services';
@@ -95,17 +95,29 @@ function PdfPreview({ url }: { url: string }) {
   );
 }
 
+const PAGE_SIZE = 50;
+
 function BlocksPreview({ docId, docType, rawUrl }: { docId: string; docType: string; rawUrl: string }) {
   const [blocks, setBlocks] = useState<BlockResponse[] | null>(null);
+  const [total, setTotal] = useState(0);
+  const [page, setPage] = useState(0);
   const [error, setError] = useState<string | null>(null);
 
-  useEffect(() => {
+  const loadPage = useCallback((p: number) => {
     setBlocks(null);
     setError(null);
-    getDocumentBlocks(docId)
-      .then(setBlocks)
+    getDocumentBlocks(docId, { limit: PAGE_SIZE, offset: p * PAGE_SIZE })
+      .then((res) => {
+        setBlocks(res.items);
+        setTotal(res.total);
+        setPage(p);
+      })
       .catch((err) => setError(err instanceof Error ? err.message : '加载失败'));
   }, [docId]);
+
+  useEffect(() => { loadPage(0); }, [loadPage]);
+
+  const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
 
   if (error) {
     return (
@@ -118,7 +130,7 @@ function BlocksPreview({ docId, docType, rawUrl }: { docId: string; docType: str
   if (blocks === null) {
     return <p className="p-4 text-sm text-muted-foreground">加载中…</p>;
   }
-  if (blocks.length === 0) {
+  if (total === 0) {
     return (
       <div className="flex flex-col items-center justify-center h-full gap-2 text-sm text-muted-foreground p-8">
         <p>该文档暂无解析内容。</p>
@@ -134,7 +146,7 @@ function BlocksPreview({ docId, docType, rawUrl }: { docId: string; docType: str
     <div className="overflow-auto h-full p-4 space-y-3">
       <div className="flex items-center gap-2 text-xs text-muted-foreground mb-2">
         <Badge variant="outline" className="text-[9px]">{docType.toUpperCase()}</Badge>
-        <span>{blocks.length} 个解析块</span>
+        <span>{total} 个解析块</span>
         <a href={rawUrl} download className="ml-auto text-primary underline text-[10px]">下载原文件</a>
       </div>
 
@@ -178,6 +190,29 @@ function BlocksPreview({ docId, docType, rawUrl }: { docId: string; docType: str
               })}
             </tbody>
           </table>
+        </div>
+      )}
+
+      {/* Pagination */}
+      {totalPages > 1 && (
+        <div className="flex items-center justify-center gap-2 pt-2 text-xs">
+          <button
+            className="px-2 py-1 rounded border disabled:opacity-40"
+            disabled={page === 0}
+            onClick={() => loadPage(page - 1)}
+          >
+            上一页
+          </button>
+          <span className="text-muted-foreground">
+            {page + 1} / {totalPages}
+          </span>
+          <button
+            className="px-2 py-1 rounded border disabled:opacity-40"
+            disabled={page >= totalPages - 1}
+            onClick={() => loadPage(page + 1)}
+          >
+            下一页
+          </button>
         </div>
       )}
     </div>

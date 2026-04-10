@@ -1,18 +1,5 @@
 import { requestJson } from '@/services/http';
-import type { DocumentBatchUploadAcceptedResponse, DocumentUploadAcceptedResponse } from '@/services/types';
-
-export async function uploadDocument(file: File, documentSetId?: string): Promise<DocumentUploadAcceptedResponse> {
-  const formData = new FormData();
-  formData.append('file', file);
-  if (documentSetId) {
-    formData.append('document_set_id', documentSetId);
-  }
-
-  return requestJson<DocumentUploadAcceptedResponse>('/api/v1/documents/upload', {
-    method: 'POST',
-    body: formData,
-  });
-}
+import type { DocumentBatchUploadAcceptedResponse } from '@/services/types';
 
 export async function uploadDocumentBatch(
   files: File[],

@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { toast } from 'sonner';
-import { FileUp, FolderOpen, FileText, FileType, Table2, Code, ChevronRight, RefreshCw, Trash2, Eye } from 'lucide-react';
-import { useVirtualizer } from '@tanstack/react-virtual';
+import { FileUp, FolderOpen, FileText, FileType, Table2, Code, RefreshCw, Trash2, Eye, CheckSquare, Square } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
@@ -16,37 +15,26 @@ import {
   getTaskStatus,
   uploadDocumentBatch,
   listDocuments,
-  getDocumentBlocks,
   getDocumentFacts,
   deleteDocument,
+  batchDeleteDocuments,
   type DocumentResponse,
-  type BlockResponse,
   type FactResponse,
 } from '@/services';
 
 export default function WorkspacePage() {
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const blockListRef = useRef<HTMLDivElement>(null);
   const [documents, setDocuments] = useState<DocumentResponse[]>([]);
   const [selectedDocId, setSelectedDocId] = useState<string | null>(null);
-  const [blocks, setBlocks] = useState<BlockResponse[]>([]);
   const [facts, setFacts] = useState<FactResponse[]>([]);
-  const [loadingBlocks, setLoadingBlocks] = useState(false);
   const [isUploading, setIsUploading] = useState(false);
-  const [middleTab, setMiddleTab] = useState<'parse' | 'preview'>('parse');
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
 
   const addUploadedDocuments = useUiStore((s) => s.addUploadedDocuments);
   const currentDocumentSetId = useUiStore((s) => s.currentDocumentSetId);
   const uploadedDocuments = useUiStore((s) => s.uploadedDocuments);
   const upsertTaskSnapshot = useUiStore((s) => s.upsertTaskSnapshot);
   const removeUploadedDocument = useUiStore((s) => s.removeUploadedDocument);
-
-  const blockVirtualizer = useVirtualizer({
-    count: blocks.length,
-    getScrollElement: () => blockListRef.current,
-    estimateSize: () => 80,
-    overscan: 5,
-  });
 
   const selectedDoc = useMemo(() => documents.find((d) => d.doc_id === selectedDocId), [documents, selectedDocId]);
 
@@ -62,21 +50,13 @@ export default function WorkspacePage() {
     }
   }, [uploadedDocuments.length]);
 
-  // Load blocks & facts when a document is selected
+  // Load facts when a document is selected
   useEffect(() => {
     if (!selectedDocId) {
-      setBlocks([]);
       setFacts([]);
       return;
     }
-    setLoadingBlocks(true);
-    Promise.all([getDocumentBlocks(selectedDocId), getDocumentFacts(selectedDocId)])
-      .then(([b, f]) => {
-        setBlocks(b);
-        setFacts(f);
-      })
-      .catch(() => {})
-      .finally(() => setLoadingBlocks(false));
+    getDocumentFacts(selectedDocId).then(setFacts).catch(() => {});
   }, [selectedDocId]);
 
   const handleUpload = useCallback(
@@ -121,6 +101,7 @@ export default function WorkspacePage() {
         await deleteDocument(docId);
         removeUploadedDocument(docId);
         setDocuments((prev) => prev.filter((d) => d.doc_id !== docId));
+        setSelectedIds((prev) => { const next = new Set(prev); next.delete(docId); return next; });
         if (selectedDocId === docId) {
           setSelectedDocId(null);
         }
@@ -131,6 +112,38 @@ export default function WorkspacePage() {
     },
     [removeUploadedDocument, selectedDocId],
   );
+
+  const toggleSelect = useCallback((docId: string) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(docId)) next.delete(docId);
+      else next.add(docId);
+      return next;
+    });
+  }, []);
+
+  const toggleSelectAll = useCallback(() => {
+    setSelectedIds((prev) =>
+      prev.size === documents.length
+        ? new Set()
+        : new Set(documents.map((d) => d.doc_id)),
+    );
+  }, [documents]);
+
+  const handleBatchDelete = useCallback(async () => {
+    if (selectedIds.size === 0) return;
+    if (!window.confirm(`确定删除选中的 ${selectedIds.size} 份文档？\n关联的解析块和事实将一并删除且不可恢复。`)) return;
+    try {
+      await batchDeleteDocuments(Array.from(selectedIds));
+      selectedIds.forEach((id) => removeUploadedDocument(id));
+      setDocuments((prev) => prev.filter((d) => !selectedIds.has(d.doc_id)));
+      if (selectedDocId && selectedIds.has(selectedDocId)) setSelectedDocId(null);
+      toast.success(`已批量删除 ${selectedIds.size} 份文档`);
+      setSelectedIds(new Set());
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : '批量删除失败');
+    }
+  }, [selectedIds, removeUploadedDocument, selectedDocId]);
 
   return (
     <ResizablePanelGroup className="h-full">
@@ -143,6 +156,18 @@ export default function WorkspacePage() {
             文档管理
           </span>
           <div className="flex gap-1">
+            {selectedIds.size > 0 && (
+              <TooltipProvider delayDuration={300}>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Button variant="ghost" size="icon" className="h-7 w-7 text-destructive" onClick={handleBatchDelete}>
+                      <Trash2 className="h-3.5 w-3.5" />
+                    </Button>
+                  </TooltipTrigger>
+                  <TooltipContent>批量删除 ({selectedIds.size})</TooltipContent>
+                </Tooltip>
+              </TooltipProvider>
+            )}
             <TooltipProvider delayDuration={300}>
               <Tooltip>
                 <TooltipTrigger asChild>
@@ -173,17 +198,40 @@ export default function WorkspacePage() {
             {documents.length === 0 && (
               <p className="px-2 py-4 text-center text-xs text-muted-foreground">暂无文档</p>
             )}
-            {documents.map((doc) => (
+            {documents.length > 0 && (
               <button
+                onClick={toggleSelectAll}
+                className="flex w-full items-center gap-2 rounded-md px-2 py-1 text-left text-[10px] text-muted-foreground hover:text-foreground transition-colors"
+              >
+                {selectedIds.size === documents.length ? <CheckSquare className="h-3 w-3" /> : <Square className="h-3 w-3" />}
+                {selectedIds.size === documents.length ? '取消全选' : '全选'}
+              </button>
+            )}
+            {documents.map((doc) => (
+              <div
                 key={doc.doc_id}
-                onClick={() => setSelectedDocId(doc.doc_id)}
-                className={`group flex w-full min-w-0 items-center gap-2 overflow-hidden rounded-md px-2 py-1.5 text-left text-sm transition-colors hover:bg-muted ${
+                className={`group flex w-full min-w-0 items-center gap-1.5 overflow-hidden rounded-md px-2 py-1.5 text-left text-sm transition-colors hover:bg-muted ${
                   selectedDocId === doc.doc_id ? 'bg-muted font-medium' : ''
                 }`}
               >
-                <FileIcon docType={doc.doc_type} />
-                <span className="flex-1 truncate">{doc.file_name}</span>
-                <StatusDot status={doc.status} />
+                <span
+                  role="checkbox"
+                  aria-checked={selectedIds.has(doc.doc_id)}
+                  tabIndex={0}
+                  className="shrink-0 cursor-pointer text-muted-foreground hover:text-foreground"
+                  onClick={(e) => { e.stopPropagation(); toggleSelect(doc.doc_id); }}
+                  onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleSelect(doc.doc_id); } }}
+                >
+                  {selectedIds.has(doc.doc_id) ? <CheckSquare className="h-3.5 w-3.5 text-primary" /> : <Square className="h-3.5 w-3.5" />}
+                </span>
+                <button
+                  className="flex flex-1 min-w-0 items-center gap-2"
+                  onClick={() => setSelectedDocId(doc.doc_id)}
+                >
+                  <FileIcon docType={doc.doc_type} />
+                  <span className="flex-1 truncate">{doc.file_name}</span>
+                  <StatusDot status={doc.status} />
+                </button>
                 <span
                   role="button"
                   tabIndex={0}
@@ -201,7 +249,7 @@ export default function WorkspacePage() {
                 >
                   <Trash2 className="h-3 w-3" />
                 </span>
-              </button>
+              </div>
             ))}
           </div>
         </ScrollArea>
@@ -221,71 +269,16 @@ export default function WorkspacePage() {
       <div className="flex h-full flex-col">
         <div className="flex items-center gap-2 border-b px-4 py-2">
           <Eye className="h-4 w-4 text-muted-foreground" />
+          <span className="text-xs text-muted-foreground">文档预览</span>
           {selectedDoc && <Badge variant="secondary" className="text-[10px]">{selectedDoc.doc_type.toUpperCase()}</Badge>}
-          <div className="ml-auto flex gap-1">
-            <button
-              onClick={() => setMiddleTab('parse')}
-              className={`px-2 py-0.5 text-xs rounded ${middleTab === 'parse' ? 'bg-primary text-primary-foreground' : 'text-muted-foreground hover:text-foreground'}`}
-            >
-              解析
-            </button>
-            <button
-              onClick={() => setMiddleTab('preview')}
-              className={`px-2 py-0.5 text-xs rounded ${middleTab === 'preview' ? 'bg-primary text-primary-foreground' : 'text-muted-foreground hover:text-foreground'}`}
-            >
-              预览
-            </button>
-          </div>
         </div>
         {!selectedDoc ? (
           <div className="flex flex-1 items-center justify-center text-muted-foreground text-sm p-8">
             选择左侧文档查看内容
           </div>
-        ) : middleTab === 'preview' ? (
+        ) : (
           <div className="flex-1 overflow-hidden">
             <FilePreview docId={selectedDoc.doc_id} docType={selectedDoc.doc_type} />
-          </div>
-        ) : loadingBlocks ? (
-          <div className="flex flex-1 items-center justify-center text-muted-foreground text-sm p-8">
-            加载中…
-          </div>
-        ) : blocks.length === 0 ? (
-          <div className="flex flex-1 items-center justify-center text-muted-foreground text-sm p-8">
-            该文档暂无解析内容（可能仍在解析中）。
-          </div>
-        ) : (
-          <div ref={blockListRef} className="flex-1 overflow-auto">
-            <div className="relative w-full" style={{ height: blockVirtualizer.getTotalSize() }}>
-              {blockVirtualizer.getVirtualItems().map((virtualRow) => {
-                const block = blocks[virtualRow.index];
-                return (
-                  <div
-                    key={block.block_id}
-                    ref={blockVirtualizer.measureElement}
-                    data-index={virtualRow.index}
-                    className="absolute left-0 w-full px-4 pb-2"
-                    style={{ top: virtualRow.start }}
-                  >
-                    <div className="rounded-md border p-3 text-sm">
-                      <div className="flex items-center gap-2 mb-1">
-                        <Badge variant="outline" className="text-[10px]">{block.block_type}</Badge>
-                        {block.section_path.length > 0 && (
-                          <span className="text-[10px] text-muted-foreground flex items-center gap-0.5">
-                            {block.section_path.map((s, i) => (
-                              <span key={i} className="flex items-center gap-0.5">
-                                {i > 0 && <ChevronRight className="h-2.5 w-2.5" />}
-                                {s}
-                              </span>
-                            ))}
-                          </span>
-                        )}
-                      </div>
-                      <p className="whitespace-pre-wrap text-xs leading-relaxed">{block.text}</p>
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
           </div>
         )}
       </div>
@@ -359,7 +352,6 @@ export default function WorkspacePage() {
                     <InfoRow label="类型" value={selectedDoc.doc_type.toUpperCase()} />
                     <InfoRow label="状态" value={selectedDoc.status} />
                     <InfoRow label="文档 ID" value={selectedDoc.doc_id} />
-                    <InfoRow label="解析块数" value={String(blocks.length)} />
                     <InfoRow label="事实数" value={String(facts.length)} />
                     <Separator />
                     <InfoRow label="上传时间" value={selectedDoc.upload_time} />
