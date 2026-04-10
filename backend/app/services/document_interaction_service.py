@@ -229,7 +229,9 @@ class DocumentInteractionService:
         if not template_name:
             raise ValueError("Missing template file name for template filling.")
         if not document_ids and not document_set_id:
-            raise ValueError("请先上传并解析源文档，再提交模板回填。")
+            document_ids = self._resolve_document_ids(None, None)
+            if not document_ids:
+                raise ValueError("请先上传并解析源文档，再提交模板回填。")
 
         task = self._template_service.submit_fill_task(
             template_name=template_name,
@@ -459,7 +461,7 @@ class DocumentInteractionService:
         facts: list[FactRecord],
         document_ids: list[str],
     ) -> str:
-        """缁熶竴鐢熸垚鎽樿鏂囨湰銆?   Build summary text through the LLM path with a natural fallback."""
+        """统一生成摘要文本。   Build summary text through the LLM path with a natural fallback."""
 
         if self._openai_client.is_configured:
             try:
@@ -845,9 +847,8 @@ class DocumentInteractionService:
         document_ids: list[str],
         has_template_file: bool,
     ) -> dict[str, object]:
-        """鐢熸垚鏇磋嚜鐒剁殑瀵掓殏涓庡姛鑳借鏄庡洖澶嶃€?
-        Generate a more natural reply for greetings and lightweight chit-chat.
-        """
+        """生成更自然的寒暄与功能说明回复。
+        Generate a more natural reply for greetings and lightweight chit-chat."""
 
         normalized = message.strip().lower()
         if any(keyword in normalized for keyword in ("谢谢", "感谢", "多谢", "辛苦了")):

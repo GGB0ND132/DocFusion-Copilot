@@ -158,7 +158,7 @@ def convert_to_canonical_unit(
         if unit == "元":
             return value_num, "元"
 
-    return value_num, canonical_unit
+    return value_num, unit or canonical_unit
 
 
 def format_value(value: float | None) -> str:

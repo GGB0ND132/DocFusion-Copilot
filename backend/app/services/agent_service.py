@@ -97,7 +97,7 @@ class AgentService:
         return []
 
     def _get_cached_history_ref(self, context_id: str) -> list[dict[str, str]]:
-        """???????????????    Return a mutable cached history reference."""
+        """返回可变的缓存历史引用。    Return a mutable cached history reference."""
         history = self._conversations.get(context_id)
         if history is not None:
             return history
@@ -196,7 +196,7 @@ class AgentService:
             return result
 
     def record_execution_result(self, context_id: str | None, summary: str) -> None:
-        """灏嗘墽琛岀殑鏈€缁堝洖澶嶅悓姝ュ埌瀵硅瘽璁板綍銆?
+        """将执行的最终回复同步到对话记录。
         Persist the final execution reply into the conversation history.
         """
 
@@ -456,7 +456,7 @@ class AgentService:
         return cleaned.strip(_QUOTE_CHARS).strip()
 
     def _is_small_talk(self, message: str) -> bool:
-        """鍒ゆ柇娑堟伅鏄惁灞炰簬瀵掓殏銆佹眰鍔╂垨绠€鍗曢棽鑱娿€?
+        """判断消息是否属于寒暄、求助或简单闲聊。
         Determine whether a message is a greeting, help request, or light chit-chat.
         """
 
@@ -467,7 +467,7 @@ class AgentService:
         return any(keyword in lowered or keyword in message for keyword in _SMALL_TALK_CONTAINS)
 
     def _build_preview_message(self, result: dict[str, object]) -> str:
-        """涓虹粨鏋勫寲璁″垝鐢熸垚鏇磋嚜鐒剁殑瀵硅瘽棰勮銆?
+        """为结构化计划生成更自然的对话预览。
         Build a more natural assistant preview message for a structured plan.
         """
 

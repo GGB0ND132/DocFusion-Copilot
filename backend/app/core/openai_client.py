@@ -73,6 +73,8 @@ class OpenAICompatibleClient:
                     "json_schema": {"name": "docfusion_response", "schema": json_schema},
                 }
             response = self._raw_client.chat.completions.create(**kwargs)
+            if not response.choices:
+                raise OpenAIClientError("OpenAI API returned empty choices")
             content = response.choices[0].message.content or ""
             return json.loads(content)
         except (APIError, APIConnectionError, APITimeoutError) as exc:

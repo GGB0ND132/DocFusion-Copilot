@@ -1144,6 +1144,19 @@ class TemplateService:
                     evidence_text=fact.source_span[:200] if fact.source_span else "",
                 ))
 
+        # If we have row_groups (multi-row data), use them for empty templates
+        if row_groups and not rows_after_header:
+            field_name_set = {fn for _, fn in field_columns}
+            for group in row_groups:
+                entity_holder = group.get("__entity__")
+                entity_name = getattr(entity_holder, "entity_name", "") if entity_holder else ""
+                has_match = any(fn in group for fn in field_name_set)
+                if not has_match:
+                    continue
+                write_row(next_row_index, entity_name, group, True)
+                next_row_index += 1
+            return updates, filled_cells
+
         # Standard flow: fill existing rows then append unassigned entities
         assigned_entities: list[str] = []
         entity_cursor = 0

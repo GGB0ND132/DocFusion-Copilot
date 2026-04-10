@@ -212,15 +212,17 @@ def _load_sheet_targets(archive: zipfile.ZipFile) -> list[tuple[str, str]]:
     """
     workbook_root = ET.fromstring(archive.read("xl/workbook.xml"))
     rels_root = ET.fromstring(archive.read("xl/_rels/workbook.xml.rels"))
-    relations = {
-        relation.get("Id"): f"xl/{relation.get('Target')}"
-        for relation in rels_root.findall("rel:Relationship", NS)
-    }
+    relations = {}
+    for relation in rels_root.findall("rel:Relationship", NS):
+        target_path = relation.get("Target", "")
+        if not target_path.startswith("xl/"):
+            target_path = f"xl/{target_path}"
+        relations[relation.get("Id")] = target_path
 
     targets: list[tuple[str, str]] = []
     for sheet_el in workbook_root.findall("main:sheets/main:sheet", {"main": MAIN_NS}):
         relation_id = sheet_el.get(f"{{{WORKBOOK_REL_NS}}}id")
-        if not relation_id:
+        if not relation_id or relation_id not in relations:
             continue
         targets.append((sheet_el.get("name", "Sheet1"), relations[relation_id]))
     return targets

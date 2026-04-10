@@ -202,6 +202,8 @@ class InMemoryRepository:
             if canonical_only:
                 facts = [fact for fact in facts if fact.is_canonical]
             if document_ids is not None:
+                if not document_ids:
+                    return []
                 facts = [fact for fact in facts if fact.source_doc_id in document_ids]
             return [replace(fact) for fact in facts]
 
@@ -305,7 +307,8 @@ class InMemoryRepository:
     def delete_conversation(self, conversation_id: str) -> ConversationRecord | None:
         """删除对话记录。    Delete a conversation record."""
         with self._lock:
-            return self._conversations.pop(conversation_id, None)
+            record = self._conversations.pop(conversation_id, None)
+            return deepcopy(record) if record else None
 
     def _recompute_canonical_flags(self) -> None:
         """将每个冲突组中置信度最高的事实标记为 canonical。

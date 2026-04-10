@@ -18,8 +18,6 @@ import {
   AlertTriangle,
   MessageSquarePlus,
   Trash2,
-  PanelLeftClose,
-  PanelLeftOpen,
   Sparkles,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
@@ -80,7 +78,6 @@ export default function AgentPage() {
   const startNewConversation = useUiStore((s) => s.startNewConversation);
   const removeConversationFromList = useUiStore((s) => s.removeConversationFromList);
 
-  const [sidebarOpen, setSidebarOpen] = useState(true);
 
   const refreshAvailableDocuments = useCallback(async () => {
     const docs = await listDocuments();
@@ -400,17 +397,15 @@ export default function AgentPage() {
   const fillTaskDone = fillTask && ['succeeded', 'completed', 'success'].includes(fillTask.status);
 
   return (
-    <div className="flex h-full">
+    <ResizablePanelGroup className="h-full">
       {/* ── Left: Conversation Sidebar ── */}
-      <div className={`flex flex-col border-r bg-muted/30 transition-all ${sidebarOpen ? 'w-56' : 'w-0 overflow-hidden'}`}>
+      <ResizablePanel defaultSize={18} minSize={8}>
+      <div className="flex h-full flex-col bg-muted/30">
         <div className="flex items-center justify-between gap-1 border-b px-2 py-2">
           <span className="text-xs font-medium truncate">对话列表</span>
           <div className="flex gap-0.5">
             <Button variant="ghost" size="icon" className="h-6 w-6" onClick={handleNewConversation} title="新建对话">
               <MessageSquarePlus className="h-3.5 w-3.5" />
-            </Button>
-            <Button variant="ghost" size="icon" className="h-6 w-6" onClick={() => setSidebarOpen(false)} title="收起">
-              <PanelLeftClose className="h-3.5 w-3.5" />
             </Button>
           </div>
         </div>
@@ -443,17 +438,12 @@ export default function AgentPage() {
           </div>
         </ScrollArea>
       </div>
+      </ResizablePanel>
 
-      {/* Sidebar toggle when collapsed */}
-      {!sidebarOpen && (
-        <Button variant="ghost" size="icon" className="h-full w-8 shrink-0 rounded-none border-r" onClick={() => setSidebarOpen(true)} title="展开对话列表">
-          <PanelLeftOpen className="h-4 w-4" />
-        </Button>
-      )}
+      <ResizableHandle withHandle />
 
-    <ResizablePanelGroup className="h-full">
       {/* ── Main chat area ── */}
-      <ResizablePanel defaultSize={70} minSize={40}>
+      <ResizablePanel defaultSize={52} minSize={30}>
       <div className="flex h-full flex-col">
         {/* Chat messages */}
         <ScrollArea className="flex-1" ref={scrollRef}>
@@ -874,7 +864,6 @@ export default function AgentPage() {
       </div>
       </ResizablePanel>
     </ResizablePanelGroup>
-    </div>
   );
 }
 
