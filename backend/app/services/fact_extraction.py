@@ -465,3 +465,119 @@ class FactExtractionService:
             extra={"doc_id": document.doc_id},
         )
         return results
+
+    def extract_targeted_fields(
+        self,
+        document: DocumentRecord,
+        blocks: list[DocumentBlock],
+        target_fields: list[str],
+        target_entities: list[str] | None = None,
+    ) -> list[FactRecord]:
+        """针对模板需要但 fact_store 缺失的字段，定向调用 LLM 提取。
+        Extract specific fields requested by a template using targeted LLM queries.
+        """
+        if not self._openai_client or not getattr(self._openai_client, "is_configured", False):
+            return []
+        if not target_fields or not blocks:
+            return []
+
+        text_blocks = [b for b in blocks if b.block_type in {"paragraph", "heading", "page", "table_row"}]
+        if not text_blocks:
+            return []
+
+        preview = "\n".join(b.text[:400] for b in text_blocks[:12])[:4000]
+        year = infer_year(preview) or infer_year(document.file_name)
+        entity_hint = ""
+        if target_entities:
+            entity_hint = f"\n目标实体（优先匹配）: {', '.join(target_entities[:20])}"
+
+        try:
+            payload = self._openai_client.create_json_completion(
+                system_prompt=(
+                    "你是结构化信息定向抽取引擎。用户指定了需要提取的目标字段列表，"
+                    "请从给定文本中精确查找这些字段对应的数值或文本值。"
+                    "每条结果包含 entity_name（实体名）、field_name（必须使用用户给定的目标字段名）、"
+                    "value（数值或文本值）、unit（单位，可为空）。"
+                    "只输出文本中明确给出的数据，不要编造。如果某个目标字段在文本中找不到，不要输出。"
+                ),
+                user_prompt=(
+                    f"文档名: {document.file_name}\n"
+                    f"目标字段: {target_fields[:50]}"
+                    f"{entity_hint}\n\n"
+                    f"文本内容:\n{preview}"
+                ),
+                json_schema={
+                    "type": "object",
+                    "properties": {
+                        "facts": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "entity_name": {"type": "string"},
+                                    "field_name": {"type": "string"},
+                                    "value": {"type": "string"},
+                                    "unit": {"type": "string"},
+                                },
+                                "required": ["entity_name", "field_name", "value"],
+                            },
+                        },
+                    },
+                    "required": ["facts"],
+                    "additionalProperties": False,
+                },
+            )
+        except Exception:
+            self._logger.debug("Targeted LLM extraction failed", exc_info=True)
+            return []
+
+        raw_facts = payload.get("facts", [])
+        if not isinstance(raw_facts, list):
+            return []
+
+        # Only accept facts whose field_name matches one of the target fields
+        target_set_lower = {f.lower() for f in target_fields}
+        results: list[FactRecord] = []
+        first_block_id = blocks[0].block_id if blocks else ""
+
+        for item in raw_facts:
+            if not isinstance(item, dict):
+                continue
+            entity = str(item.get("entity_name", "")).strip()
+            field = str(item.get("field_name", "")).strip()
+            raw_value = str(item.get("value", "")).strip()
+            unit = str(item.get("unit", "")).strip() or None
+            if not entity or not field or not raw_value:
+                continue
+            if field.lower() not in target_set_lower:
+                continue
+
+            value_num, detected_unit = extract_numeric_with_unit(raw_value)
+            entity = normalize_entity_name(entity) or entity
+
+            results.append(
+                FactRecord(
+                    fact_id=new_id("fact"),
+                    entity_type=FIELD_ENTITY_TYPES.get(field, "generic"),
+                    entity_name=entity,
+                    field_name=field,
+                    value_num=value_num,
+                    value_text=raw_value,
+                    unit=detected_unit or unit if value_num is not None else None,
+                    year=year,
+                    source_doc_id=document.doc_id,
+                    source_block_id=first_block_id,
+                    source_span=preview[:200],
+                    confidence=0.78,
+                    status="pending_review",
+                    metadata={"extraction_method": "llm_targeted"},
+                )
+            )
+
+        self._logger.info(
+            "Targeted LLM extracted %d facts for %d requested fields",
+            len(results),
+            len(target_fields),
+            extra={"doc_id": document.doc_id},
+        )
+        return results

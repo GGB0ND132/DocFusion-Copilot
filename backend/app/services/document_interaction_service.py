@@ -5,6 +5,7 @@ import re
 from pathlib import Path
 
 from app.core.config import Settings
+from app.core.logging import get_logger, log_operation
 from app.core.openai_client import OpenAIClientError, OpenAICompatibleClient
 from app.models.domain import DocumentBlock, DocumentRecord, FactRecord
 from app.repositories.base import Repository
@@ -18,10 +19,84 @@ _TEXT_HEADING_RE = re.compile(
     r"^(?P<prefix>(?:[一二三四五六七八九十]+[、.．]|\d{1,2}(?:\.\d{1,2}){0,2}[、.．]))\s*(?P<title>\S.*)$"
 )
 _MULTI_BLANK_LINES_RE = re.compile(r"\n{3,}")
+_CLEAR_CONTENT_RE = re.compile(
+    r"(删除|清空|清除|移除).{0,6}(内容|文本|全部|所有)|"
+    r"(内容|文本|全部).{0,4}(删除|清空|清除|移除)",
+)
+
+
+def _soft_sort_facts(
+    facts: list[FactRecord],
+    entities: list[str],
+    fields: list[str],
+    limit: int = 100,
+) -> list[FactRecord]:
+    """将匹配 entities/fields 的 facts 排到前面，其余排后面，截断到 limit 条。"""
+    if not entities and not fields:
+        return facts[:limit]
+    entity_set = {e.rstrip("市省区县") for e in entities}
+    field_set = set(fields)
+
+    def _match_score(fact: FactRecord) -> int:
+        score = 0
+        name_norm = fact.entity_name.rstrip("市省区县")
+        if entity_set and any(e in name_norm or name_norm in e for e in entity_set):
+            score += 2
+        if field_set and any(f in fact.field_name or fact.field_name in f for f in field_set):
+            score += 1
+        return score
+
+    scored = sorted(facts, key=_match_score, reverse=True)
+    return scored[:limit]
+
+
+def _partition_facts(
+    facts: list[FactRecord],
+    entities: list[str],
+    fields: list[str],
+    limit: int = 100,
+) -> tuple[list[FactRecord], list[FactRecord]]:
+    """将事实分为直接相关和补充参考两组，总量不超过 limit。"""
+    if not entities and not fields:
+        return facts[:limit], []
+    entity_set = {e.rstrip("市省区县") for e in entities}
+    field_set = set(fields)
+
+    matched: list[FactRecord] = []
+    rest: list[FactRecord] = []
+    for fact in facts:
+        name_norm = fact.entity_name.rstrip("市省区县")
+        hit_entity = entity_set and any(e in name_norm or name_norm in e for e in entity_set)
+        hit_field = field_set and any(f in fact.field_name or fact.field_name in f for f in field_set)
+        if hit_entity or hit_field:
+            matched.append(fact)
+        else:
+            rest.append(fact)
+    remaining = max(0, limit - len(matched))
+    return matched[:limit], rest[:remaining]
+
+
+def _soft_sort_blocks(
+    blocks: list[DocumentBlock],
+    entities: list[str],
+    limit: int = 30,
+) -> list[DocumentBlock]:
+    """将包含实体名称的 blocks 排到前面。"""
+    if not entities:
+        return blocks[:limit]
+    keywords = [e.rstrip("市省区县") for e in entities]
+
+    def _match(block: DocumentBlock) -> int:
+        return sum(1 for kw in keywords if kw in block.text)
+
+    scored = sorted(blocks, key=_match, reverse=True)
+    return scored[:limit]
 
 
 class DocumentInteractionService:
     """处理自然语言驱动的文档操作与内容查询。    Handle natural-language-driven document operations and content queries."""
+
+    _logger = get_logger("document_interaction")
 
     def __init__(
         self,
@@ -54,68 +129,70 @@ class DocumentInteractionService:
     ) -> dict[str, object]:
         """执行自然语言描述的文档操作。    Execute a document operation described in natural language."""
 
-        plan = self._agent_service.chat(message, context_id, store_preview_message=False)
-        resolved_document_ids = self._resolve_document_ids(document_ids, document_set_id)
-        intent = str(plan["intent"])
+        with log_operation(self._logger, "agent_execute"):
+            plan = self._agent_service.chat(message, context_id, store_preview_message=False)
+            resolved_document_ids = self._resolve_document_ids(document_ids, document_set_id)
+            intent = str(plan["intent"])
+            self._logger.info(f"intent resolved: {intent}", extra={"detail": intent})
 
-        if template_content is not None:
-            execution = self._queue_template_fill(
-                plan=plan,
-                template_name=template_name,
-                template_content=template_content,
-                document_set_id=document_set_id,
-                document_ids=document_ids or None,
-                fill_mode=fill_mode,
-                auto_match=auto_match,
-                user_requirement=user_requirement,
-            )
-        elif intent in {"extract_facts", "query_facts"}:
-            execution = self._query_facts(plan, resolved_document_ids)
-        elif intent == "edit_document":
-            execution = self._edit_documents(plan, resolved_document_ids)
-        elif intent == "summarize_document":
-            execution = self._summarize_documents(plan, resolved_document_ids)
-        elif intent == "reformat_document":
-            execution = self._reformat_documents(plan, resolved_document_ids)
-        elif intent == "extract_and_fill_template":
-            execution = {
-                "execution_type": "plan_only",
-                "summary": "Template filling requires an uploaded template_file.",
-                "facts": [],
-                "artifacts": [],
-                "document_ids": resolved_document_ids,
-                "task_id": None,
-                "task_status": None,
-                "template_name": None,
-            }
-        elif intent == "query_status":
-            execution = self._query_status(resolved_document_ids)
-        elif intent == "small_talk":
-            execution = self._small_talk(message, resolved_document_ids, bool(template_content))
-        elif intent == "general_qa":
-            execution = self._general_qa(message, plan, resolved_document_ids)
-        elif intent == "extract_fields":
-            execution = self._extract_fields(plan, resolved_document_ids)
-        elif intent == "export_results":
-            execution = self._export_results(plan, resolved_document_ids)
-        else:
-            execution = {
-                "execution_type": "plan_only",
-                "summary": "No executable backend operation matched the current request.",
-                "facts": [],
-                "artifacts": [],
-                "document_ids": resolved_document_ids,
-                "task_id": None,
-                "task_status": None,
-                "template_name": None,
-            }
+            if template_content is not None:
+                execution = self._queue_template_fill(
+                    plan=plan,
+                    template_name=template_name,
+                    template_content=template_content,
+                    document_set_id=document_set_id,
+                    document_ids=document_ids or None,
+                    fill_mode=fill_mode,
+                    auto_match=auto_match,
+                    user_requirement=user_requirement,
+                )
+            elif intent in {"extract_facts", "query_facts"}:
+                execution = self._query_facts(plan, resolved_document_ids)
+            elif intent == "edit_document":
+                execution = self._edit_documents(plan, resolved_document_ids)
+            elif intent == "summarize_document":
+                execution = self._summarize_documents(plan, resolved_document_ids)
+            elif intent == "reformat_document":
+                execution = self._reformat_documents(plan, resolved_document_ids)
+            elif intent == "extract_and_fill_template":
+                execution = {
+                    "execution_type": "plan_only",
+                    "summary": "Template filling requires an uploaded template_file.",
+                    "facts": [],
+                    "artifacts": [],
+                    "document_ids": resolved_document_ids,
+                    "task_id": None,
+                    "task_status": None,
+                    "template_name": None,
+                }
+            elif intent == "query_status":
+                execution = self._query_status(resolved_document_ids)
+            elif intent == "small_talk":
+                execution = self._small_talk(message, resolved_document_ids, bool(template_content))
+            elif intent == "general_qa":
+                execution = self._general_qa(message, plan, resolved_document_ids)
+            elif intent == "extract_fields":
+                execution = self._extract_fields(plan, resolved_document_ids)
+            elif intent == "export_results":
+                execution = self._export_results(plan, resolved_document_ids)
+            else:
+                execution = {
+                    "execution_type": "plan_only",
+                    "summary": "No executable backend operation matched the current request.",
+                    "facts": [],
+                    "artifacts": [],
+                    "document_ids": resolved_document_ids,
+                    "task_id": None,
+                    "task_status": None,
+                    "template_name": None,
+                }
 
-        merged = {
-            **plan,
-            **execution,
-        }
-        self._agent_service.record_execution_result(context_id, str(merged.get("summary", "")))
-        return merged
+            merged = {
+                **plan,
+                **execution,
+            }
+            self._agent_service.record_execution_result(context_id, str(merged.get("summary", "")))
+            return merged
 
     def _resolve_document_ids(
         self,
@@ -242,20 +319,22 @@ class DocumentInteractionService:
         """对文本类文档执行简单内容编辑，支持 LLM 辅助理解复杂编辑指令。
         Apply content edits to text-like documents, with LLM-assisted complex edit parsing."""
 
+        user_intent = str(plan.get("target", "") or plan.get("original_message", ""))
+        clear_all = bool(_CLEAR_CONTENT_RE.search(user_intent))
+
         raw_edits = plan.get("edits", [])
-        edits = [
-            (str(item.get("old_text", "")).strip(), str(item.get("new_text", "")).strip())
+        edits: list[tuple[str, str]] = [
+            (str(item.get("old_text", "")).strip(), str(item.get("new_text", "")))
             for item in raw_edits
             if isinstance(item, dict)
             and str(item.get("old_text", "")).strip()
-            and str(item.get("new_text", "")).strip()
         ]
 
         # LLM fallback: try to derive edits from document content + user intent
-        if not edits and self._openai_client.is_configured and document_ids:
+        if not edits and not clear_all and self._openai_client.is_configured and document_ids:
             edits = self._derive_edits_with_llm(plan, document_ids)
 
-        if not edits:
+        if not edits and not clear_all:
             return {
                 "execution_type": "plan_only",
                 "summary": "No concrete replacement pair was extracted from the request.",
@@ -279,7 +358,15 @@ class DocumentInteractionService:
             artifact_name = f"{doc_id}_edited_{safe_filename(document.file_name)}"
             output_path = self._settings.outputs_dir / artifact_name
 
-            if document.doc_type == "docx":
+            if clear_all:
+                # 清空文件内容
+                if document.doc_type == "docx":
+                    from app.utils.wordprocessing import create_empty_docx
+                    create_empty_docx(output_path)
+                else:
+                    output_path.write_text("", encoding="utf-8")
+                change_count = 1
+            elif document.doc_type == "docx":
                 change_count = replace_text_in_docx_document(source_path, output_path, edits)
             else:
                 content = source_path.read_text(encoding="utf-8", errors="ignore")
@@ -297,7 +384,12 @@ class DocumentInteractionService:
                 }
             )
 
-        summary = f"Edited {len(artifacts)} documents and applied {total_changes} text replacements."
+        if clear_all:
+            summary = f"已清空 {len(artifacts)} 份文档的内容。请点击下方按钮下载编辑后的文件。"
+        elif total_changes > 0:
+            summary = f"已编辑 {len(artifacts)} 份文档，共完成 {total_changes} 处替换。请点击下方按钮下载编辑后的文件。"
+        else:
+            summary = f"已处理 {len(artifacts)} 份文档，但未找到匹配的替换内容。请检查原文中是否存在指定的文本。"
         return {
             "execution_type": "edit",
             "summary": summary,
@@ -315,10 +407,16 @@ class DocumentInteractionService:
             if (document := self._repository.get_document(doc_id)) is not None
             and not bool(document.metadata.get("skip_fact_extraction"))
         ]
-        blocks: list[DocumentBlock] = []
+        all_blocks: list[DocumentBlock] = []
         facts = self._repository.list_facts(canonical_only=True, document_ids=set(document_ids))
         for doc_id in document_ids:
-            blocks.extend(self._repository.list_blocks(doc_id))
+            all_blocks.extend(self._repository.list_blocks(doc_id))
+
+        # ── 软预过滤：匹配的 facts/blocks 排前面，不完全排除不匹配的 ──
+        entities = [str(e) for e in plan.get("entities", []) if e and e != "城市"]
+        fields = [str(f) for f in plan.get("fields", [])]
+        facts = _soft_sort_facts(facts, entities, fields)
+        blocks = _soft_sort_blocks(all_blocks, entities)
 
         summary = self._build_summary_text(plan, blocks, facts, document_ids)
 
@@ -409,22 +507,34 @@ class DocumentInteractionService:
         """使用 OpenAI 兼容接口生成摘要。    Generate a summary using an OpenAI-compatible API."""
 
         block_preview = "\n".join(
-            f"- [{block.block_type}] {' > '.join(block.section_path) if block.section_path else 'root'}: {block.text[:160]}"
-            for block in blocks[:12]
+            f"- [{block.block_type}] {' > '.join(block.section_path) if block.section_path else 'root'}: {block.text[:200]}"
+            for block in blocks[:30]
         )
         fact_preview = "\n".join(
             f"- {fact.entity_name} / {fact.field_name} = {format_value(fact.value_num) or fact.value_text} {fact.unit or ''}".strip()
-            for fact in facts[:20]
+            for fact in facts[:100]
         )
+        user_message = str(plan.get("original_message", plan.get("intent", "")))
+        entities = [str(e) for e in plan.get("entities", []) if e and e != "城市"]
+        fields = [str(f) for f in plan.get("fields", [])]
+        entity_hint = f"\n用户关注的实体：{'、'.join(entities)}。必须以这些实体的数据为主，其他实体仅在对比时提及。" if entities else ""
+        field_hint = f"\n用户关注的字段：{'、'.join(fields)}。\n优先围绕这些字段组织摘要。" if fields else ""
         payload = self._openai_client.create_json_completion(
             system_prompt=(
-                "你是文档处理后端的摘要模块。"
-                "请根据文档块和结构化事实生成简洁中文摘要，禁止编造未给出的事实。"
+                "你是 DocFusion 文档融合系统的摘要与问答模块。\n"
+                "你会收到文档块和结构化事实。请根据用户的具体问题筛选相关内容作答。\n"
+                "规则：\n"
+                "1. 只使用与用户问题直接相关的事实和文档块，忽略不相关的内容。\n"
+                "2. 如果用户指定了地区、主题或时间范围，严格聚焦到该范围。\n"
+                "3. 禁止编造任何未在事实或文档块中出现的数据。\n"
+                "4. 用简洁的中文回答，包含关键数据和单位。\n"
+                "5. 如果提供的事实不足以完整回答问题，如实说明已知部分并指出缺失。"
+                f"{entity_hint}{field_hint}"
             ),
             user_prompt=(
-                f"用户意图: {plan.get('intent')}\n\n"
-                f"文档块:\n{block_preview}\n\n"
-                f"事实:\n{fact_preview}\n\n"
+                f"用户问题: {user_message}\n\n"
+                f"文档块（按章节排列）:\n{block_preview}\n\n"
+                f"结构化事实（实体 / 字段 = 值 单位）:\n{fact_preview}\n\n"
                 '请输出 JSON: {"summary": "..."}'
             ),
             json_schema={
@@ -528,6 +638,7 @@ class DocumentInteractionService:
                 system_prompt=(
                     "你是文档编辑助手。根据用户意图和文档片段，输出需要执行的文本替换对。"
                     "每一对包含 old_text（原文中存在的文本）和 new_text（替换后的文本）。"
+                    "如果用户要求删除某段文本，new_text 应为空字符串。"
                     "最多输出 10 对替换。如果无法确定具体替换，返回空数组。"
                 ),
                 user_prompt=(
@@ -760,9 +871,8 @@ class DocumentInteractionService:
         }
 
     def _general_qa_legacy(self, message: str, plan: dict[str, object], document_ids: list[str]) -> dict[str, object]:
-        """基于已有事实回答用户的通用问题。    Answer general questions using available facts."""
-        entities = [str(e) for e in plan.get("entities", [])]
-        fields = [str(f) for f in plan.get("fields", [])]
+        """基于已有事实回答用户的通用问题（LLM-First：不预过滤，让 LLM 自行判断相关性）。
+        Answer general questions using available facts (LLM-First: no pre-filtering)."""
         facts = self._repository.list_facts(canonical_only=True, document_ids=set(document_ids) if document_ids else None)
         scoped_blocks = [
             block
@@ -772,7 +882,7 @@ class DocumentInteractionService:
 
         if document_ids and self._looks_like_content_summary_request(message):
             summary = self._build_summary_text(
-                {**plan, "intent": "summarize_document"},
+                {**plan, "intent": "summarize_document", "original_message": message},
                 scoped_blocks,
                 facts,
                 document_ids,
@@ -794,27 +904,23 @@ class DocumentInteractionService:
                 "document_ids": document_ids,
             }
 
-        # Filter to relevant facts if entities/fields specified
-        relevant = facts
-        if entities:
-            relevant = [f for f in relevant if f.entity_name in entities or any(e in f.entity_name for e in entities)]
-        if fields:
-            relevant = [f for f in relevant if f.field_name in fields]
-        if not relevant:
-            relevant = facts[:20]
-
         if self._openai_client.is_configured:
             try:
                 fact_text = "\n".join(
                     f"- {f.entity_name} / {f.field_name} = {format_value(f.value_num) or f.value_text} {f.unit or ''}".strip()
-                    for f in relevant[:30]
+                    for f in facts[:100]
                 )
                 payload = self._openai_client.create_json_completion(
                     system_prompt=(
-                        "你是文档融合问答系统。根据以下结构化事实回答用户问题，禁止编造事实中没有的数据。"
-                        "如果事实不足以回答，请如实说明。"
+                        "你是 DocFusion 文档融合问答系统。你会收到文档范围内的全部结构化事实。\n"
+                        "请仔细阅读所有事实，自行筛选与用户问题相关的数据来回答。\n"
+                        "规则：\n"
+                        "1. 只引用与问题直接相关的事实，忽略无关数据。\n"
+                        "2. 如果用户指定了地区/主题/时间，严格聚焦到该范围。\n"
+                        "3. 禁止编造事实中没有的数据。如果事实不足以完整回答，如实说明。\n"
+                        "4. 回答使用简洁中文，包含关键数值和单位。"
                     ),
-                    user_prompt=f"已知事实:\n{fact_text}\n\n用户问题: {message}\n\n请输出 JSON: {{\"answer\": \"...\"}}",
+                    user_prompt=f"全部已知事实:\n{fact_text}\n\n用户问题: {message}\n\n请输出 JSON: {{\"answer\": \"...\"}}",
                     json_schema={
                         "type": "object",
                         "properties": {"answer": {"type": "string"}},
@@ -824,14 +930,14 @@ class DocumentInteractionService:
                 )
                 summary = str(payload.get("answer", "")).strip()
             except OpenAIClientError:
-                summary = self._fallback_qa(relevant)
+                summary = self._fallback_qa(facts)
         else:
-            summary = self._fallback_qa(relevant)
+            summary = self._fallback_qa(facts)
 
         return {
             "execution_type": "qa",
             "summary": summary,
-            "facts": relevant[:10],
+            "facts": facts[:10],
             "artifacts": [],
             "document_ids": document_ids,
         }
@@ -992,21 +1098,25 @@ class DocumentInteractionService:
         return "".join(lines)
 
     def _general_qa(self, message: str, plan: dict[str, object], document_ids: list[str]) -> dict[str, object]:
-        """优先用模型回答通用问题，对内容类问题优先转为文档摘要。
-        Prefer model-generated answers for general QA, and redirect content questions to document summaries."""
+        """优先用模型回答通用问题（软预过滤：匹配的 facts 排前面）。
+        Prefer model-generated answers for general QA (soft pre-filtering: matched facts first)."""
 
-        entities = [str(e) for e in plan.get("entities", [])]
-        fields = [str(f) for f in plan.get("fields", [])]
-        facts = self._repository.list_facts(canonical_only=True, document_ids=set(document_ids) if document_ids else None)
-        scoped_blocks = [
+        all_facts = self._repository.list_facts(canonical_only=True, document_ids=set(document_ids) if document_ids else None)
+        all_blocks = [
             block
             for doc_id in document_ids
             for block in self._repository.list_blocks(doc_id)
         ]
 
+        # ── 软预过滤：匹配的 facts/blocks 排前面 ──
+        entities = [str(e) for e in plan.get("entities", []) if e and e != "城市"]
+        fields = [str(f) for f in plan.get("fields", [])]
+        facts = _soft_sort_facts(all_facts, entities, fields)
+        scoped_blocks = _soft_sort_blocks(all_blocks, entities)
+
         if document_ids and self._looks_like_content_summary_request(message):
             summary = self._build_summary_text(
-                {**plan, "intent": "summarize_document"},
+                {**plan, "intent": "summarize_document", "original_message": message},
                 scoped_blocks,
                 facts,
                 document_ids,
@@ -1019,7 +1129,7 @@ class DocumentInteractionService:
                 "document_ids": document_ids,
             }
 
-        if not facts:
+        if not all_facts:
             scoped_documents = self._get_scoped_documents(document_ids)
             if scoped_documents:
                 summary = self._answer_with_openai(
@@ -1061,26 +1171,35 @@ class DocumentInteractionService:
                 "document_ids": document_ids,
             }
 
-        relevant = facts
-        if entities:
-            relevant = [f for f in relevant if f.entity_name in entities or any(e in f.entity_name for e in entities)]
-        if fields:
-            relevant = [f for f in relevant if f.field_name in fields]
-        if not relevant:
-            relevant = facts[:20]
-
         if self._openai_client.is_configured:
             try:
-                fact_text = "\n".join(
+                matched_facts, extra_facts = _partition_facts(all_facts, entities, fields)
+                primary_text = "\n".join(
                     f"- {f.entity_name} / {f.field_name} = {format_value(f.value_num) or f.value_text} {f.unit or ''}".strip()
-                    for f in relevant[:30]
+                    for f in matched_facts
                 )
+                extra_text = "\n".join(
+                    f"- {f.entity_name} / {f.field_name} = {format_value(f.value_num) or f.value_text} {f.unit or ''}".strip()
+                    for f in extra_facts[:30]
+                )
+                entity_hint = f"\n用户关注的实体：{'、'.join(entities)}。必须以这些实体的数据为主来回答，不要混入其他实体的数据。" if entities else ""
+                field_hint = f"\n用户关注的字段：{'、'.join(fields)}。优先引用这些字段。" if fields else ""
+                fact_section = f"【直接相关事实】\n{primary_text}" if primary_text else "【直接相关事实】\n（无匹配）"
+                if extra_text:
+                    fact_section += f"\n\n【补充参考（可能无关，仅在直接相关事实不足时酌情引用）】\n{extra_text}"
                 payload = self._openai_client.create_json_completion(
                     system_prompt=(
-                        "You are DocFusion Agent. Answer the user's question in Chinese using only the provided facts. "
-                        "Be concise, helpful, and do not invent missing data."
+                        "你是 DocFusion 文档融合问答系统。你会收到两组事实：【直接相关事实】和【补充参考】。\n"
+                        "规则：\n"
+                        "1. 优先且主要使用【直接相关事实】来回答。\n"
+                        "2. 只有在直接相关事实明显不足时，才谨慎引用【补充参考】中确实相关的条目。\n"
+                        "3. 如果用户指定了地区/主题/时间，严格聚焦到该范围，不要混入其他地区或主题。\n"
+                        "4. 禁止编造事实中没有的数据。如果事实不足以完整回答，明确说明'根据已有数据'。\n"
+                        "5. 回答使用简洁中文，包含关键数值和单位。\n"
+                        "6. 如果【直接相关事实】为空且【补充参考】也无相关信息，明确告知用户'未找到与该问题直接相关的结构数据'。"
+                        f"{entity_hint}{field_hint}"
                     ),
-                    user_prompt=f"Known facts:\n{fact_text}\n\nUser question: {message}",
+                    user_prompt=f"{fact_section}\n\n用户问题: {message}\n\n请输出 JSON: {{\"answer\": \"...\"}}",
                     json_schema={
                         "type": "object",
                         "properties": {"answer": {"type": "string"}},
@@ -1088,16 +1207,16 @@ class DocumentInteractionService:
                         "additionalProperties": False,
                     },
                 )
-                summary = str(payload.get("answer", "")).strip() or self._fallback_qa(relevant)
+                summary = str(payload.get("answer", "")).strip() or self._fallback_qa(facts)
             except OpenAIClientError:
-                summary = self._fallback_qa(relevant)
+                summary = self._fallback_qa(facts)
         else:
-            summary = self._fallback_qa(relevant)
+            summary = self._fallback_qa(facts)
 
         return {
             "execution_type": "qa",
             "summary": summary,
-            "facts": relevant[:10],
+            "facts": facts[:10],
             "artifacts": [],
             "document_ids": document_ids,
         }

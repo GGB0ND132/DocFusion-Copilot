@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { toast } from 'sonner';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 import {
   Send,
   FileUp,
@@ -470,7 +472,13 @@ export default function AgentPage() {
                         : 'bg-card border'
                   }`}
                 >
-                  <p className="whitespace-pre-wrap">{msg.text}</p>
+                  {msg.role === 'assistant' ? (
+                    <div className="prose prose-sm max-w-none dark:prose-invert prose-p:my-1 prose-headings:my-2 prose-ul:my-1 prose-li:my-0">
+                      <ReactMarkdown remarkPlugins={[remarkGfm]}>{msg.text}</ReactMarkdown>
+                    </div>
+                  ) : (
+                    <p className="whitespace-pre-wrap">{msg.text}</p>
+                  )}
                   {/* Operation result cards */}
                   {msg.role === 'assistant' && msg.data && <OperationResultCard data={msg.data} onDownload={handleDownloadArtifact} />}
                 </div>
@@ -495,7 +503,7 @@ export default function AgentPage() {
         {/* Input bar */}
         <div className="border-t bg-card p-3">
           <div className="mx-auto flex max-w-3xl items-end gap-2">
-            <input ref={templateInputRef} type="file" accept=".xlsx,.docx" className="hidden" onChange={handleTemplateSelect} />
+            <input ref={templateInputRef} type="file" accept=".xlsx,.docx,.txt,.md" className="hidden" onChange={handleTemplateSelect} />
             <Button
               variant="ghost"
               size="icon"

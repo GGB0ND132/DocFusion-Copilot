@@ -175,6 +175,45 @@ def reformat_docx_document(source_path: str | Path, output_path: str | Path) -> 
                 destination_archive.writestr(file_info, payload)
 
 
+def create_empty_docx(output_path: str | Path) -> None:
+    """创建一个只有空段落的 DOCX 文件。    Create a minimal DOCX with a single empty paragraph."""
+
+    from io import BytesIO
+
+    destination_file = Path(output_path)
+    destination_file.parent.mkdir(parents=True, exist_ok=True)
+
+    content_types = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+        '<Default Extension="xml" ContentType="application/xml"/>'
+        '<Override PartName="/word/document.xml" '
+        'ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>'
+        '</Types>'
+    )
+    rels = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" '
+        'Target="word/document.xml"/>'
+        '</Relationships>'
+    )
+    document_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        '<w:body><w:p/></w:body>'
+        '</w:document>'
+    )
+
+    buf = BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("[Content_Types].xml", content_types)
+        zf.writestr("_rels/.rels", rels)
+        zf.writestr("word/document.xml", document_xml)
+    destination_file.write_bytes(buf.getvalue())
+
+
 def replace_text_in_docx_document(
     source_path: str | Path,
     output_path: str | Path,

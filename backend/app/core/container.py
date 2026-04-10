@@ -3,11 +3,16 @@ from __future__ import annotations
 from dataclasses import dataclass
 from functools import lru_cache
 
+import logging
+
 from app.core.config import Settings, get_settings
 from app.core.openai_client import OpenAICompatibleClient
 from app.parsers.factory import ParserRegistry
 from app.repositories.base import Repository
+from app.repositories.memory import InMemoryRepository
 from app.repositories.postgres import PostgresRepository
+
+_logger = logging.getLogger("container")
 from app.services.benchmark_service import BenchmarkService
 from app.services.agent_service import AgentService
 from app.services.document_service import DocumentService
@@ -46,8 +51,12 @@ def get_container() -> ServiceContainer:
     Create and cache the application service container.
     """
     settings = get_settings()
-    repository = PostgresRepository(settings.database_url, echo=settings.database_echo)
-    repository.initialize()
+    try:
+        repository: Repository = PostgresRepository(settings.database_url, echo=settings.database_echo)
+        repository.initialize()
+    except Exception as exc:
+        _logger.warning("PostgreSQL 不可用，回退到内存仓储: %s", exc)
+        repository = InMemoryRepository()
     executor = TaskExecutor(max_workers=settings.max_workers)
     openai_client = OpenAICompatibleClient(
         api_key=settings.openai_api_key,
@@ -69,6 +78,7 @@ def get_container() -> ServiceContainer:
         executor=executor,
         settings=settings,
         openai_client=openai_client,
+        extraction_service=extraction_service,
     )
     benchmark_service = BenchmarkService(
         repository=repository,

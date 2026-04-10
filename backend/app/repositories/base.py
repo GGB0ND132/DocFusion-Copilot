@@ -50,9 +50,14 @@ class Repository(Protocol):
         Replace all parsed blocks for a document.
         """
 
-    def list_blocks(self, doc_id: str) -> list[DocumentBlock]:
-        """列出文档的全部解析块。
-        List all parsed blocks for a document.
+    def list_blocks(self, doc_id: str, *, limit: int | None = None, offset: int = 0) -> list[DocumentBlock]:
+        """列出文档的解析块，支持可选分页。
+        List parsed blocks for a document, with optional pagination.
+        """
+
+    def count_blocks(self, doc_id: str) -> int:
+        """返回文档解析块总数。
+        Return the total number of parsed blocks for a document.
         """
 
     def upsert_task(self, task: TaskRecord) -> TaskRecord:

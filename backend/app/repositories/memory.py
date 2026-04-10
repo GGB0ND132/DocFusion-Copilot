@@ -106,12 +106,19 @@ class InMemoryRepository:
         with self._lock:
             self._blocks_by_doc[doc_id] = [replace(block) for block in blocks]
 
-    def list_blocks(self, doc_id: str) -> list[DocumentBlock]:
-        """返回指定文档的全部解析块。
-        Return all parsed blocks for a given document.
+    def list_blocks(self, doc_id: str, *, limit: int | None = None, offset: int = 0) -> list[DocumentBlock]:
+        """返回指定文档的解析块，支持可选分页。
+        Return parsed blocks for a given document, with optional pagination.
         """
         with self._lock:
-            return [replace(block) for block in self._blocks_by_doc.get(doc_id, [])]
+            all_blocks = [replace(block) for block in self._blocks_by_doc.get(doc_id, [])]
+            sliced = all_blocks[offset:] if limit is None else all_blocks[offset:offset + limit]
+            return sliced
+
+    def count_blocks(self, doc_id: str) -> int:
+        """返回指定文档的解析块总数。"""
+        with self._lock:
+            return len(self._blocks_by_doc.get(doc_id, []))
 
     def upsert_task(self, task: TaskRecord) -> TaskRecord:
         """插入或替换任务记录并返回副本。

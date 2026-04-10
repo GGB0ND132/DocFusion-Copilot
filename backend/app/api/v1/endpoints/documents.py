@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
+from fastapi import APIRouter, Body, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse
 
 from app.core.container import get_container
@@ -91,6 +91,22 @@ def delete_document(doc_id: str) -> dict:
     return {"doc_id": doc.doc_id, "deleted": True}
 
 
+@router.post("/batch-delete")
+def batch_delete_documents(doc_ids: list[str] = Body(..., embed=True)) -> dict:
+    """批量删除文档及其关联数据。
+    Batch-delete documents and cascade-remove their blocks, facts and stored files.
+    """
+    deleted: list[str] = []
+    errors: list[dict[str, str]] = []
+    for doc_id in doc_ids:
+        try:
+            get_container().document_service.delete_document(doc_id)
+            deleted.append(doc_id)
+        except ValueError as exc:
+            errors.append({"doc_id": doc_id, "error": str(exc)})
+    return {"deleted": deleted, "errors": errors}
+
+
 @router.get("", response_model=list[DocumentResponse])
 def list_documents() -> list[DocumentResponse]:
     """列出后端仓储当前已知的全部文档。
@@ -111,16 +127,23 @@ def get_document(doc_id: str) -> DocumentResponse:
     return DocumentResponse.model_validate(document)
 
 
-@router.get("/{doc_id}/blocks", response_model=list[BlockResponse])
-def get_document_blocks(doc_id: str) -> list[BlockResponse]:
-    """获取指定文档的解析块。
-    Fetch parsed blocks for a document.
+@router.get("/{doc_id}/blocks")
+def get_document_blocks(
+    doc_id: str,
+    limit: int | None = Query(default=None, ge=1, le=500, description="每页条数，不传则返回全部"),
+    offset: int = Query(default=0, ge=0, description="偏移量"),
+) -> dict:
+    """获取指定文档的解析块，支持分页。
+    Fetch parsed blocks for a document, with optional pagination.
     """
     document = get_container().document_service.get_document(doc_id)
     if document is None:
         raise HTTPException(status_code=404, detail="Document not found.")
-    blocks = get_container().document_service.get_document_blocks(doc_id)
-    return [BlockResponse.model_validate(block) for block in blocks]
+    container = get_container()
+    blocks = container.repository.list_blocks(doc_id, limit=limit, offset=offset)
+    total = container.repository.count_blocks(doc_id)
+    items = [BlockResponse.model_validate(block) for block in blocks]
+    return {"items": items, "total": total, "offset": offset, "limit": limit}
 
 
 @router.get("/{doc_id}/facts", response_model=list[FactResponse])

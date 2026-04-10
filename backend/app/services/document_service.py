@@ -5,6 +5,7 @@ from pathlib import Path
 from time import perf_counter
 
 from app.core.config import Settings
+from app.core.logging import ErrorCode, get_logger, log_operation
 from app.models.domain import DocumentRecord, DocumentStatus, TaskRecord, TaskStatus, TaskType
 from app.parsers.factory import ParserRegistry
 from app.repositories.base import Repository
@@ -18,6 +19,8 @@ class DocumentService:
     """处理文档上传、解析任务和事实抽取编排。
     Handle document uploads, parsing tasks and fact extraction orchestration.
     """
+
+    _logger = get_logger("document_service")
 
     def __init__(
         self,
@@ -131,6 +134,7 @@ class DocumentService:
         """解析单个上传文档、抽取事实并更新任务状态。
         Parse one uploaded document, extract facts and update task state.
         """
+        self._logger.info("document_parse started", extra={"doc_id": doc_id, "task_id": task_id})
         started_at = perf_counter()
         self._repository.update_document(doc_id, status=DocumentStatus.parsing)
         self._repository.update_task(
@@ -215,7 +219,15 @@ class DocumentService:
                     "total_seconds": total_elapsed,
                 },
             )
+            self._logger.info(
+                f"document_parse completed in {total_elapsed:.2f}s",
+                extra={"doc_id": doc_id, "task_id": task_id, "duration_ms": round(total_elapsed * 1000, 1)},
+            )
         except Exception as exc:
+            self._logger.error(
+                f"document_parse failed: {exc}",
+                extra={"doc_id": doc_id, "task_id": task_id, "error_code": ErrorCode.PARSE_READ_FAILURE},
+            )
             self._repository.update_document(doc_id, status=DocumentStatus.failed)
             self._repository.update_task(
                 task_id,

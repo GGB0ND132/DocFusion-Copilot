@@ -138,17 +138,28 @@ class PostgresRepository:
             session.execute(delete(DocumentBlockRow).where(DocumentBlockRow.doc_id == doc_id))
             session.add_all(self._block_to_row(block) for block in blocks)
 
-    def list_blocks(self, doc_id: str) -> list[DocumentBlock]:
-        """列出文档的全部解析块。
-        List all parsed blocks for a document.
+    def list_blocks(self, doc_id: str, *, limit: int | None = None, offset: int = 0) -> list[DocumentBlock]:
+        """列出文档的解析块，支持可选分页。
+        List parsed blocks for a document, with optional pagination.
         """
         with self._session() as session:
             stmt = (
                 select(DocumentBlockRow)
                 .where(DocumentBlockRow.doc_id == doc_id)
                 .order_by(DocumentBlockRow.page_or_index.asc().nulls_last(), DocumentBlockRow.block_id.asc())
+                .offset(offset)
             )
+            if limit is not None:
+                stmt = stmt.limit(limit)
             return [self._block_from_row(row) for row in session.scalars(stmt).all()]
+
+    def count_blocks(self, doc_id: str) -> int:
+        """返回文档解析块总数。"""
+        from sqlalchemy import func
+        with self._session() as session:
+            return session.scalar(
+                select(func.count()).select_from(DocumentBlockRow).where(DocumentBlockRow.doc_id == doc_id)
+            ) or 0
 
     def upsert_task(self, task: TaskRecord) -> TaskRecord:
         """插入或更新任务记录。

@@ -98,6 +98,17 @@
 - 前端 TypeScript 编译：**0 错误**
 - 前端 Vite 构建：**成功**（403KB JS + 17KB CSS）
 
+### 2.8 本轮新增功能
+
+| 功能 | 说明 |
+|---|---|
+| **InMemoryRepository 自动降级** | `container.py` 启动时若 PostgreSQL 不可用，自动 fallback 到内存仓储，不再崩溃 |
+| **LLM 语义字段匹配** | `_llm_enhance_field_columns()` 作为字段匹配第 4 层 fallback（catalog → stripped → case-insensitive → LLM），处理模板表头与事实字段名不一致的情况 |
+| **定向 LLM 抽取** | `extract_targeted_fields()` 针对模板缺失字段，从源文档 Block 中定向 LLM 抽取，集成到填充管线 |
+| **DOCX/XLSX 在线预览** | `FilePreview.tsx` 新增 `BlocksPreview` 组件，按 Block 渲染 DOCX/XLSX（标题 + 段落 + 表格行） |
+| **Agent TXT/MD 模板上传** | Agent 页面模板上传 accept 扩展为 `.xlsx,.docx,.txt,.md` |
+| **Agent Markdown 渲染** | Agent 助手消息使用 `ReactMarkdown` + `remark-gfm` 渲染，支持表格、列表、代码块等格式 |
+
 ---
 
 ## 三、待实现需求
@@ -208,52 +219,54 @@
 - [x] 超长对话自动截断（40 条截到 30 条，LLM 上下文窗口 20 条）
 - [x] `DELETE /api/v1/agent/conversations/{context_id}` 清空对话端点
 
-#### B-3：Agent 自然语言问答分支
-- [ ] AgentService 意图识别新增 `query_status` / `summarize` / `general_qa` 等意图类型
-- [ ] `/agent/execute` 根据 intent 分发：fill → 模板回填，summarize → 文档摘要，query_status → 查询状态，general_qa → 通用问答
-- [ ] 问答类返回纯文本 summary 而非 artifacts
+#### B-3：Agent 自然语言问答分支 ✅
+- [x] AgentService 意图识别新增 `query_status` / `summarize` / `general_qa` 等意图类型
+- [x] `/agent/execute` 根据 intent 分发：fill → 模板回填，summarize → 文档摘要，query_status → 查询状态，general_qa → 通用问答
+- [x] 问答类返回纯文本 summary 而非 artifacts
 
-#### B-4：文档智能操作完善
-- [ ] DocumentInteractionService 增强 reformat：支持 LLM 解析用户格式要求（标题级别 + 字体 + 字号）
-- [ ] 增强 edit：支持批量文本替换、LLM 辅助理解复杂编辑指令
-- [ ] 增强 extract：支持用户自然语言指定要提取的实体/字段，返回结构化结果
-- [ ] 新增 export：将提取结果导出为 xlsx / docx / json 文件（参考 openpyxl + python-docx XML 模式）
-- [ ] 各操作产生的 artifact 支持前端下载
-- [ ] Agent 意图扩充：`extract_fields` / `export_results` 加入 INTENT_KEYWORDS
+#### B-4：文档智能操作完善 ✅
+- [x] DocumentInteractionService 增强 reformat：支持 LLM 解析用户格式要求（标题级别 + 字体 + 字号）
+- [x] 增强 edit：支持批量文本替换、LLM 辅助理解复杂编辑指令
+- [x] 增强 extract：支持用户自然语言指定要提取的实体/字段，返回结构化结果
+- [x] 新增 export：将提取结果导出为 xlsx / docx / json 文件（参考 openpyxl + python-docx XML 模式）
+- [x] 各操作产生的 artifact 支持前端下载
+- [x] Agent 意图扩充：`extract_fields` / `export_results` 加入 INTENT_KEYWORDS
 
-#### B-5：DOCX 模板回填能力修复（Critical）
-- [ ] `_build_docx_table_updates` 补齐 row_groups 多行填充逻辑（从 XLSX 版 `_build_sheet_updates` 移植）
-- [ ] `load_docx_tables` 增加 gridSpan（水平合并）+ vMerge（垂直合并）合并单元格检测
-- [ ] `DocxParser` 表格解析同步处理合并单元格，正确计算逻辑列位置
-- [ ] `_get_or_create_table_row` 克隆行时清除 vMerge 属性，防止输出文件结构损坏
-- [ ] `CITY_NAMES` 扩充：添加测试集中出现的城市（德州/潍坊/临沂/合肥等地级市）
-- [ ] `fact_lookup` 构建时同时注册带"市"和不带"市"两个 key，提升实体匹配命中率
-- [ ] `_detect_layout` 中实体匹配同时尝试带"市"和不带"市"的变体
+#### B-5：DOCX 模板回填能力修复（Critical） ✅
+- [x] `_build_docx_table_updates` 补齐 row_groups 多行填充逻辑（从 XLSX 版 `_build_sheet_updates` 移植）
+- [x] `load_docx_tables` 增加 gridSpan（水平合并）+ vMerge（垂直合并）合并单元格检测
+- [x] `DocxParser` 表格解析同步处理合并单元格，正确计算逻辑列位置
+- [x] `_get_or_create_table_row` 克隆行时清除 vMerge 属性，防止输出文件结构损坏
+- [x] `CITY_NAMES` 扩充至 221 个城市（覆盖全国地级市 + 测试集城市）
+- [x] `fact_lookup` 构建时同时注册带"市"和不带"市"两个 key，提升实体匹配命中率
+- [x] `_detect_layout` 中实体匹配同时尝试带"市"和不带"市"的变体
+- [x] **新增** `_llm_enhance_field_columns()`：LLM 语义匹配作为第 4 层 fallback，XLSX 和 DOCX 模板均已集成
+- [x] **新增** `extract_targeted_fields()`：针对模板缺失字段进行定向 LLM 抽取，集成到 `_fill_template_once_inner`
 
-#### B-6：PDF 文件解析支持
-- [ ] `requirements.txt` 添加 `pdfplumber`
-- [ ] 新建 `backend/app/parsers/pdf_parser.py`：继承 `DocumentParser`，`supported_suffixes = (".pdf",)`
-- [ ] `parse()` 方法：pdfplumber 逐页提取文本，每页生成一个 Block（block_type="page"，page_or_index=页码）
-- [ ] 表格识别：`page.extract_tables()` 每个表格生成 table_row Block
-- [ ] `factory.py` registry 添加 `PdfParser()` 实例
-- [ ] `config.py` → `supported_document_extensions` 添加 `".pdf"`
+#### B-6：PDF 文件解析支持 ✅
+- [x] `requirements.txt` 添加 `pdfplumber`（+ `python-docx>=1.1,<2.0`、`openpyxl>=3.1,<4.0`、`fpdf2>=2.7,<3.0`）
+- [x] 新建 `backend/app/parsers/pdf_parser.py`：继承 `DocumentParser`，`supported_suffixes = (".pdf",)`
+- [x] `parse()` 方法：pdfplumber 逐页提取文本，每页生成一个 Block（block_type="page"，page_or_index=页码）
+- [x] 表格识别：`page.extract_tables()` 每个表格生成 table_row Block
+- [x] `factory.py` registry 添加 `PdfParser()` 实例
+- [x] `config.py` → `supported_document_extensions` 添加 `".pdf"`
 
-#### B-7：原始文件下载端点
-- [ ] 新增 `GET /api/v1/documents/{doc_id}/raw` — 返回 `FileResponse`，用于前端原文预览
-- [ ] 安全校验：仅返回已上传且存在于 storage/uploads/ 的文件
+#### B-7：原始文件下载端点 ✅
+- [x] 新增 `GET /api/v1/documents/{doc_id}/raw` — 返回 `FileResponse`，用于前端原文预览
+- [x] 安全校验：仅返回已上传且存在于 storage/uploads/ 的文件
 
-#### B-8：对话历史持久化（数据库存储）
-- [ ] `sqlalchemy_models.py` 新增 `ConversationRow` 模型：`conversation_id`(PK) / `title` / `created_at` / `updated_at` / `messages`(JSONB) / `metadata`(JSONB)
-- [ ] `base.py` Protocol 新增对话 CRUD 方法：`create_conversation` / `update_conversation` / `list_conversations` / `get_conversation` / `delete_conversation`
-- [ ] `postgres.py` 实现上述方法
-- [ ] 新增端点：`GET /api/v1/agent/conversations`（列表，按 updated_at DESC）、`POST /api/v1/agent/conversations`（新建）、`GET /api/v1/agent/conversations/{id}`（详情+messages）、`PUT /api/v1/agent/conversations/{id}`（更新）
-- [ ] `AgentService._conversations` 内存字典改为 DB 读写，发送消息时同步 persist
-- [ ] 自动标题生成：首条用户消息截断前 30 字作为对话标题
+#### B-8：对话历史持久化（数据库存储） ✅
+- [x] `sqlalchemy_models.py` 新增 `ConversationRow` 模型：`conversation_id`(PK) / `title` / `created_at` / `updated_at` / `messages`(JSONB) / `metadata`(JSONB)
+- [x] `base.py` Protocol 新增对话 CRUD 方法：`create_conversation` / `update_conversation` / `list_conversations` / `get_conversation` / `delete_conversation`
+- [x] `postgres.py` 实现上述方法
+- [x] 新增端点：`GET /api/v1/agent/conversations`（列表，按 updated_at DESC）、`POST /api/v1/agent/conversations`（新建）、`GET /api/v1/agent/conversations/{id}`（详情+messages）、`PUT /api/v1/agent/conversations/{id}`（更新）
+- [x] `AgentService._conversations` 内存字典改为 DB 读写，发送消息时同步 persist
+- [x] 自动标题生成：首条用户消息截断前 30 字作为对话标题
 
-#### B-9：Benchmark 评测矩阵
-- [ ] 编写 benchmark runner 脚本：批量上传测试集文档 → 逐个模板回填 → 与标准答案比对 → 输出准确率 + 耗时报表
-- [ ] 误差分类统计：实体识别错误 / 字段归一化错误 / 单位换算错误 / 模板定位错误 / 合并单元格错误 / LLM 误判
-- [ ] 输出 JSON + Markdown 格式的评测报告，方便版本间对比
+#### B-9：Benchmark 评测矩阵 ✅
+- [x] 编写 benchmark runner 脚本（`scripts/run_benchmark.py`）：批量上传测试集文档 → 逐个模板回填 → 与标准答案比对 → 输出准确率 + 耗时报表
+- [x] 误差分类统计：实体识别错误 / 字段归一化错误 / 单位换算错误 / 模板定位错误 / 合并单元格错误 / LLM 误判
+- [x] 输出 JSON + Markdown 格式的评测报告，方便版本间对比
 - [ ] 集成到 pytest：`test_benchmark_full_pipeline` 跑完后 assert 准确率 ≥ 基准线
 
 #### B-10：结构化日志与错误码
@@ -295,10 +308,10 @@
 - [x] 页面切换时不销毁对话状态（Zustand 持久化）
 - [x] 增加"清空对话"按钮（RotateCcw 图标 + 调用 clearAgentConversation API）
 
-#### F-3：Agent 自然语言问答
-- [ ] 修改 handleSend 逻辑：无 templateFile 时走 runAgentExecute，有 templateFile 时先判断意图再决定走回填还是 execute
-- [ ] Agent 返回的纯文本 summary 直接作为 assistant 消息展示
-- [ ] 支持 summarize / query / general_qa 类响应的展示
+#### F-3：Agent 自然语言问答 ✅
+- [x] 修改 handleSend 逻辑：无 templateFile 时走 runAgentExecute，有 templateFile 时先判断意图再决定走回填还是 execute
+- [x] Agent 返回的纯文本 summary 直接作为 assistant 消息展示（ReactMarkdown 渲染）
+- [x] 支持 summarize / query / general_qa 类响应的展示
 
 #### F-4：Agent 对话输入框自适应高度 ✅
 - [x] textarea 通过 ref + onChange 动态调整 height = Math.min(scrollHeight, 200)
@@ -306,42 +319,44 @@
 - [x] 超过上限时 overflow-y-auto 显示滚动条
 - [x] 发送后重置高度
 
-#### F-5：文档智能操作交互模块 UI
-- [ ] AgentPage handleSend 对非 template_fill 的 agent 返回结果（summary / artifacts）直接在对话流中展示
-- [ ] 操作结果卡片展示：替换计数、摘要文本、提取字段表格、导出文件链接
-- [ ] artifact 下载按钮对 edit / reformat / extract / export 产物全部生效
+#### F-5：文档智能操作交互模块 UI ✅
+- [x] AgentPage handleSend 对非 template_fill 的 agent 返回结果（summary / artifacts）直接在对话流中展示
+- [x] 操作结果卡片展示：替换计数、摘要文本、提取字段表格、导出文件链接
+- [x] artifact 下载按钮对 edit / reformat / extract / export 产物全部生效
 - [ ] 可选：WorkspacePage 右侧新增"文档操作"Tab
 
-#### F-6：大文档预览虚拟滚动
-- [ ] 安装 `@tanstack/react-virtual`
-- [ ] WorkspacePage 中栏 Block 列表用 `useVirtualizer` 替代 `blocks.map()` 全量渲染
-- [ ] 支持动态行高（`estimateSize` + `measureElement`）
-- [ ] 保持或适配 ScrollArea / 原生 overflow-auto（virtualizer 需要容器 ref）
+#### F-6：大文档预览虚拟滚动 ✅
+- [x] 安装 `@tanstack/react-virtual`
+- [x] WorkspacePage 中栏 Block 列表用 `useVirtualizer` 替代 `blocks.map()` 全量渲染
+- [x] 支持动态行高（`estimateSize` + `measureElement`）
+- [x] 保持或适配 ScrollArea / 原生 overflow-auto（virtualizer 需要容器 ref）
 
-#### F-7：PDF 上传与 FileIcon 扩展
-- [ ] WorkspacePage 文件上传 `accept` 属性添加 `.pdf`
-- [ ] `FileIcon` 组件添加 PDF 图标（lucide-react `FileType` 或自定义颜色）
+#### F-7：PDF 上传与 FileIcon 扩展 ✅
+- [x] WorkspacePage 文件上传 `accept` 属性添加 `.pdf`
+- [x] `FileIcon` 组件添加 PDF 图标（lucide-react `FileType` 或自定义颜色）
 
-#### F-8：原始文件在线预览组件
-- [ ] 安装 `react-markdown` + `remark-gfm`（`react-pdf` 已安装）
-- [ ] 新建 `frontend/src/components/FilePreview.tsx`：根据 docType 分发渲染
+#### F-8：原始文件在线预览组件 ✅
+- [x] 安装 `react-markdown` + `remark-gfm`（`react-pdf` 已安装）
+- [x] 新建 `frontend/src/components/FilePreview.tsx`：根据 docType 分发渲染（PDF / MD / TXT / DOCX / XLSX）
   - PdfPreview：react-pdf `Document` / `Page` 组件，逐页滚动 + 缩放控制
   - MarkdownPreview：fetch 原始文本 → `react-markdown` 渲染
   - TextPreview：fetch 原始文本 → `<pre>` 展示
-- [ ] `services/` 新增 `getDocumentRawUrl(docId)` 函数
-- [ ] WorkspacePage 中栏顶部加 **"解析" / "预览"** Tab 切换
-- [ ] "预览" Tab 渲染 `<FilePreview docId={...} docType={...} />`
+  - **BlocksPreview**：DOCX / XLSX 按 Block 渲染（标题 + 段落 + 表格行），支持原文件下载
+- [x] `services/` 新增 `getDocumentRawUrl(docId)` 函数
+- [x] WorkspacePage 中栏顶部加 **"解析" / "预览"** Tab 切换
+- [x] "预览" Tab 渲染 `<FilePreview docId={...} docType={...} />`
 
-#### F-9：对话历史侧边栏（会话管理）
-- [ ] `services/` 新增对话 CRUD API：`listConversations` / `createConversation` / `getConversation` / `updateConversation` / `deleteConversation`
-- [ ] `uiStore.ts` 新增状态：`conversations` 列表、`activeConversationId`、对话切换 action
-- [ ] AgentPage 左侧新增可折叠侧边栏（用 `ResizablePanel`）：
+#### F-9：对话历史侧边栏（会话管理） ✅
+- [x] `services/` 新增对话 CRUD API：`listConversations` / `createConversation` / `getConversation` / `updateConversation` / `deleteConversation`
+- [x] `uiStore.ts` 新增状态：`conversations` 列表、`activeConversationId`、对话切换 action
+- [x] AgentPage 左侧新增可折叠侧边栏（用 `ResizablePanel`）：
   - 顶部 "新对话" 按钮
   - 对话列表（标题 + 时间戳，点击切换）
   - 每项 hover 显示删除按钮
-- [ ] 切换对话 → 加载该对话 messages → 渲染到聊天区域
-- [ ] 发送消息 → 同步更新到 DB（通过 PUT 端点）
-- [ ] 新对话时自动生成 conversation_id 并 POST 创建
+- [x] 切换对话 → 加载该对话 messages → 渲染到聊天区域
+- [x] 发送消息 → 同步更新到 DB（通过 PUT 端点）
+- [x] 新对话时自动生成 conversation_id 并 POST 创建
+- [x] 模板回填前先调 `runAgentChat()` 将用户意图写入对话历史
 
 #### F-10：Fact 追溯与复核 UI
 - [ ] 回填结果表格中，每个单元格支持 hover 显示 fact_id / confidence / evidence_text
@@ -400,14 +415,14 @@
 | ~~P0~~ | ~~B-1 + F-1 文档删除~~ | ✅ 已完成 |
 | ~~P0~~ | ~~F-4 输入框自适应~~ | ✅ 已完成 |
 | ~~P2~~ | ~~B-2 + F-2 对话记忆（内存版）~~ | ✅ 已完成 |
-| **P0** | **B-5 DOCX 回填修复** | 🔴 DOCX 模板回填能力严重不足，直接影响比赛得分 |
-| **P0** | **B-6 + F-7 PDF 解析** | 🔴 新增文件格式覆盖率直接影响赛题评分 |
-| **P1** | **F-6 大文档虚拟滚动** | 大 XLSX 预览卡顿严重影响演示体验 |
-| **P1** | **B-7 + F-8 原始文件预览** | 赛题展示加分项，react-pdf 已安装可快速实现 |
-| **P1** | B-3 + F-3 Agent 问答分支 | 赛题核心要求，当前 Agent 只能回填 |
-| **P1** | B-4 + F-5 文档智能操作 | 赛题三大必选模块之一 |
-| **P2** | **B-8 + F-9 对话持久化 + 侧边栏** | 体验提升，DB 存储可作为技术亮点 |
-| **P1** | **B-9 Benchmark 评测矩阵** | 🔴 每次改动后需立即验证准确率未退步 |
+| ~~P0~~ | ~~B-6 + F-7 PDF 解析~~ | ✅ 已完成（pdf_parser.py + FileIcon + requirements） |
+| ~~P1~~ | ~~F-6 大文档虚拟滚动~~ | ✅ 已完成（@tanstack/react-virtual） |
+| ~~P1~~ | ~~B-7 + F-8 原始文件预览~~ | ✅ 已完成（PDF/MD/TXT/DOCX/XLSX 预览） |
+| ~~P1~~ | ~~B-3 + F-3 Agent 问答分支~~ | ✅ 已完成（general_qa/summarize/query_status 意图） |
+| ~~P2~~ | ~~B-8 + F-9 对话持久化 + 侧边栏~~ | ✅ 已完成（ConversationRow + CRUD + 侧边栏 + runAgentChat 持久化） |
+| ~~P0~~ | ~~B-5 DOCX 回填修复~~ | ✅ 已完成（合并单元格 + row_groups + "市"别名 + LLM 语义匹配 + 定向抽取） |
+| ~~P1~~ | ~~B-4 + F-5 文档智能操作~~ | ✅ 已完成（11 种意图 + OperationResultCard） |
+| ~~P1~~ | ~~B-9 Benchmark 评测矩阵~~ | ✅ 已完成（run_benchmark.py + 误差分类 + JSON/Markdown 报告） |
 | **P1** | **B-13 LLM Prompt 工程增强** | 提升回填准确率的核心杠杆 |
 | **P2** | **B-10 结构化日志** | 赛前排障效率，降低 Demo 翻车风险 |
 | **P2** | **B-11 + F-10 Fact 追溯 + 复核** | 赛题强调"可追溯"，评分加分项 |
@@ -421,24 +436,19 @@
 ### 建议实施顺序
 
 ```
-第一批（P0 — 赛题保底分）
-  B-5 DOCX 回填修复
-  B-6 + F-7 PDF 解析
+✅ 第一批（P0 — 赛题保底分）— 全部完成
+  B-5 DOCX 回填修复              ✅ 合并单元格 + row_groups + LLM 语义匹配
 
-第二批（P1 — 准确率 + 展示分）
-  B-9 Benchmark 评测矩阵        ← 越早建越好，后续改动靠它验证
-  B-13 LLM Prompt 工程增强       ← 直接提升准确率
-  F-6 大文档虚拟滚动             ← 独立，可随时插入
-  B-7 + F-8 原始文件预览          ← 依赖 B-6（PDF 解析完成后做）
-  B-3 + F-3 Agent 问答分支        ← 依赖 B-2 已完成
-  B-4 + F-5 文档智能操作          ← 最大工作量
+✅ 第二批（P1 — 准确率 + 展示分）— 全部完成
+  B-9 Benchmark 评测矩阵        ✅ run_benchmark.py + 误差分类 + 报告
+  B-4 + F-5 文档智能操作          ✅ 11 种意图 + OperationResultCard
 
 第三批（P2 — 质量 + 可追溯）
+  B-13 LLM Prompt 工程增强       ← 直接提升准确率
   B-10 结构化日志                ← 赛前排障
   B-11 + F-10 Fact 追溯 + 复核    ← 赛题"可追溯"加分
   T-1 回归测试矩阵               ← 保障稳定性
   D-1 一键启动 + 部署            ← 评委运行便利
-  B-8 + F-9 对话历史持久化 + 侧边栏
 
 第四批（P3 — 锦上添花）
   B-12 document_set 快照
@@ -455,45 +465,47 @@
 
 | # | 严重度 | 问题 | 影响 |
 |---|--------|------|------|
-| 1 | 🔴 Critical | `_build_docx_table_updates` 缺少 row_groups 多行填充逻辑 | 空模板（仅表头无数据行）时 **0 条数据写入**，XLSX 有此逻辑而 DOCX 完全缺失 |
-| 2 | 🔴 Critical | 无 `gridSpan` / `w:vMerge` 合并单元格处理 | 中文模板常用合并单元格做多级表头，列索引错位导致数据写入错误位置 |
-| 3 | 🔴 Critical | `CITY_NAMES` 仅 20 个一线城市 | 测试集中的德州/潍坊/临沂/合肥等地级市无法被 `find_entity_mentions()` 从自由文本中识别 |
-| 4 | 🟡 High | `_get_or_create_table_row` 克隆行时携带 vMerge 属性 | 新增行继承合并标记，输出文件结构损坏 |
-| 5 | 🟡 High | 实体名 "市" 后缀不对称 | `normalize_entity_name` 去掉 "市"，但模板/fact_lookup 可能保留，导致 lookup miss |
+| 1 | ~~🔴 Critical~~ | ~~`_build_docx_table_updates` 缺少 row_groups 多行填充逻辑~~ | ✅ 已修复：row_groups 逻辑已从 XLSX 版移植 |
+| 2 | ~~🔴 Critical~~ | ~~无 `gridSpan` / `w:vMerge` 合并单元格处理~~ | ✅ 已修复：`load_docx_tables` 正确处理 gridSpan + vMerge |
+| 3 | ~~🔴 Critical~~ | ~~`CITY_NAMES` 仅 20 个一线城市~~ | ✅ 已修复：扩展至 221 个城市（覆盖全国地级市 + 测试集城市） |
+| 4 | ~~🟡 High~~ | ~~`_get_or_create_table_row` 克隆行时携带 vMerge 属性~~ | ✅ 已修复：克隆行时清除 vMerge |
+| 5 | ~~🟡 High~~ | ~~实体名 "市" 后缀不对称~~ | ✅ 已修复：`_build_fact_lookup` 同时注册带/不带"市"的 key |
 | 6 | 🟠 Medium | DOCX 不支持嵌套表格 | 仅处理 `<w:body>` 直接子元素的表格，嵌套在单元格中的表格被忽略 |
 
 ### 修改方案
 
-**Phase 1 — DOCX 回填修复（核心 Bug）**
+**Phase 1 — DOCX 回填修复（核心 Bug）** ✅ 全部完成
 
-| 步骤 | 修改 | 文件 |
-|------|------|------|
-| 1 | `_build_docx_table_updates` 补齐 row_groups（从 XLSX 版 `_build_sheet_updates` 移植 15 行代码） | `template_service.py` |
-| 2 | `load_docx_tables` 增加 gridSpan + vMerge 合并单元格检测，正确计算逻辑列 | `wordprocessing.py` |
-| 3 | `DocxParser` 表格解析同步处理合并单元格 | `docx_parser.py` |
-| 4 | `_get_or_create_table_row` 克隆行时清除 vMerge | `wordprocessing.py` |
-| 5 | `CITY_NAMES` 扩充测试集出现的城市 | `catalog.py` |
+| 步骤 | 修改 | 文件 | 状态 |
+|------|------|------|------|
+| 1 | `_build_docx_table_updates` 补齐 row_groups | `template_service.py` | ✅ |
+| 2 | `load_docx_tables` 增加 gridSpan + vMerge 合并单元格检测 | `wordprocessing.py` | ✅ |
+| 3 | `DocxParser` 表格解析同步处理合并单元格 | `docx_parser.py` | ✅ |
+| 4 | `_get_or_create_table_row` 克隆行时清除 vMerge | `wordprocessing.py` | ✅ |
+| 5 | `CITY_NAMES` 扩充测试集出现的城市 | `catalog.py` | ✅ |
 
-**Phase 2 — 实体匹配健壮性**
+**Phase 2 — 实体匹配健壮性** ✅ 全部完成
 
-| 步骤 | 修改 | 文件 |
-|------|------|------|
-| 6 | `fact_lookup` 构建时同时注册带"市"和不带"市"两个 key | `template_service.py` |
-| 7 | entity matching 同时尝试带"市"和不带"市" | `normalizers.py` |
+| 步骤 | 修改 | 文件 | 状态 |
+|------|------|------|------|
+| 6 | `fact_lookup` 同时注册带"市"和不带"市"两个 key | `template_service.py` | ✅ |
+| 7 | entity matching 同时尝试带"市"和不带"市" | `normalizers.py` | ✅ |
+| 8 | LLM 语义字段匹配（`_llm_enhance_field_columns`） | `template_service.py` | ✅ |
+| 9 | 定向 LLM 抽取缺失字段（`extract_targeted_fields`） | `fact_extraction.py` + `template_service.py` | ✅ |
 
-**Phase 3 — 后端文档操作增强（B-4）**
+**Phase 3 — 后端文档操作增强（B-4）** ✅ 全部完成
 
-| 步骤 | 修改 | 文件 |
-|------|------|------|
-| 8 | `_reformat_documents` 增强：LLM 解析格式要求 | `document_interaction_service.py` |
-| 9 | `_edit_documents` 增强：LLM 辅助复杂编辑指令 | `document_interaction_service.py` |
-| 10 | 新增 `_extract_fields`：按用户指定实体/字段从事实库提取 | `document_interaction_service.py` |
-| 11 | 新增 `_export_results`：导出 xlsx / docx / json | `document_interaction_service.py` |
-| 12 | Agent 意图扩充 | `catalog.py` + `agent_service.py` |
+| 步骤 | 修改 | 文件 | 状态 |
+|------|------|------|------|
+| 8 | `_reformat_documents` 增强：LLM 解析格式要求 | `document_interaction_service.py` | ✅ |
+| 9 | `_edit_documents` 增强：LLM 辅助复杂编辑指令 | `document_interaction_service.py` | ✅ |
+| 10 | 新增 `_extract_fields`：按用户指定实体/字段从事实库提取 | `document_interaction_service.py` | ✅ |
+| 11 | 新增 `_export_results`：导出 xlsx / docx / json | `document_interaction_service.py` | ✅ |
+| 12 | Agent 意图扩充 | `catalog.py` + `agent_service.py` | ✅ |
 
-**Phase 4 — 前端文档操作 UI（F-5）**
+**Phase 4 — 前端文档操作 UI（F-5）** ✅ 全部完成
 
-| 步骤 | 修改 | 文件 |
-|------|------|------|
-| 13 | AgentPage 非 template 结果展示 | `AgentPage.tsx` |
-| 14 | 操作结果卡片 + artifact 下载按钮 | `AgentPage.tsx` |
+| 步骤 | 修改 | 文件 | 状态 |
+|------|------|------|------|
+| 13 | AgentPage 非 template 结果展示 | `AgentPage.tsx` | ✅ |
+| 14 | 操作结果卡片 + artifact 下载按钮 | `AgentPage.tsx` | ✅ |

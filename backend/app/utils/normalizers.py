@@ -63,6 +63,8 @@ def normalize_entity_name(raw_value: str) -> str:
     candidate = re.sub(r"[\s:：\-_/]+", "", raw_value or "")
     if candidate.endswith("市") and len(candidate) > 2:
         candidate = candidate[:-1]
+    if candidate.endswith("省") and len(candidate) > 2:
+        candidate = candidate[:-1]
     return candidate
 
 
@@ -81,7 +83,7 @@ def find_entity_mentions(text: str, extra_candidates: Iterable[str] | None = Non
             candidates.append(normalized)
 
     for city_name in CITY_NAMES:
-        if city_name in text or f"{city_name}市" in text:
+        if city_name in text or f"{city_name}市" in text or f"{city_name}省" in text:
             _push(city_name)
 
     for match in _CITY_WITH_SUFFIX_RE.finditer(text):

@@ -275,17 +275,41 @@ class AgentService:
         extra_messages = self._get_history_for_llm(context_id) if context_id else None
         payload = self._openai_client.create_json_completion(
             system_prompt=(
-                "You are the intent planner for the DocFusion backend. "
-                "Convert the user's latest message into a concise executable JSON plan. "
-                "Allowed intents are: small_talk, extract_facts, query_facts, "
+                "你是 DocFusion 后端的意图规划器。将用户消息转换为可执行的 JSON 计划。\n"
+                "允许的 intent 值：small_talk, extract_facts, query_facts, "
                 "extract_and_fill_template, trace_fact, edit_document, summarize_document, "
-                "reformat_document, query_status, general_qa, extract_fields, export_results. "
-                "Use small_talk for greetings, thanks, capability questions, and light chit-chat. "
-                "Use general_qa for open-ended questions that still need a natural-language answer. "
-                "Use extract_and_fill_template when the user wants a template, spreadsheet, or table filled. "
-                "Keep entities and fields short and literal. Return JSON only."
+                "reformat_document, query_status, general_qa, extract_fields, export_results。\n\n"
+                "intent 使用规则：\n"
+                "- small_talk: 寒暄、问好、感谢、问你能做什么\n"
+                "- summarize_document: 总结、概括、摘要相关请求\n"
+                "- general_qa: 针对文档的开放性问答（如XX的空气质量怎么样、XX有什么数据）\n"
+                "- extract_and_fill_template: 模板回填、表格填充、智能填表\n"
+                "- query_facts: 查询特定实体的特定字段值\n"
+                "- extract_facts: 从文档中抽取新事实\n"
+                "- edit_document: 文本替换\n"
+                "- extract_fields: 提取指定字段导出\n"
+                "- export_results: 导出为文件\n"
+                "- reformat_document: 排版整理\n"
+                "- query_status: 查询系统状态\n\n"
+                "entities 和 fields 只填用户明确提到的，保持简短。\n\n"
+                "── 示例 ──\n"
+                '用户：你好 → {"intent":"small_talk","entities":[],"fields":[],"target":"fact_store","need_db_store":false,"edits":[]}\n'
+                '用户：你能做什么 → {"intent":"small_talk","entities":[],"fields":[],"target":"fact_store","need_db_store":false,"edits":[]}\n'
+                '用户：帮我总结一下这些文档 → {"intent":"summarize_document","entities":[],"fields":[],"target":"fact_store","need_db_store":false,"edits":[]}\n'
+                '用户：总结山东省的空气质量 → {"intent":"summarize_document","entities":["山东"],"fields":["空气质量"],"target":"fact_store","need_db_store":false,"edits":[]}\n'
+                '用户：山东省环境空气质量怎么样 → {"intent":"general_qa","entities":["山东"],"fields":["空气质量"],"target":"fact_store","need_db_store":false,"edits":[]}\n'
+                '用户：COVID-19确诊人数有多少 → {"intent":"general_qa","entities":[],"fields":["确诊人数"],"target":"fact_store","need_db_store":false,"edits":[]}\n'
+                '用户：查一下上海的GDP → {"intent":"query_facts","entities":["上海"],"fields":["GDP总量"],"target":"fact_store","need_db_store":false,"edits":[]}\n'
+                '用户：帮我智能填表 → {"intent":"extract_and_fill_template","entities":[],"fields":[],"target":"uploaded_template","need_db_store":true,"edits":[]}\n'
+                '用户：帮我用这些数据回填模板 → {"intent":"extract_and_fill_template","entities":[],"fields":[],"target":"uploaded_template","need_db_store":true,"edits":[]}\n'
+                '用户：将南京甲公司替换为南京采购中心 → {"intent":"edit_document","entities":[],"fields":[],"target":"fact_store","need_db_store":false,"edits":[{"old_text":"南京甲公司","new_text":"南京采购中心"}]}\n'
+                '用户：从这些报告中提取各城市的常住人口和GDP数据 → {"intent":"extract_facts","entities":["城市"],"fields":["常住人口","GDP总量"],"target":"fact_store","need_db_store":true,"edits":[]}\n'
+                '用户：提取所有城市的GDP和人均收入字段 → {"intent":"extract_fields","entities":["城市"],"fields":["GDP总量","人均收入"],"target":"fact_store","need_db_store":false,"edits":[]}\n'
+                '用户：把提取结果导出为xlsx → {"intent":"export_results","entities":[],"fields":[],"target":"fact_store","need_db_store":false,"edits":[]}\n'
+                '用户：请帮我整理一下格式 → {"intent":"reformat_document","entities":[],"fields":[],"target":"fact_store","need_db_store":false,"edits":[]}\n'
+                '用户：当前系统有多少文档 → {"intent":"query_status","entities":[],"fields":[],"target":"fact_store","need_db_store":false,"edits":[]}\n'
             ),
-            user_prompt=f"User message:\n{message}",
+            user_prompt=f"用户消息：{message}",
             json_schema={
                 "type": "object",
                 "properties": {
@@ -328,6 +352,7 @@ class AgentService:
             ),
             "edits": self._normalize_edits(payload.get("edits", [])),
             "planner": "openai",
+            "original_message": message,
         }
 
     def _infer_intent(self, message: str) -> str:
@@ -378,6 +403,7 @@ class AgentService:
             "need_db_store": intent in {"extract_and_fill_template", "extract_facts"},
             "edits": self._infer_edits(message),
             "planner": "rules",
+            "original_message": message,
         }
 
     def _infer_fields(self, message: str) -> list[str]:

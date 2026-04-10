@@ -74,6 +74,7 @@ class TemplateService:
         executor: TaskExecutor,
         settings: Settings,
         openai_client: OpenAICompatibleClient,
+        extraction_service: object | None = None,
     ) -> None:
         """初始化模板回填与匹配流程所需依赖。
         Initialize dependencies used by template filling and matching workflows.
@@ -82,6 +83,7 @@ class TemplateService:
         self._executor = executor
         self._settings = settings
         self._openai_client = openai_client
+        self._extraction_service = extraction_service
 
     def submit_fill_task(
         self,
@@ -194,6 +196,33 @@ class TemplateService:
         date_from, date_to = parse_date_range_from_text(user_requirement) if user_requirement else (None, None)
         if date_from or date_to:
             facts = self._filter_facts_by_date(facts, date_from, date_to)
+
+        # Detect template field names to enable targeted extraction for missing fields
+        profile = self._build_template_profile(template_name, template_path)
+        template_field_names = set(profile.get("field_names", []))
+        template_entity_names = list(profile.get("entity_names", []))
+        existing_field_names = {f.field_name for f in facts}
+        missing_fields = sorted(template_field_names - existing_field_names)
+
+        # Targeted LLM extraction for fields the template needs but fact_store lacks
+        if missing_fields and self._extraction_service is not None and hasattr(self._extraction_service, "extract_targeted_fields"):
+            for doc_id in document_ids[:5]:
+                doc = self._repository.get_document(doc_id)
+                if doc is None:
+                    continue
+                blocks = self._repository.list_blocks(doc_id)
+                if not blocks:
+                    continue
+                new_facts = self._extraction_service.extract_targeted_fields(
+                    doc, blocks, missing_fields, target_entities=template_entity_names,
+                )
+                if new_facts:
+                    saved = self._repository.add_facts(new_facts)
+                    facts.extend(saved)
+                    existing_field_names.update(f.field_name for f in saved)
+                    missing_fields = sorted(template_field_names - existing_field_names)
+                    if not missing_fields:
+                        break
 
         # Build row-oriented groups: each source block → one template row
         row_groups = self._build_row_groups(facts)
@@ -772,7 +801,10 @@ class TemplateService:
         known_field_names = {key[1] for key in fact_lookup}
         for sheet in workbook.sheets:
             header_row, entity_column, field_columns = self._detect_layout(sheet, known_field_names)
-            if header_row is None or entity_column is None or not field_columns:
+            if header_row is None or entity_column is None:
+                continue
+            field_columns = self._llm_enhance_field_columns(sheet, header_row, field_columns, known_field_names)
+            if not field_columns:
                 continue
             sheet_updates, sheet_filled_cells = self._build_sheet_updates(
                 sheet=sheet,
@@ -806,7 +838,10 @@ class TemplateService:
         known_field_names = {key[1] for key in fact_lookup}
         for table in document.tables:
             header_row, entity_column, field_columns = self._detect_layout(table, known_field_names)
-            if header_row is None or entity_column is None or not field_columns:
+            if header_row is None or entity_column is None:
+                continue
+            field_columns = self._llm_enhance_field_columns(table, header_row, field_columns, known_field_names)
+            if not field_columns:
                 continue
             table_updates, table_filled_cells = self._build_docx_table_updates(
                 table=table,
@@ -870,6 +905,113 @@ class TemplateService:
                 best_entity_column = entity_column or 1
 
         return best_row_index, best_entity_column, best_fields
+
+    def _llm_enhance_field_columns(
+        self,
+        sheet_or_table: SpreadsheetSheet | WordTable,
+        header_row: int | None,
+        field_columns: list[tuple[int, str]],
+        known_field_names: set[str],
+    ) -> list[tuple[int, str]]:
+        """当三层匹配遗漏列时，用 LLM 做语义字段映射补全。
+        Use LLM to semantically match unresolved template headers to known fact field names.
+        """
+        if header_row is None or not known_field_names:
+            return field_columns
+        if not self._openai_client.is_configured:
+            return field_columns
+
+        # Find header row values
+        header_values: list[str] = []
+        for row in sheet_or_table.rows:
+            if row.row_index == header_row:
+                header_values = [str(v).strip() for v in row.values]
+                break
+        if not header_values:
+            return field_columns
+
+        # Identify which columns were already matched
+        matched_cols = {col_idx for col_idx, _ in field_columns}
+        unmatched: list[tuple[int, str]] = []
+        for col_idx, raw_value in enumerate(header_values, start=1):
+            if col_idx in matched_cols or not raw_value or is_entity_column(raw_value) or is_date_column(raw_value):
+                continue
+            stripped = strip_header_adornments(raw_value)
+            if stripped and len(stripped) <= 40 and not stripped.isdigit():
+                unmatched.append((col_idx, stripped))
+
+        if not unmatched:
+            return field_columns
+
+        # Batch send to LLM
+        unmatched_names = [name for _, name in unmatched]
+        known_list = sorted(known_field_names)[:200]
+
+        try:
+            payload = self._openai_client.create_json_completion(
+                system_prompt=(
+                    "你是数据字段匹配引擎。用户给出模板表头名称列表和事实库已有字段名列表。"
+                    "请将每个模板表头映射到最匹配的事实库字段。"
+                    "如果某个表头确实无法匹配任何已有字段（含义完全不同），将其映射为 null。"
+                    "只输出 JSON，不要解释。"
+                ),
+                user_prompt=(
+                    f"模板表头（待匹配）:\n{unmatched_names}\n\n"
+                    f"事实库已有字段:\n{known_list}\n\n"
+                    '输出格式: {{"mappings": [{{"header": "表头名", "field": "匹配的字段名或null"}}]}}'
+                ),
+                json_schema={
+                    "type": "object",
+                    "properties": {
+                        "mappings": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "header": {"type": "string"},
+                                    "field": {"type": ["string", "null"]},
+                                },
+                                "required": ["header", "field"],
+                            },
+                        },
+                    },
+                    "required": ["mappings"],
+                    "additionalProperties": False,
+                },
+            )
+        except (OpenAIClientError, Exception):
+            self._logger.debug("LLM field matching failed", exc_info=True)
+            return field_columns
+
+        # Parse result and add newly matched columns
+        raw_mappings = payload.get("mappings", [])
+        if not isinstance(raw_mappings, list):
+            return field_columns
+
+        known_lower = {f.lower(): f for f in known_field_names}
+        header_to_col = {name: col_idx for col_idx, name in unmatched}
+        extra: list[tuple[int, str]] = []
+        for item in raw_mappings:
+            if not isinstance(item, dict):
+                continue
+            header = str(item.get("header", "")).strip()
+            field_val = item.get("field")
+            if not header or field_val is None:
+                continue
+            field_str = str(field_val).strip()
+            if not field_str:
+                continue
+            # Validate the LLM's answer exists in known fields
+            resolved = known_lower.get(field_str.lower())
+            if resolved and header in header_to_col:
+                col_idx = header_to_col[header]
+                if col_idx not in matched_cols:
+                    extra.append((col_idx, resolved))
+                    matched_cols.add(col_idx)
+
+        if extra:
+            self._logger.info("LLM semantic matching added %d field columns", len(extra))
+        return field_columns + extra
 
     def _build_sheet_updates(
         self,

@@ -24,7 +24,6 @@ class OpenAICompatibleClient:
     base_url: str
     model: str
     timeout_seconds: float = 45.0
-    embedding_model: str = ""
     _raw_client: Any = field(init=False, repr=False, default=None)
     _instructor_client: Any = field(init=False, repr=False, default=None)
 
@@ -108,15 +107,3 @@ class OpenAICompatibleClient:
             )
         except (APIError, APIConnectionError, APITimeoutError) as exc:
             raise OpenAIClientError(f"OpenAI API error: {exc}") from exc
-
-    # ── NEW: embeddings ──
-    def create_embedding(self, text: str) -> list[float]:
-        if not self.is_configured or self._raw_client is None:
-            raise OpenAIClientError("OpenAI client is not configured.")
-        model = self.embedding_model or self.model
-        try:
-            response = self._raw_client.embeddings.create(model=model, input=[text])
-            return response.data[0].embedding
-        except Exception as exc:
-            logger.warning("Embedding API failed (%s), returning zero vector", exc)
-            return [0.0] * 1536

@@ -35,7 +35,8 @@
 
 ### 模板回填
 - **双格式模板**：xlsx 和 docx 模板均支持
-- **字段归一化**：别名表 + LLM 辅助匹配模板表头到事实字段
+- **四层字段匹配**：catalog 别名表 → 去括号/空格 → 大小写忽略 → **LLM 语义匹配**（`_llm_enhance_field_columns`），逐层 fallback 确保高命中
+- **定向 LLM 抽取**：模板缺失字段时，自动调用 `extract_targeted_fields` 从源文档定向补抽
 - **自动关联文档**：auto_match 按文档集自动筛选关联文档
 - **多行填充**：row_groups 模式支持只有表头的空模板自动生成数据行
 
@@ -60,6 +61,7 @@
 - **Benchmark 评测**：事实评估 + 模板回填评测 + 错误分类 + Markdown 报告
 
 ### 工程化
+- **无数据库降级**：PostgreSQL 不可用时自动 fallback 到 InMemoryRepository，系统可完整运行
 - **结构化日志**：JSON 格式 + 统一错误码（E1xxx~E4xxx）+ 操作计时
 - **Prompt 工程**：9 个 few-shot 示例 + 匹配原则 + 验证步骤
 
@@ -97,7 +99,7 @@
 
 - **Python** 3.11+
 - **Node.js** 18+（含 npm）
-- **PostgreSQL** 14+（需提前安装并创建数据库；纯内存模式可跳过）
+- **PostgreSQL** 14+（可选；未配置时自动使用内存仓储，功能完整但重启后数据丢失）
 - **LLM API Key**（DeepSeek 或其他 OpenAI 兼容服务）
 
 ## 快速开始
@@ -253,8 +255,8 @@ python -m pytest tests/ -v
 
 | 页面 | 功能 |
 |---|---|
-| **WorkspacePage** | 文档上传（拖拽 / 批量）、文档列表、任务进度、文件预览（Markdown / 文本 / PDF） |
-| **AgentPage** | 自然语言对话、模板上传与回填、操作结果卡片、填充单元格详情、来源追溯面板、对话历史侧边栏 |
+| **WorkspacePage** | 文档上传（拖拽 / 批量）、文档列表、任务进度、文件预览（Markdown / 文本 / PDF / DOCX / XLSX） |
+| **AgentPage** | 自然语言对话（Markdown 渲染）、模板上传与回填（xlsx/docx/txt/md）、操作结果卡片、填充单元格详情、来源追溯面板、对话历史侧边栏 |
 
 ## 详细方案
 

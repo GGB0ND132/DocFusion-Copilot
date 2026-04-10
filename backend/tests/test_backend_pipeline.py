@@ -1187,6 +1187,216 @@ class BackendPipelineTests(unittest.TestCase):
             ]
         )
 
+    # ── Phase 7: New Tests ──
+
+    def test_agent_plan_uses_few_shot_for_summarize_intent(self) -> None:
+        """Agent planner should classify summarize requests correctly via few-shot examples."""
+        fake_openai = FakeOpenAIClient([{
+            "intent": "summarize_document",
+            "entities": ["山东"],
+            "fields": ["空气质量"],
+            "target": "fact_store",
+            "need_db_store": False,
+            "edits": [],
+        }])
+        agent = AgentService(repository=self.repository, openai_client=fake_openai)
+        plan = agent.chat("总结山东省的空气质量")
+        self.assertEqual("summarize_document", plan["intent"])
+        self.assertIn("山东", plan["entities"])
+
+    def test_agent_plan_uses_few_shot_for_general_qa_intent(self) -> None:
+        """Agent planner should classify open-ended questions as general_qa."""
+        fake_openai = FakeOpenAIClient([{
+            "intent": "general_qa",
+            "entities": [],
+            "fields": ["确诊人数"],
+            "target": "fact_store",
+            "need_db_store": False,
+            "edits": [],
+        }])
+        agent = AgentService(repository=self.repository, openai_client=fake_openai)
+        plan = agent.chat("COVID-19确诊人数有多少")
+        self.assertEqual("general_qa", plan["intent"])
+
+    def test_summarize_does_not_prefilter_facts(self) -> None:
+        """Summarize path should pass all document-scoped facts to LLM, not pre-filter."""
+        self._seed_city_facts()
+        fake_responses = [
+            # Plan response
+            {"intent": "summarize_document", "entities": ["上海"], "fields": ["GDP总量"],
+             "target": "fact_store", "need_db_store": False, "edits": []},
+            # Summary response
+            {"summary": "上海GDP总量56708.71亿元。"},
+        ]
+        fake_openai = FakeOpenAIClient(fake_responses)
+        agent = AgentService(repository=self.repository, openai_client=fake_openai)
+        service = DocumentInteractionService(
+            repository=self.repository,
+            agent_service=agent,
+            template_service=self.template_service,
+            settings=self.settings,
+            openai_client=fake_openai,
+        )
+        result = service.execute(message="总结上海的GDP", document_ids=["doc_seed"])
+        self.assertEqual("summary", result["execution_type"])
+        # Verify the summary LLM call received all facts (not filtered)
+        summary_call = fake_openai.calls[-1]
+        user_prompt = str(summary_call.get("user_prompt", ""))
+        # Should contain both 上海 and 北京 facts (no pre-filtering)
+        self.assertIn("上海", user_prompt)
+        self.assertIn("北京", user_prompt)
+
+    def test_general_qa_does_not_prefilter_facts(self) -> None:
+        """General QA should pass all document-scoped facts to LLM without entity/field filtering."""
+        self._seed_city_facts()
+        fake_responses = [
+            # Plan response
+            {"intent": "general_qa", "entities": ["上海"], "fields": ["GDP总量"],
+             "target": "fact_store", "need_db_store": False, "edits": []},
+            # QA response
+            {"answer": "上海GDP总量56708.71亿元。"},
+        ]
+        fake_openai = FakeOpenAIClient(fake_responses)
+        agent = AgentService(repository=self.repository, openai_client=fake_openai)
+        service = DocumentInteractionService(
+            repository=self.repository,
+            agent_service=agent,
+            template_service=self.template_service,
+            settings=self.settings,
+            openai_client=fake_openai,
+        )
+        result = service.execute(message="上海GDP多少", document_ids=["doc_seed"])
+        self.assertEqual("qa", result["execution_type"])
+        # Verify the QA LLM call received all facts (not just 上海)
+        qa_call = fake_openai.calls[-1]
+        user_prompt = str(qa_call.get("user_prompt", ""))
+        self.assertIn("北京", user_prompt)
+
+    def test_conversation_delete_nonexistent_is_safe(self) -> None:
+        """Deleting a non-existent conversation should not raise."""
+        self.agent_service.clear_conversation("nonexistent_ctx_12345")
+
+    def test_conversation_list_returns_all_created(self) -> None:
+        """After creating multiple conversations, list should return all."""
+        self.agent_service.chat("你好", "ctx_a")
+        self.agent_service.chat("你好", "ctx_b")
+        conversations = self.agent_service.list_conversations()
+        ids = {c.conversation_id for c in conversations}
+        self.assertIn("ctx_a", ids)
+        self.assertIn("ctx_b", ids)
+
+    def test_blocks_pagination_returns_correct_slice(self) -> None:
+        """list_blocks with limit/offset returns correct subset and count_blocks works."""
+        content = "# Title\n\nParagraph one.\n\n## Section A\n\nContent A.\n\n## Section B\n\nContent B.\n\n## Section C\n\nContent C."
+        doc, task = self.document_service.upload_document("data.md", content.encode("utf-8"))
+        self.executor.wait(task.task_id, timeout=5)
+
+        all_blocks = self.repository.list_blocks(doc.doc_id)
+        total = self.repository.count_blocks(doc.doc_id)
+        self.assertEqual(total, len(all_blocks))
+        self.assertGreaterEqual(total, 4)
+
+        page1 = self.repository.list_blocks(doc.doc_id, limit=2, offset=0)
+        page2 = self.repository.list_blocks(doc.doc_id, limit=2, offset=2)
+        self.assertEqual(len(page1), 2)
+        self.assertEqual(len(page2), 2)
+        self.assertNotEqual(page1[0].block_id, page2[0].block_id)
+
+    def test_soft_sort_facts_prioritizes_matching_entities(self) -> None:
+        """_soft_sort_facts should put facts matching entities at the front."""
+        from app.services.document_interaction_service import _soft_sort_facts
+
+        facts = [
+            self._make_fact("北京", "GDP", 1000),
+            self._make_fact("上海", "GDP", 2000),
+            self._make_fact("德州", "PM10", 50),
+            self._make_fact("枣庄", "AQI", 80),
+        ]
+        sorted_facts = _soft_sort_facts(facts, ["德州", "枣庄"], [])
+        self.assertIn(sorted_facts[0].entity_name, {"德州", "枣庄"})
+        self.assertIn(sorted_facts[1].entity_name, {"德州", "枣庄"})
+
+    def test_edit_clear_content_produces_empty_file(self) -> None:
+        """edit_document with clear intent should produce an empty output file."""
+        doc, task = self.document_service.upload_document("notes.txt", "这是一些内容\n第二行".encode())
+        self.executor.wait(task.task_id, timeout=5)
+
+        plan = {
+            "intent": "edit_document",
+            "target": "帮我把notes.txt的内容删除",
+            "edits": [],
+            "entities": [],
+            "fields": [],
+            "original_message": "帮我把notes.txt的内容删除",
+        }
+        result = self.document_interaction_service._edit_documents(plan, [doc.doc_id])
+        self.assertEqual(result["execution_type"], "edit")
+        self.assertEqual(len(result["artifacts"]), 1)
+        output_path = Path(result["artifacts"][0]["output_path"])
+        self.assertTrue(output_path.exists())
+        self.assertEqual(output_path.read_text(encoding="utf-8"), "")
+
+    def test_batch_delete_removes_multiple_documents(self) -> None:
+        """batch delete should remove all specified documents."""
+        doc1, t1 = self.document_service.upload_document("a.txt", b"aaa")
+        doc2, t2 = self.document_service.upload_document("b.txt", b"bbb")
+        doc3, t3 = self.document_service.upload_document("c.txt", b"ccc")
+        for t in (t1, t2, t3):
+            self.executor.wait(t.task_id, timeout=5)
+        self.assertEqual(len(self.document_service.list_documents()), 3)
+        self.document_service.delete_document(doc1.doc_id)
+        self.document_service.delete_document(doc2.doc_id)
+        remaining = self.document_service.list_documents()
+        self.assertEqual(len(remaining), 1)
+        self.assertEqual(remaining[0].doc_id, doc3.doc_id)
+
+    def test_partition_facts_separates_matched_and_rest(self) -> None:
+        """_partition_facts should split facts into matched and rest groups."""
+        from app.services.document_interaction_service import _partition_facts
+        facts = [
+            self._make_fact("北京", "GDP", 1000),
+            self._make_fact("上海", "GDP", 2000),
+            self._make_fact("德州", "PM2.5", 65),
+            self._make_fact("枣庄", "AQI", 75),
+        ]
+        matched, rest = _partition_facts(facts, ["德州", "枣庄"], [])
+        matched_names = {f.entity_name for f in matched}
+        rest_names = {f.entity_name for f in rest}
+        self.assertIn("德州", matched_names)
+        self.assertIn("枣庄", matched_names)
+        self.assertNotIn("北京", matched_names)
+        self.assertIn("北京", rest_names)
+
+    def test_create_empty_docx_produces_valid_zip(self) -> None:
+        """create_empty_docx should write a valid ZIP/DOCX file."""
+        from app.utils.wordprocessing import create_empty_docx
+        output = self.settings.outputs_dir / "empty_test.docx"
+        create_empty_docx(output)
+        self.assertTrue(output.exists())
+        self.assertTrue(zipfile.is_zipfile(output))
+        with zipfile.ZipFile(output) as zf:
+            self.assertIn("word/document.xml", zf.namelist())
+
+    def _make_fact(self, entity: str, field: str, value: float) -> FactRecord:
+        return FactRecord(
+            fact_id=f"fact_{uuid.uuid4().hex[:8]}",
+            entity_type="city",
+            entity_name=entity,
+            field_name=field,
+            value_num=value,
+            value_text=str(value),
+            unit="",
+            year=2025,
+            source_doc_id="doc_test",
+            source_block_id="block_test",
+            source_span="test",
+            confidence=0.9,
+            conflict_group_id=None,
+            is_canonical=True,
+            status="confirmed",
+            metadata={},
+        )
+
 
 def build_simple_template_xlsx(headers: list[str], rows: list[list[str]]) -> bytes:
     """在内存中构造最小可用 XLSX 模板。    Build a minimal usable XLSX template in memory."""
