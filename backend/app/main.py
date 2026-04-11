@@ -83,7 +83,8 @@ def run() -> None:
 
     import uvicorn
 
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    settings = get_settings()
+    uvicorn.run(app, host=settings.host, port=settings.port)
 
 
 if __name__ == "__main__":

@@ -27,6 +27,19 @@ _DOC_TYPE_HINT_RE = re.compile(r"\.(docx|doc|xlsx|xls|pdf|txt|md|csv)\s*文件")
 _DOC_TYPE_ALIASES: dict[str, str] = {"doc": "docx", "xls": "xlsx"}
 
 
+def _has_field_overlap(keyword: str, field_name: str) -> bool:
+    """检查关键词与字段名是否有语义重叠（完整子串或中文 bigram 命中）。"""
+    if keyword in field_name or field_name in keyword:
+        return True
+    # 对较长的关键词，检查其 2 字子串是否出现在字段名中
+    if len(keyword) >= 3:
+        for i in range(len(keyword) - 1):
+            bigram = keyword[i : i + 2]
+            if bigram in field_name:
+                return True
+    return False
+
+
 def _soft_sort_facts(
     facts: list[FactRecord],
     entities: list[str],
@@ -44,7 +57,7 @@ def _soft_sort_facts(
         name_norm = fact.entity_name.rstrip("市省区县")
         if entity_set and any(e in name_norm or name_norm in e for e in entity_set):
             score += 2
-        if field_set and any(f in fact.field_name or fact.field_name in f for f in field_set):
+        if field_set and any(_has_field_overlap(f, fact.field_name) for f in field_set):
             score += 1
         return score
 
@@ -69,7 +82,7 @@ def _partition_facts(
     for fact in facts:
         name_norm = fact.entity_name.rstrip("市省区县")
         hit_entity = entity_set and any(e in name_norm or name_norm in e for e in entity_set)
-        hit_field = field_set and any(f in fact.field_name or fact.field_name in f for f in field_set)
+        hit_field = field_set and any(_has_field_overlap(f, fact.field_name) for f in field_set)
         if hit_entity or hit_field:
             matched.append(fact)
         else:
@@ -134,6 +147,7 @@ class DocumentInteractionService:
         with log_operation(self._logger, "agent_execute"):
             plan = self._agent_service.chat(message, context_id, store_preview_message=False)
             resolved_document_ids = self._resolve_document_ids(document_ids, document_set_id)
+            resolved_document_ids = self._narrow_by_message(message, resolved_document_ids)
             intent = str(plan["intent"])
             self._logger.info(f"intent resolved: {intent}", extra={"detail": intent})
 
@@ -178,16 +192,7 @@ class DocumentInteractionService:
             elif intent == "export_results":
                 execution = self._export_results(plan, resolved_document_ids)
             else:
-                execution = {
-                    "execution_type": "plan_only",
-                    "summary": "No executable backend operation matched the current request.",
-                    "facts": [],
-                    "artifacts": [],
-                    "document_ids": resolved_document_ids,
-                    "task_id": None,
-                    "task_status": None,
-                    "template_name": None,
-                }
+                execution = self._llm_fallback(message, plan, resolved_document_ids)
 
             merged = {
                 **plan,
@@ -211,6 +216,59 @@ class DocumentInteractionService:
                 and not bool(document.metadata.get("skip_fact_extraction"))
             ]
         return self._template_service.resolve_document_ids(document_set_id, None)
+
+    def _narrow_by_message(self, message: str, document_ids: list[str]) -> list[str]:
+        """根据用户消息中提及的文件名或 doc_id 缩小文档范围。
+        Narrow document IDs by matching file names or doc_ids mentioned in the user message.
+        Supports exact doc_id match, exact file name/stem match, and fuzzy keyword overlap."""
+        if len(document_ids) <= 1:
+            return document_ids
+
+        # Pass 0: direct doc_id match — user explicitly mentions doc_xxxx in the message
+        doc_id_set = set(document_ids)
+        mentioned_ids = [m for m in re.findall(r"doc_[a-f0-9]+", message) if m in doc_id_set]
+        if mentioned_ids:
+            return list(dict.fromkeys(mentioned_ids))
+
+        all_docs = {
+            doc.doc_id: doc
+            for doc in self._repository.list_documents()
+            if doc.doc_id in set(document_ids)
+        }
+        # Pass 1: exact file name or stem match
+        exact_ids: list[str] = []
+        for doc_id, doc in all_docs.items():
+            stem = Path(doc.file_name).stem
+            if doc.file_name in message or stem in message:
+                exact_ids.append(doc_id)
+        if exact_ids:
+            return exact_ids
+
+        # Pass 2: fuzzy — score by bigram overlap between message and file name
+        def _bigrams(text: str) -> set[str]:
+            tokens: set[str] = set()
+            # Latin/digit words
+            tokens.update(w.lower() for w in re.findall(r"[A-Za-z0-9]+", text))
+            # Chinese character bigrams for better fuzzy matching
+            cjk = re.findall(r"[\u4e00-\u9fff]+", text)
+            for run in cjk:
+                for i in range(len(run) - 1):
+                    tokens.add(run[i : i + 2])
+            return tokens
+
+        scored: list[tuple[int, str]] = []
+        msg_tokens = _bigrams(message)
+        for doc_id, doc in all_docs.items():
+            name_tokens = _bigrams(doc.file_name)
+            overlap = len(msg_tokens & name_tokens)
+            if overlap >= 2:
+                scored.append((overlap, doc_id))
+        if scored:
+            scored.sort(reverse=True)
+            best_score = scored[0][0]
+            return [doc_id for score, doc_id in scored if score == best_score]
+
+        return document_ids
 
     def _queue_template_fill(
         self,
@@ -261,61 +319,133 @@ class DocumentInteractionService:
             "template_name": template_name,
         }
 
+    _DOC_ID_RE = re.compile(r"^doc_[a-f0-9]+$")
+
     def _query_facts(self, plan: dict[str, object], document_ids: list[str]) -> dict[str, object]:
-        """根据规划结果查询事实库。    Query the fact store according to the operation plan."""
+        """根据规划结果查询事实库，使用文档原文 + LLM 生成回答。
+        Query fact store, fetch document blocks, and let LLM produce the answer."""
 
         document_id_set = set(document_ids)
-        fields = [str(field) for field in plan.get("fields", [])]
-        entities = [str(entity) for entity in plan.get("entities", []) if entity != "城市"]
+        original_message = str(plan.get("original_message", ""))
 
-        matched_facts: list[FactRecord] = []
-        if not fields and not entities:
-            matched_facts = self._repository.list_facts(canonical_only=True, document_ids=document_id_set)
+        # ── 获取文档原文 blocks ──
+        all_blocks = [
+            block
+            for doc_id in document_ids
+            for block in self._repository.list_blocks(doc_id)
+        ]
+        # ── 获取事实（canonical）用于返回和下载 ──
+        all_facts = self._repository.list_facts(canonical_only=True, document_ids=document_id_set)
+
+        # ── 构建文档原文摘要，优先使用 blocks ──
+        block_text = "\n".join(b.text for b in all_blocks if b.text.strip())
+        # 限制长度，避免超 token
+        if len(block_text) > 12000:
+            block_text = block_text[:12000] + "\n... (内容过长，已截断)"
+
+        if block_text:
+            summary = self._plain_text_llm_call(
+                system_prompt=(
+                    "你是 DocFusion 文档数据分析助手。\n"
+                    "你会收到文档的原文内容和用户问题。\n"
+                    "规则（必须严格遵守）：\n"
+                    "1. 仔细阅读用户问题，精确定位原文中与问题**最匹配**的表格或段落。\n"
+                    "2. 如果用户提到了具体的表格名称或主题（如'产品产量'），必须找到原文中标题包含该关键词的表格，不要返回其他不相关的表格。\n"
+                    "3. 将找到的表格用 Markdown 表格格式完整还原，包含所有行和列。\n"
+                    "4. 只使用文档原文中的数据，不要编造。\n"
+                    "5. 如果找不到匹配的表格，明确说明。\n"
+                    "6. 回答使用中文。直接输出结果，不要输出思考过程。"
+                ),
+                user_prompt=(
+                    f"用户问题：{original_message}\n\n"
+                    f"请在以下文档原文中，找到与用户问题最相关的表格并用 Markdown 格式还原：\n\n{block_text}"
+                ),
+                fallback=self._fallback_fact_summary(all_facts) if all_facts else "未找到相关数据。",
+            )
+        elif all_facts:
+            # 没有 blocks，用 facts 回退
+            fact_lines = []
+            for f in all_facts:
+                val = format_value(f.value_num) if f.value_num is not None else (f.value_text or "")
+                unit = f.unit or ""
+                fact_lines.append(f"{f.entity_name} | {f.field_name} | {val} {unit}".strip())
+            fact_text = "\n".join(fact_lines)
+            summary = self._plain_text_llm_call(
+                system_prompt=(
+                    "你是 DocFusion 文档数据分析助手。\n"
+                    "根据用户问题，从提供的事实数据中筛选相关数据，用 Markdown 表格呈现。\n"
+                    "只使用提供的数据，不要编造。回答使用中文。不要输出思考过程。"
+                ),
+                user_prompt=(
+                    f"用户问题：{original_message}\n\n"
+                    f"以下是从文档中提取的 {len(all_facts)} 条事实数据（格式：实体 | 字段 | 值）：\n"
+                    f"{fact_text}"
+                ),
+                fallback=self._fallback_fact_summary(all_facts),
+            )
         else:
-            for entity_name in entities or [None]:
-                for field_name in fields or [None]:
-                    matched_facts.extend(
-                        self._repository.list_facts(
-                            entity_name=entity_name,
-                            field_name=field_name,
-                            canonical_only=True,
-                            document_ids=document_id_set,
-                        )
-                    )
+            return {
+                "execution_type": "fact_query",
+                "summary": f"在 {len(document_ids)} 份文档中未找到任何数据。",
+                "facts": [],
+                "artifacts": [],
+                "document_ids": document_ids,
+            }
 
-        deduplicated: dict[str, FactRecord] = {fact.fact_id: fact for fact in matched_facts}
-        facts = list(deduplicated.values())
-        summary = f"Matched {len(facts)} facts from {len(document_ids)} parsed documents."
-        artifacts: list[dict[str, object]] = []
-        if facts:
-            artifact_name = "facts_query_result.json"
-            output_path = self._settings.outputs_dir / artifact_name
-            fact_dicts = [
-                {
-                    "fact_id": f.fact_id,
-                    "entity_name": f.entity_name,
-                    "field_name": f.field_name,
-                    "value_num": f.value_num,
-                    "value_text": f.value_text,
-                    "unit": f.unit,
-                    "year": f.year,
-                    "confidence": f.confidence,
-                }
-                for f in facts
-            ]
-            output_path.write_text(json.dumps(fact_dicts, ensure_ascii=False, indent=2), encoding="utf-8")
-            artifacts.append({
-                "doc_id": "",
-                "operation": "query_facts",
-                "file_name": artifact_name,
-                "output_path": str(output_path),
-                "change_count": len(facts),
-            })
         return {
-            "execution_type": "fact_query",
+            "execution_type": "qa",
             "summary": summary,
-            "facts": facts,
-            "artifacts": artifacts,
+            "facts": [],
+            "artifacts": [],
+            "document_ids": document_ids,
+        }
+
+    @staticmethod
+    def _fallback_fact_summary(facts: list[FactRecord], limit: int = 20) -> str:
+        """LLM 不可用时的简单事实摘要。  Simple fact summary when LLM is unavailable."""
+        lines = []
+        for f in facts[:limit]:
+            val = format_value(f.value_num) if f.value_num is not None else (f.value_text or "")
+            unit = f.unit or ""
+            lines.append(f"- {f.entity_name} / {f.field_name}: {val} {unit}")
+        header = f"共 {len(facts)} 条事实数据：\n"
+        return header + "\n".join(lines)
+
+    def _llm_fallback(self, message: str, plan: dict[str, object], document_ids: list[str]) -> dict[str, object]:
+        """通用 LLM 兜底：用文档原文回答任何未匹配到特定意图的问题。
+        Generic LLM fallback: answer any unmatched intent using document blocks."""
+
+        all_blocks = [
+            block
+            for doc_id in document_ids
+            for block in self._repository.list_blocks(doc_id)
+        ]
+        block_text = "\n".join(b.text for b in all_blocks if b.text.strip())
+        if len(block_text) > 12000:
+            block_text = block_text[:12000] + "\n... (内容过长，已截断)"
+
+        if block_text:
+            summary = self._plain_text_llm_call(
+                system_prompt=(
+                    "你是 DocFusion 文档助手。你会收到文档原文内容和用户问题。\n"
+                    "请根据文档内容回答用户问题。如果涉及表格，用 Markdown 表格呈现。\n"
+                    "只使用文档中的数据，不要编造。回答使用中文。直接输出结果。"
+                ),
+                user_prompt=f"用户问题：{message}\n\n文档原文：\n{block_text}",
+                fallback="抱歉，无法处理该请求。请尝试更具体的描述。",
+            )
+        else:
+            summary = self._plain_text_llm_call(
+                system_prompt="你是 DocFusion 文档助手。请用中文简洁回答用户问题。",
+                user_prompt=f"用户问题：{message}\n\n当前没有可用的文档内容。请根据你的知识回答或建议下一步操作。",
+                fallback="抱歉，当前没有可用的文档内容来回答该问题。",
+            )
+
+        return {
+            "execution_type": "qa",
+            "summary": summary,
+            "facts": [],
+            "artifacts": [],
             "document_ids": document_ids,
         }
 
@@ -956,6 +1086,37 @@ class DocumentInteractionService:
             "document_ids": document_ids,
         }
 
+    def _plain_text_llm_call(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        fallback: str,
+    ) -> str:
+        """直接调用 LLM 获取纯文本回复（不要求 JSON），兼容推理模型。
+        Call LLM for plain text response without JSON wrapping."""
+        if not self._openai_client.is_configured or self._openai_client._raw_client is None:
+            return fallback
+        try:
+            import re as _re
+            response = self._openai_client._raw_client.chat.completions.create(
+                model=self._openai_client.model,
+                temperature=0.0,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+            )
+            if not response.choices:
+                return fallback
+            content = response.choices[0].message.content or ""
+            # 剥离推理模型的 <think>...</think> 标签
+            content = _re.sub(r"<think>[\s\S]*?</think>\s*", "", content).strip()
+            return content or fallback
+        except Exception as exc:
+            self._logger.error("_plain_text_llm_call failed: %s", exc, exc_info=True)
+            return fallback
+
     def _answer_with_openai(
         self,
         *,
@@ -1428,6 +1589,44 @@ class DocumentInteractionService:
         cleaned = cleaned.strip("关于")
         cleaned = self._clean_summary_text(cleaned)
         return cleaned or title
+
+    _KW_STOPWORDS: set[str] = {
+        "写", "一个", "一下", "表格", "统计", "表格统计", "查询", "查一下", "查", "帮我", "帮",
+        "请", "的", "了", "和", "及", "与", "是", "有", "在", "把", "将", "对", "说",
+        "主要", "相关", "情况", "数据", "信息", "文档", "文件", "所有", "这些",
+        "这个", "那个", "什么", "怎么", "如何", "多少", "出来", "一些", "进行",
+        "需要", "显示", "列出", "汇总", "整理", "分析", "文档说",
+    }
+    _KW_SPLIT_RE = re.compile(
+        r"帮我|一个|一下|这些|这份|那个|所有|什么|怎么|如何|多少|"
+        r"查一下|列出|写出|[写帮请把将对的了和及与是有在所这那一个]|"
+        r"doc_[a-f0-9]+|"
+        r"[^\u4e00-\u9fff]+"
+    )
+
+    @classmethod
+    def _extract_keywords_from_message(cls, message: str) -> list[str]:
+        """从用户消息中提取潜在的事实查询关键词。
+        Extract potential fact-query keywords from the user message.
+
+        策略：用高频虚词 + 标点 + 非中文字符做切分，保留 2~6 字的实义片段。
+        """
+        fragments = cls._KW_SPLIT_RE.split(message)
+        keywords: list[str] = []
+        for frag in fragments:
+            frag = frag.strip()
+            if len(frag) < 2 or frag in cls._KW_STOPWORDS:
+                continue
+            # 进一步去掉头尾停用词
+            for sw in ("主要", "相关", "情况", "所有"):
+                if frag.startswith(sw):
+                    frag = frag[len(sw):]
+                if frag.endswith(sw):
+                    frag = frag[: -len(sw)]
+            frag = frag.strip()
+            if len(frag) >= 2 and frag not in cls._KW_STOPWORDS and frag not in keywords:
+                keywords.append(frag)
+        return keywords
 
     @staticmethod
     def _format_list_phrase(items: list[str], delimiter: str = "、") -> str:

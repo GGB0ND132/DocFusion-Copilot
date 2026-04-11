@@ -19,6 +19,7 @@ import {
   MessageSquarePlus,
   Trash2,
   Sparkles,
+  Square,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
@@ -60,6 +61,8 @@ export default function AgentPage() {
 
   const [inputText, setInputText] = useState('');
   const [isExecuting, setIsExecuting] = useState(false);
+  const [thinkingStartTime, setThinkingStartTime] = useState<number | null>(null);
+  const abortControllerRef = useRef<AbortController | null>(null);
   const [templateFile, setTemplateFile] = useState<File | null>(null);
   const [fillTaskId, setFillTaskId] = useState<string | null>(null);
   const [fillTask, setFillTask] = useState<TaskResponse | null>(null);
@@ -208,6 +211,13 @@ export default function AgentPage() {
     if (templateInputRef.current) templateInputRef.current.value = '';
   }, []);
 
+  const handleAbort = useCallback(() => {
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+      abortControllerRef.current = null;
+    }
+  }, []);
+
   const handleSend = useCallback(async () => {
     const text = inputText.trim();
     if (!text || isExecuting) return;
@@ -256,7 +266,10 @@ export default function AgentPage() {
 
     // If there's a template file, do template fill instead of agent execute
     if (templateFile) {
+      const ac = new AbortController();
+      abortControllerRef.current = ac;
       setIsExecuting(true);
+      setThinkingStartTime(Date.now());
       try {
         const resp = await runAgentExecute({
           message: text,
@@ -265,7 +278,7 @@ export default function AgentPage() {
           documentIds: runtimeParsedDocIds,
           autoMatch: true,
           templateFile,
-        });
+        }, { signal: ac.signal });
         if (resp.context_id && resp.context_id !== agentContextId) {
           setAgentContextId(resp.context_id);
         }
@@ -284,17 +297,26 @@ export default function AgentPage() {
         });
         refreshConversations();
       } catch (err) {
-        const msg = err instanceof Error ? err.message : '模板回填失败';
-        addAgentMessage({ role: 'assistant', text: `错误：${msg}`, timestamp: Date.now() });
-        toast.error(msg);
+        if (err instanceof DOMException && err.name === 'AbortError') {
+          addAgentMessage({ role: 'assistant', text: '已中止回答。', timestamp: Date.now() });
+        } else {
+          const msg = err instanceof Error ? err.message : '模板回填失败';
+          addAgentMessage({ role: 'assistant', text: `错误：${msg}`, timestamp: Date.now() });
+          toast.error(msg);
+        }
       } finally {
+        abortControllerRef.current = null;
         setIsExecuting(false);
+        setThinkingStartTime(null);
       }
       return;
     }
 
     // Otherwise run agent execute
+    const ac = new AbortController();
+    abortControllerRef.current = ac;
     setIsExecuting(true);
+    setThinkingStartTime(Date.now());
     try {
       const r = await runAgentExecute({
         message: text,
@@ -302,26 +324,34 @@ export default function AgentPage() {
         documentSetId: runtimeDocumentSetId ?? undefined,
         documentIds: runtimeParsedDocIds,
         autoMatch: true,
-      });
+      }, { signal: ac.signal });
       if (r.context_id && r.context_id !== agentContextId) {
         setAgentContextId(r.context_id);
       }
+      const elapsed = thinkingStartTime ? ((Date.now() - thinkingStartTime) / 1000).toFixed(1) : null;
       const summary = formatAgentReply(r);
+      const timeTag = elapsed ? `\n\n> \u23f1\ufe0f \u601d\u8003\u8017\u65f6 ${elapsed}s` : '';
       addAgentMessage({
         role: 'assistant',
-        text: summary,
+        text: summary + timeTag,
         timestamp: Date.now(),
         data: shouldRenderOperationCard(r) ? r : undefined,
       });
       refreshConversations();
     } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Agent 执行失败';
-      addAgentMessage({ role: 'assistant', text: `错误：${msg}`, timestamp: Date.now() });
-      toast.error(msg);
+      if (err instanceof DOMException && err.name === 'AbortError') {
+        addAgentMessage({ role: 'assistant', text: '已中止回答。', timestamp: Date.now() });
+      } else {
+        const msg = err instanceof Error ? err.message : 'Agent 执行失败';
+        addAgentMessage({ role: 'assistant', text: `错误：${msg}`, timestamp: Date.now() });
+        toast.error(msg);
+      }
     } finally {
+      abortControllerRef.current = null;
       setIsExecuting(false);
+      setThinkingStartTime(null);
     }
-  }, [inputText, isExecuting, templateFile, parsedScopedDocIds, effectiveDocumentSetId, refreshAvailableDocuments, uploadedDocuments, currentDocumentSetId, upsertTaskSnapshot, addAgentMessage, agentContextId, setAgentContextId, refreshConversations]);
+  }, [inputText, isExecuting, templateFile, parsedScopedDocIds, effectiveDocumentSetId, refreshAvailableDocuments, uploadedDocuments, currentDocumentSetId, upsertTaskSnapshot, addAgentMessage, agentContextId, setAgentContextId, refreshConversations, thinkingStartTime]);
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
@@ -522,7 +552,17 @@ export default function AgentPage() {
                 <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-primary/10">
                   <Loader2 className="h-4 w-4 animate-spin text-primary" />
                 </div>
-                <div className="rounded-lg border bg-card px-3 py-2 text-sm text-muted-foreground">思考中…</div>
+                <div className="rounded-lg border bg-card px-3 py-2 text-sm text-muted-foreground flex items-center gap-2">
+                  思考中…
+                  {thinkingStartTime && <ThinkingTimer startTime={thinkingStartTime} />}
+                  <button
+                    onClick={handleAbort}
+                    className="ml-1 rounded-md border px-1.5 py-0.5 text-xs text-destructive hover:bg-destructive/10 transition-colors flex items-center gap-1"
+                    title="中止回答"
+                  >
+                    <Square className="h-3 w-3 fill-current" /> 停止
+                  </button>
+                </div>
               </div>
             )}
           </div>
@@ -584,9 +624,15 @@ export default function AgentPage() {
                 style={{ minHeight: '40px', maxHeight: '200px' }}
               />
             </div>
-            <Button size="icon" className="h-9 w-9 shrink-0" disabled={!inputText.trim() || isExecuting} onClick={handleSend}>
-              <Send className="h-4 w-4" />
-            </Button>
+            {isExecuting ? (
+              <Button size="icon" className="h-9 w-9 shrink-0" variant="destructive" onClick={handleAbort} title="中止回答">
+                <Square className="h-4 w-4 fill-current" />
+              </Button>
+            ) : (
+              <Button size="icon" className="h-9 w-9 shrink-0" disabled={!inputText.trim()} onClick={handleSend}>
+                <Send className="h-4 w-4" />
+              </Button>
+            )}
           </div>
         </div>
       </div>
@@ -1096,4 +1142,18 @@ function OperationResultCard({
       )}
     </div>
   );
+}
+
+function ThinkingTimer({ startTime }: { startTime: number }) {
+  const [elapsed, setElapsed] = useState(0);
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      setElapsed(Math.floor((Date.now() - startTime) / 1000));
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [startTime]);
+  const minutes = Math.floor(elapsed / 60);
+  const seconds = elapsed % 60;
+  const display = minutes > 0 ? `${minutes}:${String(seconds).padStart(2, '0')}` : `${seconds}s`;
+  return <span className="text-xs font-mono tabular-nums text-muted-foreground/70">{display}</span>;
 }

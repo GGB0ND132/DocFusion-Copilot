@@ -76,6 +76,9 @@ class OpenAICompatibleClient:
             if not response.choices:
                 raise OpenAIClientError("OpenAI API returned empty choices")
             content = response.choices[0].message.content or ""
+            # 推理模型可能返回 <think>...</think> 前缀，剥离后再解析 JSON
+            import re as _re
+            content = _re.sub(r"<think>[\s\S]*?</think>\s*", "", content).strip()
             return json.loads(content)
         except (APIError, APIConnectionError, APITimeoutError) as exc:
             raise OpenAIClientError(f"OpenAI API error: {exc}") from exc

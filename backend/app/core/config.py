@@ -49,7 +49,9 @@ class Settings:
     project_name: str = "DocFusion Copilot Backend"
     api_prefix: str = "/api/v1"
     workspace_root: Path = field(default_factory=_workspace_root)
-    max_workers: int = 4
+    host: str = field(default_factory=lambda: os.getenv("DOCFUSION_HOST", "127.0.0.1"))
+    port: int = field(default_factory=lambda: int(os.getenv("DOCFUSION_PORT", "8000")))
+    max_workers: int = field(default_factory=lambda: int(os.getenv("DOCFUSION_MAX_WORKERS", "4")))
     database_url: str = field(
         default_factory=lambda: (
             os.getenv("DOCFUSION_DATABASE_URL")
@@ -64,7 +66,7 @@ class Settings:
     )
     openai_api_key: str = field(default_factory=lambda: os.getenv("DOCFUSION_OPENAI_API_KEY", ""))
     openai_base_url: str = field(default_factory=lambda: os.getenv("DOCFUSION_OPENAI_BASE_URL", ""))
-    openai_model: str = field(default_factory=lambda: os.getenv("DOCFUSION_OPENAI_MODEL", "gpt-4o-mini"))
+    openai_model: str = field(default_factory=lambda: os.getenv("DOCFUSION_OPENAI_MODEL", ""))
     openai_timeout_seconds: float = field(
         default_factory=lambda: float(os.getenv("DOCFUSION_OPENAI_TIMEOUT_SECONDS", "90"))
     )

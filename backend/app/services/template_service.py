@@ -190,6 +190,34 @@ class TemplateService:
         if suffix not in {".xlsx", ".docx"}:
             raise ValueError(f"Unsupported template type: {suffix}")
 
+        resolved_output_file_name = output_file_name or f"{task_id}_{safe_filename(template_name)}"
+        output_path = self._settings.outputs_dir / resolved_output_file_name
+
+        # ── Fast path: direct block-metadata search (no fact extraction) ──
+        direct_result = self._try_direct_search(
+            template_path=template_path,
+            output_path=output_path,
+            document_ids=document_ids,
+            user_requirement=user_requirement,
+        )
+        if direct_result is not None:
+            self._logger.info("Direct search succeeded with %d cells", len(direct_result))
+            result = TemplateResultRecord(
+                task_id=task_id,
+                template_name=template_name,
+                output_path=str(output_path),
+                output_file_name=resolved_output_file_name,
+                created_at=datetime.now(timezone.utc),
+                fill_mode=fill_mode,
+                document_ids=document_ids,
+                filled_cells=direct_result,
+                warnings=[],
+            )
+            if persist_result:
+                self._repository.save_template_result(result)
+            return result
+
+        # ── Slow path: fact-based extraction (fallback) ──
         # Detect template field names to enable targeted extraction
         profile = self._build_template_profile(template_name, template_path)
         template_field_names = set(profile.get("field_names", []))
@@ -252,8 +280,6 @@ class TemplateService:
             ]
         else:
             unique_entities = all_entities
-        resolved_output_file_name = output_file_name or f"{task_id}_{safe_filename(template_name)}"
-        output_path = self._settings.outputs_dir / resolved_output_file_name
 
         if suffix == ".xlsx":
             filled_cells = self._fill_xlsx_template(
@@ -331,93 +357,420 @@ class TemplateService:
             result.append(group)
         return result
 
-    @staticmethod
-    def _extract_primary_entity(
-        context_text: str,
-        candidates: list[str],
-    ) -> list[str]:
-        """从上下文段落中提取主体实体，忽略仅作参照引用的实体。
-        Extract the primary subject entity from context, ignoring entities
-        mentioned only for comparison/reference.
-        Checks each candidate against subject-role patterns like
-        '城市：德州市', '潍坊市各监测站点', '记录…临沂市各…数据'.
-        """
-        if not context_text or not candidates:
-            return []
+    # ── Table-context constraint parsing (LLM + regex fallback) ────────────
 
-        # 1) Check each candidate for explicit subject-role patterns
-        for c in candidates:
-            escaped = re.escape(c)
-            subject_patterns = [
-                rf"城市[：:]\s*{escaped}(?:市|县|区)?",            # "城市：德州市"
-                rf"{escaped}(?:市|县|区)?(?:各|的)(?:监测|站点|数据)",  # "潍坊市各监测站点"
-                rf"记录.*?{escaped}(?:市|县|区)?(?:各|的)",          # "记录…临沂市各…"
-                rf"{escaped}(?:市|县|区)?(?:的|各)\S*?(?:检测|质量|监测|数据|信息)",  # "德州市的空气质量"
-            ]
-            for pat in subject_patterns:
-                if re.search(pat, context_text):
-                    return [c]
+    _TABLE_CONTEXT_SCHEMA: dict = {
+        "type": "object",
+        "properties": {
+            "primary_entity": {
+                "type": "string",
+                "description": "本表的主体实体名（如城市名），不含'市/县/区'后缀。仅填写表格数据描述的主体对象，忽略仅作对比参照提及的实体。若无法判断则留空。",
+            },
+            "date": {
+                "type": "string",
+                "description": "本表数据对应的日期，格式 YYYY-MM-DD。若无法判断则留空。",
+            },
+            "hour": {
+                "type": "string",
+                "description": "本表数据对应的小时（24h 制，如 '09'）。若无法判断则留空。",
+            },
+        },
+        "required": ["primary_entity", "date", "hour"],
+        "additionalProperties": False,
+    }
 
-        # 2) Fallback: first sentence usually describes the subject
-        first_sentence = context_text.split("。")[0] if "。" in context_text else context_text
-        found_in_first = [c for c in candidates if c in first_sentence or f"{c}市" in first_sentence]
-        if len(found_in_first) == 1:
-            return found_in_first
-
-        return []  # Ambiguous — don't filter
-
-    _TIME_CONTEXT_RE = re.compile(
-        r"(?:监测时间|时间|日期|采样时间|检测时间)[：:]\s*((\d{4})-(\d{2})-(\d{2})(?:\s+(\d{2})[:\d.]*)?)"
-    )
-    _TIME_FIELD_NAMES = frozenset({
-        "创建时间", "监测时间", "时间", "日期", "检测时间", "采样时间", "最后更新时间",
-    })
-
-    def _filter_row_groups_by_context_time(
+    def _parse_table_context(
         self,
         context_text: str,
+        candidates: list[str],
+    ) -> dict[str, str]:
+        """解析表前上下文描述，返回结构化约束 {primary_entity, date, hour}。
+        Parse the descriptive text preceding a table into structured constraints.
+        Tries LLM first; falls back to regex patterns."""
+        result: dict[str, str] = {"primary_entity": "", "date": "", "hour": ""}
+        if not context_text:
+            return result
+
+        # ── LLM path ──
+        if self._openai_client.is_configured:
+            try:
+                payload = self._openai_client.create_json_completion(
+                    system_prompt=(
+                        "你是模板解析引擎。给定一段表格前的描述文字和候选实体列表，"
+                        "提取该表数据的主体实体（数据描述的对象，非对比参照）、日期和小时。\n"
+                        "规则：\n"
+                        "1. primary_entity 必须是候选列表中的一个，不含'市/县/区'后缀。\n"
+                        "2. 如果文字提到多个城市，只取数据主体（如'记录潍坊市...数据，结构与德州市一致'中主体是潍坊）。\n"
+                        "3. date 格式 YYYY-MM-DD；hour 用两位数字如 '09'。\n"
+                        "4. 不确定的字段留空字符串。"
+                    ),
+                    user_prompt=(
+                        f"描述文字:\n{context_text}\n\n"
+                        f"候选实体: {candidates}\n\n"
+                        "请输出 JSON。"
+                    ),
+                    json_schema=self._TABLE_CONTEXT_SCHEMA,
+                )
+                entity = str(payload.get("primary_entity", "")).strip().rstrip("市县区")
+                if entity and entity in candidates:
+                    result["primary_entity"] = entity
+                result["date"] = str(payload.get("date", "")).strip()
+                result["hour"] = str(payload.get("hour", "")).strip()
+                if result["primary_entity"] or result["date"]:
+                    return result
+            except Exception:
+                pass  # Fall through to regex
+
+        # ── Regex fallback: entity ──
+        result["primary_entity"] = self._extract_primary_entity_regex(context_text, candidates)
+
+        # ── Regex fallback: time ──
+        m = re.search(
+            r"(?:监测时间|时间|日期|采样时间|检测时间)[：:]\s*"
+            r"(\d{4})-(\d{2})-(\d{2})(?:\s+(\d{2})[:\d.]*)?",
+            context_text,
+        )
+        if m:
+            result["date"] = f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+            if m.group(4):
+                result["hour"] = m.group(4)
+
+        return result
+
+    @staticmethod
+    def _extract_primary_entity_regex(context_text: str, candidates: list[str]) -> str:
+        """正则兜底：从上下文提取主体实体。    Regex fallback for primary entity extraction."""
+        for c in candidates:
+            escaped = re.escape(c)
+            patterns = [
+                rf"城市[：:]\s*{escaped}(?:市|县|区)?",
+                rf"{escaped}(?:市|县|区)?(?:各|的)(?:监测|站点|数据)",
+                rf"记录.*?{escaped}(?:市|县|区)?(?:各|的)",
+                rf"{escaped}(?:市|县|区)?(?:的|各)\S*?(?:检测|质量|监测|数据|信息)",
+            ]
+            for pat in patterns:
+                if re.search(pat, context_text):
+                    return c
+        first_sentence = context_text.split("。")[0] if "。" in context_text else context_text
+        found = [c for c in candidates if c in first_sentence or f"{c}市" in first_sentence]
+        return found[0] if len(found) == 1 else ""
+
+    # ── Time-based row_group filtering ───────────────────────────────────
+
+    @staticmethod
+    def _filter_row_groups_by_time(
+        target_date: str,
+        target_hour: str,
         row_groups: list[dict[str, object]] | None,
     ) -> list[dict[str, object]] | None:
-        """根据上下文段落中的时间描述过滤 row_groups。
-        Filter row_groups by datetime constraint parsed from context text."""
-        if not row_groups or not context_text:
+        """按日期和小时过滤 row_groups，不依赖硬编码字段名。
+        Filter row_groups by date/hour by scanning all fact values."""
+        if not row_groups or not target_date:
             return row_groups
-        m = self._TIME_CONTEXT_RE.search(context_text)
-        if not m:
-            return row_groups
-        target_date = f"{m.group(2)}-{m.group(3)}-{m.group(4)}"  # e.g. 2025-11-25
-        target_hour = m.group(5)  # e.g. "09" or None
 
-        # Filter groups whose time-field value matches the target date
+        def _fact_time_val(group: dict) -> str | None:
+            """Return the first fact value_text that contains the target date."""
+            for key, fact in group.items():
+                if key == "__entity__":
+                    continue
+                val = str(getattr(fact, "value_text", "") or "")
+                if target_date in val:
+                    return val
+            return None
+
         date_matched: list[dict[str, object]] = []
+        time_vals: list[str] = []
         for g in row_groups:
-            for field_name, fact in g.items():
-                if field_name in self._TIME_FIELD_NAMES and hasattr(fact, "value_text"):
-                    val = str(getattr(fact, "value_text", "") or "")
-                    if target_date in val:
-                        date_matched.append(g)
-                        break
+            val = _fact_time_val(g)
+            if val is not None:
+                date_matched.append(g)
+                time_vals.append(val)
         if not date_matched:
-            return row_groups  # No time field found; don't filter
+            return row_groups
 
-        # If hour is specified, prefer groups whose time is closest to it
-        if target_hour is not None:
+        if target_hour:
             hour_matched = []
-            for g in date_matched:
-                for field_name, fact in g.items():
-                    if field_name in self._TIME_FIELD_NAMES and hasattr(fact, "value_text"):
-                        val = str(getattr(fact, "value_text", "") or "")
-                        # Extract hour from value like "2025-11-25 11:35:43.0"
-                        hm = re.search(r"(\d{2}):\d{2}", val)
-                        if hm:
-                            hour_matched.append((abs(int(hm.group(1)) - int(target_hour)), g))
-                        break
+            for g, val in zip(date_matched, time_vals):
+                hm = re.search(r"(\d{2}):\d{2}", val)
+                if hm:
+                    hour_matched.append((abs(int(hm.group(1)) - int(target_hour)), g))
             if hour_matched:
-                # Pick groups from the closest hour
                 best_delta = min(d for d, _ in hour_matched)
                 date_matched = [g for d, g in hour_matched if d == best_delta]
 
         return date_matched
+
+    # ── Direct-search fast path: query block metadata instead of facts ───
+
+    _COLUMN_MAPPING_SCHEMA: dict = {
+        "type": "object",
+        "properties": {
+            "mappings": {
+                "type": "object",
+                "description": "模板表头到源数据列名的映射。key=模板表头, value=源数据列名或null",
+                "additionalProperties": {"type": ["string", "null"]},
+            },
+            "entity_column": {
+                "type": "string",
+                "description": "源数据中表示实体/城市的列名（如'城市'）",
+            },
+            "time_column": {
+                "type": "string",
+                "description": "源数据中表示时间/日期的列名（如'监测时间'）",
+            },
+        },
+        "required": ["mappings", "entity_column", "time_column"],
+        "additionalProperties": False,
+    }
+
+    def _try_direct_search(
+        self,
+        *,
+        template_path: Path,
+        output_path: Path,
+        document_ids: list[str],
+        user_requirement: str,
+    ) -> list[FilledCellRecord] | None:
+        """尝试直接从 block metadata 中查找数据填充模板，跳过 fact 系统。
+        Try to fill the template by directly querying structured block metadata,
+        bypassing the fact extraction pipeline entirely. Returns None if not applicable."""
+        suffix = template_path.suffix.lower()
+
+        # Collect structured blocks (table_row with row_values)
+        structured_blocks: list[dict] = []
+        source_headers: list[str] = []
+        for doc_id in document_ids[:5]:
+            blocks = self._repository.list_blocks(doc_id)
+            for b in blocks:
+                rv = b.metadata.get("row_values") if b.metadata else None
+                if rv and isinstance(rv, dict):
+                    structured_blocks.append(rv)
+                    if not source_headers:
+                        headers = b.metadata.get("headers")
+                        if headers:
+                            source_headers = list(headers)
+        if not structured_blocks or not source_headers:
+            return None  # No structured data available — fall back
+
+        # Parse template tables
+        if suffix == ".docx":
+            document = load_docx_tables(template_path)
+            tables = document.tables
+        else:
+            workbook = load_xlsx(template_path)
+            tables = workbook.sheets  # type: ignore[assignment]
+
+        known_field_names = set(source_headers)
+        all_updates_xlsx: list[CellWrite] = []
+        all_updates_docx: list[WordCellWrite] = []
+        all_filled: list[FilledCellRecord] = []
+
+        for table in tables:
+            header_row, entity_column, field_columns = self._detect_layout(table, known_field_names)
+            if header_row is None or entity_column is None:
+                continue
+            field_columns = self._llm_enhance_field_columns(table, header_row, field_columns, known_field_names)
+            if not field_columns:
+                continue
+
+            # Get template header names for mapping
+            template_headers = [fn for _, fn in field_columns]
+
+            # LLM maps template headers → source column names (one call)
+            col_map = self._build_column_mapping(template_headers, source_headers)
+            if not col_map:
+                continue
+
+            # Parse per-table constraints from context
+            context_text = getattr(table, "context_text", "") or ""
+            entity_col_name = col_map.get("__entity_column__", "")
+            time_col_name = col_map.get("__time_column__", "")
+            constraints = self._parse_table_context(context_text, self._collect_unique_values(structured_blocks, entity_col_name))
+
+            # Filter blocks
+            matching_rows = self._query_blocks(
+                structured_blocks,
+                entity_col_name=entity_col_name,
+                target_entity=constraints.get("primary_entity", ""),
+                time_col_name=time_col_name,
+                target_date=constraints.get("date", ""),
+                target_hour=constraints.get("hour", ""),
+            )
+
+            # Sort by entity name and cap to template rows
+            rows_after_header = [row for row in table.rows if row.row_index > header_row]
+            max_rows = len(rows_after_header) if rows_after_header else 50
+            matching_rows.sort(key=lambda r: str(r.get(entity_col_name, "")))
+            matching_rows = matching_rows[:max_rows]
+
+            # Fill template
+            self._logger.info(
+                "Direct search: table=%s, constraints=%s, matched_rows=%d",
+                getattr(table, "name", "?"), constraints, len(matching_rows),
+            )
+            next_row_index = max([header_row, *(r.row_index for r in rows_after_header)], default=header_row) + 1
+            for idx, src_row in enumerate(matching_rows):
+                target_row_idx = rows_after_header[idx].row_index if idx < len(rows_after_header) else next_row_index + (idx - len(rows_after_header))
+                # Write entity cell
+                entity_val = str(src_row.get(entity_col_name, ""))
+                if suffix == ".docx":
+                    all_updates_docx.append(WordCellWrite(
+                        table_index=table.table_index, row_index=target_row_idx,
+                        column_index=entity_column, value=entity_val,
+                    ))
+                else:
+                    all_updates_xlsx.append(CellWrite(
+                        sheet_name=table.name, cell_ref=build_cell_ref(target_row_idx, entity_column), value=entity_val,
+                    ))
+                # Write field cells
+                for col_idx, template_field in field_columns:
+                    source_col = col_map.get(template_field)
+                    if not source_col:
+                        continue
+                    raw_val = src_row.get(source_col, "")
+                    if not raw_val or str(raw_val).strip() in ("", "—", "-", "None"):
+                        continue
+                    cell_value: str | float | int = raw_val
+                    try:
+                        num = float(str(raw_val))
+                        cell_value = int(num) if num == int(num) else num
+                    except (ValueError, OverflowError):
+                        cell_value = str(raw_val)
+                    if suffix == ".docx":
+                        all_updates_docx.append(WordCellWrite(
+                            table_index=table.table_index, row_index=target_row_idx,
+                            column_index=col_idx, value=cell_value,
+                        ))
+                    else:
+                        all_updates_xlsx.append(CellWrite(
+                            sheet_name=table.name, cell_ref=build_cell_ref(target_row_idx, col_idx), value=cell_value,
+                        ))
+                    all_filled.append(FilledCellRecord(
+                        sheet_name=getattr(table, "name", ""),
+                        cell_ref=f"R{target_row_idx}C{col_idx}" if suffix == ".docx" else build_cell_ref(target_row_idx, col_idx),
+                        entity_name=entity_val,
+                        field_name=template_field,
+                        value=cell_value,
+                        fact_id="direct_search",
+                        confidence=1.0,
+                        evidence_text=f"{source_col}={raw_val}",
+                    ))
+
+        if not all_filled:
+            return None
+
+        if suffix == ".docx":
+            apply_docx_updates(template_path, output_path, all_updates_docx)
+        else:
+            apply_xlsx_updates(template_path, output_path, all_updates_xlsx)
+        return all_filled
+
+    def _build_column_mapping(
+        self,
+        template_headers: list[str],
+        source_headers: list[str],
+    ) -> dict[str, str]:
+        """LLM 一次调用: 模板表头 → 源数据列名映射。
+        One LLM call to map template headers to source column names."""
+        # Fast path: exact / normalized match
+        result: dict[str, str] = {}
+        source_lower = {h.lower().strip(): h for h in source_headers}
+        unmatched: list[str] = []
+        for th in template_headers:
+            norm = normalize_field_name(th)
+            if norm in source_lower:
+                result[th] = source_lower[norm]
+            elif th.lower().strip() in source_lower:
+                result[th] = source_lower[th.lower().strip()]
+            else:
+                unmatched.append(th)
+
+        if unmatched and self._openai_client.is_configured:
+            try:
+                payload = self._openai_client.create_json_completion(
+                    system_prompt=(
+                        "你是字段映射引擎。将模板表头映射到源数据列名。\n"
+                        "规则：语义相同即匹配（如'空气质量指数'='AQI'）。无法匹配则填null。\n"
+                        "同时识别源数据中的实体列（城市/地区）和时间列。"
+                    ),
+                    user_prompt=(
+                        f"模板表头（待匹配）: {unmatched}\n"
+                        f"源数据列名: {source_headers}\n"
+                        '输出 JSON: {{"mappings": {{"模板表头": "源列名或null", ...}}, '
+                        '"entity_column": "实体列名", "time_column": "时间列名"}}'
+                    ),
+                    json_schema=self._COLUMN_MAPPING_SCHEMA,
+                )
+                for th, src in (payload.get("mappings") or {}).items():
+                    if src and src in source_headers:
+                        result[th] = src
+                result["__entity_column__"] = str(payload.get("entity_column", ""))
+                result["__time_column__"] = str(payload.get("time_column", ""))
+            except Exception:
+                pass
+
+        if "__entity_column__" not in result:
+            # Guess entity column from common names
+            for candidate in ("城市", "city", "地区", "区域", "实体"):
+                if candidate in source_lower:
+                    result["__entity_column__"] = source_lower[candidate]
+                    break
+        if "__time_column__" not in result:
+            for candidate in ("监测时间", "时间", "日期", "date", "创建时间"):
+                if candidate in source_lower:
+                    result["__time_column__"] = source_lower[candidate]
+                    break
+
+        return result
+
+    @staticmethod
+    def _collect_unique_values(blocks: list[dict], column: str) -> list[str]:
+        """从结构化 blocks 中收集某列的唯一值。"""
+        if not column:
+            return []
+        seen: set[str] = set()
+        result: list[str] = []
+        for row in blocks:
+            val = str(row.get(column, "")).strip().rstrip("市县区")
+            if val and val not in seen:
+                seen.add(val)
+                result.append(val)
+        return result
+
+    @staticmethod
+    def _query_blocks(
+        blocks: list[dict],
+        *,
+        entity_col_name: str,
+        target_entity: str,
+        time_col_name: str,
+        target_date: str,
+        target_hour: str,
+    ) -> list[dict]:
+        """在结构化 blocks 中按实体和时间筛选。
+        Query structured blocks by entity and time constraints."""
+        results = blocks
+        if target_entity and entity_col_name:
+            results = [
+                r for r in results
+                if target_entity in str(r.get(entity_col_name, ""))
+            ]
+        if target_date:
+            if time_col_name:
+                results = [r for r in results if target_date in str(r.get(time_col_name, ""))]
+            else:
+                results = [r for r in results if any(target_date in str(v) for v in r.values())]
+        if target_hour and results:
+            hour_scored = []
+            for r in results:
+                time_val = str(r.get(time_col_name, "")) if time_col_name else ""
+                hm = re.search(r"(\d{2}):\d{2}", time_val)
+                if hm:
+                    hour_scored.append((abs(int(hm.group(1)) - int(target_hour)), r))
+            if hour_scored:
+                best = min(d for d, _ in hour_scored)
+                results = [r for d, r in hour_scored if d == best]
+        return results
 
     @staticmethod
     def _verify_filled_cells(
@@ -956,17 +1309,17 @@ class TemplateService:
             field_columns = self._llm_enhance_field_columns(table, header_row, field_columns, known_field_names)
             if not field_columns:
                 continue
-            # Scope entities and time per table using preceding paragraph context
+            # Scope entities and time per table via LLM + regex fallback
             table_entities = unique_entities
             table_row_groups = row_groups
             if table.context_text:
-                primary = self._extract_primary_entity(table.context_text, unique_entities)
-                if primary:
-                    table_entities = primary
-                # Time scoping — extract date from context and filter row_groups
-                table_row_groups = self._filter_row_groups_by_context_time(
-                    table.context_text, row_groups,
-                )
+                ctx = self._parse_table_context(table.context_text, unique_entities)
+                if ctx["primary_entity"]:
+                    table_entities = [ctx["primary_entity"]]
+                if ctx["date"]:
+                    table_row_groups = self._filter_row_groups_by_time(
+                        ctx["date"], ctx["hour"], row_groups,
+                    )
             table_updates, table_filled_cells = self._build_docx_table_updates(
                 table=table,
                 header_row=header_row,
