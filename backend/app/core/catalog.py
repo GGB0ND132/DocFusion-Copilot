@@ -560,3 +560,12 @@ INTENT_KEYWORDS: dict[str, tuple[str, ...]] = {
     "extract_fields": ("字段提取", "提取字段", "抽取字段", "字段抽取", "指标提取"),
     "export_results": ("导出", "下载", "输出为", "保存为", "转为excel", "转为xlsx", "转为json"),
 }
+
+# 占位实体黑名单：LLM 可能将这些通用词作为实体返回，在过滤时应忽略
+PLACEHOLDER_ENTITIES: frozenset[str] = frozenset({"城市", "地区", "公司", "企业", "机构"})
+
+# 需要持久化到数据库的意图
+DB_STORE_INTENTS: frozenset[str] = frozenset({"extract_and_fill_template", "extract_facts"})
+
+# 使用上传模板作为 target 的意图
+TEMPLATE_TARGET_INTENTS: frozenset[str] = frozenset({"extract_and_fill_template"})

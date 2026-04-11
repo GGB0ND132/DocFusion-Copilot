@@ -70,6 +70,12 @@ class Settings:
     openai_timeout_seconds: float = field(
         default_factory=lambda: float(os.getenv("DOCFUSION_OPENAI_TIMEOUT_SECONDS", "90"))
     )
+    llm_block_text_max_chars: int = field(
+        default_factory=lambda: int(os.getenv("DOCFUSION_LLM_BLOCK_TEXT_MAX_CHARS", "12000"))
+    )
+    llm_temperature: float = field(
+        default_factory=lambda: float(os.getenv("DOCFUSION_LLM_TEMPERATURE", "0.0"))
+    )
     cors_allow_origins_raw: tuple[str, ...] = field(
         default_factory=lambda: _split_csv_env(
             "DOCFUSION_CORS_ALLOW_ORIGINS",

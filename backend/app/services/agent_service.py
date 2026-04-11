@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from datetime import datetime, timezone
 
-from app.core.catalog import FIELD_ALIASES, INTENT_KEYWORDS
+from app.core.catalog import DB_STORE_INTENTS, FIELD_ALIASES, INTENT_KEYWORDS, PLACEHOLDER_ENTITIES, TEMPLATE_TARGET_INTENTS
 from app.core.logging import ErrorCode, get_logger, log_operation
 from app.core.openai_client import OpenAIClientError, OpenAICompatibleClient
 from app.models.domain import ConversationRecord
@@ -177,13 +177,13 @@ class AgentService:
             preview_facts = self._preview_facts(fields, entities)
             result = {
                 "intent": intent,
-                "entities": entities or (["城市"] if "城市" in message else []),
+                "entities": entities or ([e for e in PLACEHOLDER_ENTITIES if e in message][:1]),
                 "fields": fields,
                 "target": str(
                     plan.get("target")
                     or ("uploaded_template" if intent == "extract_and_fill_template" else "fact_store")
                 ),
-                "need_db_store": bool(plan.get("need_db_store", intent in {"extract_and_fill_template", "extract_facts"})),
+                "need_db_store": bool(plan.get("need_db_store", intent in DB_STORE_INTENTS)),
                 "context_id": context_id,
                 "preview": preview_facts,
                 "edits": edits,
@@ -363,7 +363,7 @@ class AgentService:
         # ── 本地规则纠偏：LLM 可能误判，用关键词规则做二次检查 ──
         if intent == "general_qa":
             local_intent = self._infer_intent(message)
-            if local_intent in ("query_facts", "extract_facts", "summarize_document"):
+            if local_intent != "general_qa":
                 intent = local_intent
         return {
             "intent": intent,
@@ -371,10 +371,10 @@ class AgentService:
             "fields": [str(field).strip() for field in payload.get("fields", []) if str(field).strip()],
             "target": str(
                 payload.get("target")
-                or ("uploaded_template" if intent == "extract_and_fill_template" else "fact_store")
+                or ("uploaded_template" if intent in TEMPLATE_TARGET_INTENTS else "fact_store")
             ),
             "need_db_store": bool(
-                payload.get("need_db_store", intent in {"extract_and_fill_template", "extract_facts"})
+                payload.get("need_db_store", intent in DB_STORE_INTENTS)
             ),
             "edits": self._normalize_edits(payload.get("edits", [])),
             "planner": "openai",
@@ -412,8 +412,6 @@ class AgentService:
                     best_intent = intent
         if best_intent is not None:
             return best_intent
-        if any(keyword in message for keyword in ("排版", "格式", "整理", "规范", "重排", "清理")):
-            return "reformat_document"
         return "general_qa"
 
     def _fallback_plan(self, message: str) -> dict[str, object]:
@@ -424,8 +422,8 @@ class AgentService:
             "intent": intent,
             "entities": find_entity_mentions(message),
             "fields": self._infer_fields(message),
-            "target": "uploaded_template" if intent == "extract_and_fill_template" else "fact_store",
-            "need_db_store": intent in {"extract_and_fill_template", "extract_facts"},
+            "target": "uploaded_template" if intent in TEMPLATE_TARGET_INTENTS else "fact_store",
+            "need_db_store": intent in DB_STORE_INTENTS,
             "edits": self._infer_edits(message),
             "planner": "rules",
             "original_message": message,

@@ -4,6 +4,7 @@ import json
 import re
 from pathlib import Path
 
+from app.core.catalog import PLACEHOLDER_ENTITIES
 from app.core.config import Settings
 from app.core.logging import get_logger, log_operation
 from app.core.openai_client import OpenAIClientError, OpenAICompatibleClient
@@ -340,8 +341,9 @@ class DocumentInteractionService:
         # ── 构建文档原文摘要，优先使用 blocks ──
         block_text = "\n".join(b.text for b in all_blocks if b.text.strip())
         # 限制长度，避免超 token
-        if len(block_text) > 12000:
-            block_text = block_text[:12000] + "\n... (内容过长，已截断)"
+        _max = self._settings.llm_block_text_max_chars
+        if len(block_text) > _max:
+            block_text = block_text[:_max] + "\n... (内容过长，已截断)"
 
         if block_text:
             summary = self._plain_text_llm_call(
@@ -421,8 +423,9 @@ class DocumentInteractionService:
             for block in self._repository.list_blocks(doc_id)
         ]
         block_text = "\n".join(b.text for b in all_blocks if b.text.strip())
-        if len(block_text) > 12000:
-            block_text = block_text[:12000] + "\n... (内容过长，已截断)"
+        _max = self._settings.llm_block_text_max_chars
+        if len(block_text) > _max:
+            block_text = block_text[:_max] + "\n... (内容过长，已截断)"
 
         if block_text:
             summary = self._plain_text_llm_call(
@@ -558,7 +561,7 @@ class DocumentInteractionService:
             all_blocks.extend(self._repository.list_blocks(doc_id))
 
         # ── 软预过滤：匹配的 facts/blocks 排前面，不完全排除不匹配的 ──
-        entities = [str(e) for e in plan.get("entities", []) if e and e != "城市"]
+        entities = [str(e) for e in plan.get("entities", []) if e and e not in PLACEHOLDER_ENTITIES]
         fields = [str(f) for f in plan.get("fields", [])]
         facts = _soft_sort_facts(facts, entities, fields)
         blocks = _soft_sort_blocks(all_blocks, entities)
@@ -660,7 +663,7 @@ class DocumentInteractionService:
             for fact in facts[:100]
         )
         user_message = str(plan.get("original_message", plan.get("intent", "")))
-        entities = [str(e) for e in plan.get("entities", []) if e and e != "城市"]
+        entities = [str(e) for e in plan.get("entities", []) if e and e not in PLACEHOLDER_ENTITIES]
         fields = [str(f) for f in plan.get("fields", [])]
         entity_hint = f"\n用户关注的实体：{'、'.join(entities)}。必须以这些实体的数据为主，其他实体仅在对比时提及。" if entities else ""
         field_hint = f"\n用户关注的字段：{'、'.join(fields)}。\n优先围绕这些字段组织摘要。" if fields else ""
@@ -1101,7 +1104,7 @@ class DocumentInteractionService:
             import re as _re
             response = self._openai_client._raw_client.chat.completions.create(
                 model=self._openai_client.model,
-                temperature=0.0,
+                temperature=self._settings.llm_temperature,
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
@@ -1284,7 +1287,7 @@ class DocumentInteractionService:
         ]
 
         # ── 软预过滤：匹配的 facts/blocks 排前面 ──
-        entities = [str(e) for e in plan.get("entities", []) if e and e != "城市"]
+        entities = [str(e) for e in plan.get("entities", []) if e and e not in PLACEHOLDER_ENTITIES]
         fields = [str(f) for f in plan.get("fields", [])]
         facts = _soft_sort_facts(all_facts, entities, fields)
         scoped_blocks = _soft_sort_blocks(all_blocks, entities)
