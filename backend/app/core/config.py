@@ -66,7 +66,7 @@ class Settings:
     openai_base_url: str = field(default_factory=lambda: os.getenv("DOCFUSION_OPENAI_BASE_URL", ""))
     openai_model: str = field(default_factory=lambda: os.getenv("DOCFUSION_OPENAI_MODEL", "gpt-4o-mini"))
     openai_timeout_seconds: float = field(
-        default_factory=lambda: float(os.getenv("DOCFUSION_OPENAI_TIMEOUT_SECONDS", "45"))
+        default_factory=lambda: float(os.getenv("DOCFUSION_OPENAI_TIMEOUT_SECONDS", "90"))
     )
     cors_allow_origins_raw: tuple[str, ...] = field(
         default_factory=lambda: _split_csv_env(

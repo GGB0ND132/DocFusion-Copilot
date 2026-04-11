@@ -84,6 +84,12 @@ class Repository(Protocol):
         Update task status fields.
         """
 
+    def delete_facts_by_doc_id(self, doc_id: str) -> int:
+        """删除指定文档的全部事实记录，返回删除条数。
+        Delete all facts belonging to a document. Returns count of deleted rows.
+        """
+        return 0
+
     def add_facts(self, facts: list[FactRecord]) -> list[FactRecord]:
         """批量保存事实记录。
         Persist fact records in batch.

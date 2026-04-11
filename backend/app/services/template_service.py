@@ -190,21 +190,37 @@ class TemplateService:
         if suffix not in {".xlsx", ".docx"}:
             raise ValueError(f"Unsupported template type: {suffix}")
 
-        facts = self._repository.list_facts(canonical_only=False, document_ids=set(document_ids))
+        # Detect template field names to enable targeted extraction
+        profile = self._build_template_profile(template_name, template_path)
+        template_field_names = set(profile.get("field_names", []))
+        template_entity_names = list(profile.get("entity_names", []))
+
+        # Step 1: Collect facts — reuse existing ones, only extract if none exist yet.
+        facts: list = []
+        for doc_id in document_ids[:5]:
+            existing = self._repository.list_facts(canonical_only=False, document_ids={doc_id})
+            if existing:
+                facts.extend(existing)
+            elif self._extraction_service is not None:
+                doc = self._repository.get_document(doc_id)
+                if doc is None:
+                    continue
+                blocks = self._repository.list_blocks(doc_id)
+                if not blocks:
+                    continue
+                new_facts = self._extraction_service.extract(doc, blocks)
+                if new_facts:
+                    saved = self._repository.add_facts(new_facts)
+                    facts.extend(saved)
 
         # Parse user_requirement for date range filtering
         date_from, date_to = parse_date_range_from_text(user_requirement) if user_requirement else (None, None)
         if date_from or date_to:
             facts = self._filter_facts_by_date(facts, date_from, date_to)
 
-        # Detect template field names to enable targeted extraction for missing fields
-        profile = self._build_template_profile(template_name, template_path)
-        template_field_names = set(profile.get("field_names", []))
-        template_entity_names = list(profile.get("entity_names", []))
+        # Step 2: LLM targeted extraction only for genuinely missing fields
         existing_field_names = {f.field_name for f in facts}
         missing_fields = sorted(template_field_names - existing_field_names)
-
-        # Targeted LLM extraction for fields the template needs but fact_store lacks
         if missing_fields and self._extraction_service is not None and hasattr(self._extraction_service, "extract_targeted_fields"):
             for doc_id in document_ids[:5]:
                 doc = self._repository.get_document(doc_id)
@@ -227,7 +243,15 @@ class TemplateService:
         # Build row-oriented groups: each source block → one template row
         row_groups = self._build_row_groups(facts)
         fact_lookup = self._build_fact_lookup(facts)
-        unique_entities = list(dict.fromkeys(fact.entity_name for fact in facts if fact.entity_name))
+        all_entities = list(dict.fromkeys(fact.entity_name for fact in facts if fact.entity_name))
+        # Only keep entities that have at least one fact matching a template field
+        if template_field_names:
+            unique_entities = [
+                e for e in all_entities
+                if any(fact_lookup.get((e, fn)) for fn in template_field_names)
+            ]
+        else:
+            unique_entities = all_entities
         resolved_output_file_name = output_file_name or f"{task_id}_{safe_filename(template_name)}"
         output_path = self._settings.outputs_dir / resolved_output_file_name
 
@@ -306,6 +330,94 @@ class TemplateService:
             group["__entity__"] = type("_EntityHolder", (), {"entity_name": entity})()  # type: ignore[arg-type]
             result.append(group)
         return result
+
+    @staticmethod
+    def _extract_primary_entity(
+        context_text: str,
+        candidates: list[str],
+    ) -> list[str]:
+        """从上下文段落中提取主体实体，忽略仅作参照引用的实体。
+        Extract the primary subject entity from context, ignoring entities
+        mentioned only for comparison/reference.
+        Checks each candidate against subject-role patterns like
+        '城市：德州市', '潍坊市各监测站点', '记录…临沂市各…数据'.
+        """
+        if not context_text or not candidates:
+            return []
+
+        # 1) Check each candidate for explicit subject-role patterns
+        for c in candidates:
+            escaped = re.escape(c)
+            subject_patterns = [
+                rf"城市[：:]\s*{escaped}(?:市|县|区)?",            # "城市：德州市"
+                rf"{escaped}(?:市|县|区)?(?:各|的)(?:监测|站点|数据)",  # "潍坊市各监测站点"
+                rf"记录.*?{escaped}(?:市|县|区)?(?:各|的)",          # "记录…临沂市各…"
+                rf"{escaped}(?:市|县|区)?(?:的|各)\S*?(?:检测|质量|监测|数据|信息)",  # "德州市的空气质量"
+            ]
+            for pat in subject_patterns:
+                if re.search(pat, context_text):
+                    return [c]
+
+        # 2) Fallback: first sentence usually describes the subject
+        first_sentence = context_text.split("。")[0] if "。" in context_text else context_text
+        found_in_first = [c for c in candidates if c in first_sentence or f"{c}市" in first_sentence]
+        if len(found_in_first) == 1:
+            return found_in_first
+
+        return []  # Ambiguous — don't filter
+
+    _TIME_CONTEXT_RE = re.compile(
+        r"(?:监测时间|时间|日期|采样时间|检测时间)[：:]\s*((\d{4})-(\d{2})-(\d{2})(?:\s+(\d{2})[:\d.]*)?)"
+    )
+    _TIME_FIELD_NAMES = frozenset({
+        "创建时间", "监测时间", "时间", "日期", "检测时间", "采样时间", "最后更新时间",
+    })
+
+    def _filter_row_groups_by_context_time(
+        self,
+        context_text: str,
+        row_groups: list[dict[str, object]] | None,
+    ) -> list[dict[str, object]] | None:
+        """根据上下文段落中的时间描述过滤 row_groups。
+        Filter row_groups by datetime constraint parsed from context text."""
+        if not row_groups or not context_text:
+            return row_groups
+        m = self._TIME_CONTEXT_RE.search(context_text)
+        if not m:
+            return row_groups
+        target_date = f"{m.group(2)}-{m.group(3)}-{m.group(4)}"  # e.g. 2025-11-25
+        target_hour = m.group(5)  # e.g. "09" or None
+
+        # Filter groups whose time-field value matches the target date
+        date_matched: list[dict[str, object]] = []
+        for g in row_groups:
+            for field_name, fact in g.items():
+                if field_name in self._TIME_FIELD_NAMES and hasattr(fact, "value_text"):
+                    val = str(getattr(fact, "value_text", "") or "")
+                    if target_date in val:
+                        date_matched.append(g)
+                        break
+        if not date_matched:
+            return row_groups  # No time field found; don't filter
+
+        # If hour is specified, prefer groups whose time is closest to it
+        if target_hour is not None:
+            hour_matched = []
+            for g in date_matched:
+                for field_name, fact in g.items():
+                    if field_name in self._TIME_FIELD_NAMES and hasattr(fact, "value_text"):
+                        val = str(getattr(fact, "value_text", "") or "")
+                        # Extract hour from value like "2025-11-25 11:35:43.0"
+                        hm = re.search(r"(\d{2}):\d{2}", val)
+                        if hm:
+                            hour_matched.append((abs(int(hm.group(1)) - int(target_hour)), g))
+                        break
+            if hour_matched:
+                # Pick groups from the closest hour
+                best_delta = min(d for d, _ in hour_matched)
+                date_matched = [g for d, g in hour_matched if d == best_delta]
+
+        return date_matched
 
     @staticmethod
     def _verify_filled_cells(
@@ -423,6 +535,7 @@ class TemplateService:
                 },
             )
         except Exception as exc:
+            self._logger.error("Template filling failed: %s", exc, exc_info=True)
             self._repository.update_task(
                 task_id,
                 status=TaskStatus.failed,
@@ -843,14 +956,25 @@ class TemplateService:
             field_columns = self._llm_enhance_field_columns(table, header_row, field_columns, known_field_names)
             if not field_columns:
                 continue
+            # Scope entities and time per table using preceding paragraph context
+            table_entities = unique_entities
+            table_row_groups = row_groups
+            if table.context_text:
+                primary = self._extract_primary_entity(table.context_text, unique_entities)
+                if primary:
+                    table_entities = primary
+                # Time scoping — extract date from context and filter row_groups
+                table_row_groups = self._filter_row_groups_by_context_time(
+                    table.context_text, row_groups,
+                )
             table_updates, table_filled_cells = self._build_docx_table_updates(
                 table=table,
                 header_row=header_row,
                 entity_column=entity_column,
                 field_columns=field_columns,
                 fact_lookup=fact_lookup,
-                unique_entities=unique_entities,
-                row_groups=row_groups,
+                unique_entities=table_entities,
+                row_groups=table_row_groups,
             )
             updates.extend(table_updates)
             filled_cells.extend(table_filled_cells)
@@ -950,10 +1074,13 @@ class TemplateService:
         try:
             payload = self._openai_client.create_json_completion(
                 system_prompt=(
-                    "你是数据字段匹配引擎。用户给出模板表头名称列表和事实库已有字段名列表。"
-                    "请将每个模板表头映射到最匹配的事实库字段。"
-                    "如果某个表头确实无法匹配任何已有字段（含义完全不同），将其映射为 null。"
-                    "只输出 JSON，不要解释。"
+                    "你是高精度数据字段匹配引擎。\n"
+                    "规则：\n"
+                    "1. 将每个模板表头映射到语义最接近的事实库字段。\n"
+                    "2. 匹配时要考虑表头中可能包含的单位提示（如括号内的单位），这有助于区分相似字段。\n"
+                    "3. 不同名称的指标是不同字段。名称中含有'人均'、'总量'、'增速'等修饰词时，它们代表不同指标，必须精确匹配到对应字段。\n"
+                    "4. 如果表头确实无法匹配任何已有字段（含义完全不同），映射为 null。\n"
+                    "5. 只输出 JSON，不要解释。\n"
                 ),
                 user_prompt=(
                     f"模板表头（待匹配）:\n{unmatched_names}\n\n"
@@ -1060,18 +1187,38 @@ class TemplateService:
                     evidence_text=fact.source_span[:200] if fact.source_span else "",
                 ))
 
-        # If we have row_groups (multi-row data like COVID-19), use them for empty templates
-        if row_groups and not rows_after_header:
+        # Sort entities alphabetically by name (first column)
+        unique_entities = sorted(unique_entities)
+
+        # Use row_groups when template data area is empty or has only blank placeholder rows
+        all_rows_empty = rows_after_header and all(
+            not any(v.strip() for v in row.values) for row in rows_after_header
+        )
+        if row_groups and (not rows_after_header or all_rows_empty):
             field_name_set = {fn for _, fn in field_columns}
-            for group in row_groups:
+            entity_set = set(unique_entities)
+            # Require each group to have at least 2 matching fields to avoid sparse rows
+            min_fields = min(2, len(field_name_set))
+            filtered_groups = [
+                g for g in row_groups
+                if sum(1 for fn in field_name_set if fn in g) >= min_fields
+                and (not entity_set or normalize_entity_name(
+                    getattr(g.get("__entity__"), "entity_name", "")) in entity_set)
+            ]
+            filtered_groups.sort(key=lambda g: getattr(g.get("__entity__"), "entity_name", ""))
+            # Cap to template placeholder row count to avoid generating excessive rows
+            max_rows = len(rows_after_header) if rows_after_header else 50
+            filtered_groups = filtered_groups[:max_rows]
+            row_idx = 0
+            for group in filtered_groups:
                 entity_holder = group.get("__entity__")
                 entity_name = getattr(entity_holder, "entity_name", "") if entity_holder else ""
-                # Check if this group has any matching fields
-                has_match = any(fn in group for fn in field_name_set)
-                if not has_match:
-                    continue
-                write_row(next_row_index, entity_name, group, True)
-                next_row_index += 1
+                if row_idx < len(rows_after_header):
+                    write_row(rows_after_header[row_idx].row_index, entity_name, group, True)
+                else:
+                    write_row(next_row_index, entity_name, group, True)
+                    next_row_index += 1
+                row_idx += 1
             return updates, filled_cells
 
         # Standard flow: fill existing rows then append unassigned entities
@@ -1144,17 +1291,38 @@ class TemplateService:
                     evidence_text=fact.source_span[:200] if fact.source_span else "",
                 ))
 
-        # If we have row_groups (multi-row data), use them for empty templates
-        if row_groups and not rows_after_header:
+        # Sort entities alphabetically by name (first column)
+        unique_entities = sorted(unique_entities)
+
+        # Use row_groups when template data area is empty or has only blank placeholder rows
+        all_rows_empty = rows_after_header and all(
+            not any(v.strip() for v in row.values) for row in rows_after_header
+        )
+        if row_groups and (not rows_after_header or all_rows_empty):
             field_name_set = {fn for _, fn in field_columns}
-            for group in row_groups:
+            entity_set = set(unique_entities)
+            # Require each group to have at least 2 matching fields to avoid sparse rows
+            min_fields = min(2, len(field_name_set))
+            filtered_groups = [
+                g for g in row_groups
+                if sum(1 for fn in field_name_set if fn in g) >= min_fields
+                and (not entity_set or normalize_entity_name(
+                    getattr(g.get("__entity__"), "entity_name", "")) in entity_set)
+            ]
+            filtered_groups.sort(key=lambda g: getattr(g.get("__entity__"), "entity_name", ""))
+            # Cap to template placeholder row count to avoid generating excessive rows
+            max_rows = len(rows_after_header) if rows_after_header else 50
+            filtered_groups = filtered_groups[:max_rows]
+            row_idx = 0
+            for group in filtered_groups:
                 entity_holder = group.get("__entity__")
                 entity_name = getattr(entity_holder, "entity_name", "") if entity_holder else ""
-                has_match = any(fn in group for fn in field_name_set)
-                if not has_match:
-                    continue
-                write_row(next_row_index, entity_name, group, True)
-                next_row_index += 1
+                if row_idx < len(rows_after_header):
+                    write_row(rows_after_header[row_idx].row_index, entity_name, group, True)
+                else:
+                    write_row(next_row_index, entity_name, group, True)
+                    next_row_index += 1
+                row_idx += 1
             return updates, filled_cells
 
         # Standard flow: fill existing rows then append unassigned entities
