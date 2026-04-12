@@ -664,7 +664,10 @@ export default function AgentPage() {
                         <span className="text-xs font-medium">模板回填任务</span>
                         <TaskStatusBadge status={fillTask.status} />
                       </div>
-                      <div className="text-[10px] text-muted-foreground truncate">{fillTaskId}</div>
+                      <div className="flex items-center justify-between text-[10px] text-muted-foreground">
+                        <span className="truncate">{fillTaskId}</span>
+                        <TaskElapsed task={fillTask} />
+                      </div>
                       <div className="h-1.5 w-full rounded-full bg-muted">
                         <div
                           className="h-1.5 rounded-full bg-primary transition-all"
@@ -928,9 +931,26 @@ function TaskStatusBadge({ status }: { status: string }) {
   return <Badge variant="secondary" className="text-[9px] h-4 gap-0.5"><Clock className="h-2.5 w-2.5" />进行中</Badge>;
 }
 
+function TaskElapsed({ task }: { task: TaskResponse }) {
+  const done = ['succeeded', 'completed', 'success', 'failed'].includes(task.status);
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => {
+    if (done) return;
+    const t = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(t);
+  }, [done]);
+  const start = new Date(task.created_at).getTime();
+  const end = done ? new Date(task.updated_at).getTime() : now;
+  const sec = Math.max(0, Math.round((end - start) / 1000));
+  const m = Math.floor(sec / 60);
+  const s = sec % 60;
+  const label = m > 0 ? `${m}分${s}秒` : `${s}秒`;
+  return <span className="shrink-0 tabular-nums">{done ? `耗时 ${label}` : `已用 ${label}`}</span>;
+}
+
 function StatusDot({ status }: { status: string }) {
   const color =
-    status === 'parsed' ? 'bg-green-500' : status === 'parsing' ? 'bg-amber-400' : status === 'failed' ? 'bg-red-500' : 'bg-gray-300';
+    status === 'parsed' ? 'bg-green-500' : status === 'parsing' ? 'bg-amber-400' : status === 'failed' ? 'bg-red-500' : 'bg-gray-300 dark:bg-gray-600';
   return <span className={`inline-block h-1.5 w-1.5 rounded-full ${color}`} />;
 }
 

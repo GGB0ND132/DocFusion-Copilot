@@ -383,7 +383,7 @@ function FileIcon({ docType }: { docType: string }) {
 }
 
 function StatusDot({ status }: { status: string }) {
-  const color = status === 'parsed' ? 'bg-green-500' : status === 'parsing' ? 'bg-amber-400' : status === 'failed' ? 'bg-red-500' : 'bg-gray-300';
+  const color = status === 'parsed' ? 'bg-green-500' : status === 'parsing' ? 'bg-amber-400' : status === 'failed' ? 'bg-red-500' : 'bg-gray-300 dark:bg-gray-600';
   return <span className={`inline-block h-2 w-2 rounded-full ${color}`} />;
 }
 

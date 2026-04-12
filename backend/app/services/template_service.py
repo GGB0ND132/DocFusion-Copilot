@@ -36,6 +36,12 @@ from app.utils.spreadsheet import CellWrite, SpreadsheetDocument, SpreadsheetShe
 from app.utils.wordprocessing import WordCellWrite, WordDocument, WordTable, apply_docx_updates, load_docx_tables
 
 _TOKEN_RE = re.compile(r"[A-Za-z0-9\u4e00-\u9fff]{2,24}")
+
+# 汇总/聚合行实体名，在按城市/地区填充时应过滤掉
+_AGGREGATE_ENTITY_NAMES = frozenset({
+    "全国", "合计", "总计", "平均", "全省", "全市", "总体",
+    "全区", "均值", "中位数", "最大值", "最小值",
+})
 _GENERIC_TEMPLATE_TOKENS = frozenset(
     {
         "template",
@@ -271,7 +277,10 @@ class TemplateService:
         # Build row-oriented groups: each source block → one template row
         row_groups = self._build_row_groups(facts)
         fact_lookup = self._build_fact_lookup(facts)
-        all_entities = list(dict.fromkeys(fact.entity_name for fact in facts if fact.entity_name))
+        all_entities = list(dict.fromkeys(
+            fact.entity_name for fact in facts
+            if fact.entity_name and fact.entity_name.strip() not in _AGGREGATE_ENTITY_NAMES
+        ))
         # Only keep entities that have at least one fact matching a template field
         if template_field_names:
             unique_entities = [
@@ -561,6 +570,26 @@ class TemplateService:
             tables = workbook.sheets  # type: ignore[assignment]
 
         known_field_names = set(source_headers)
+
+        # ── 前置校验：模板字段与源数据表头必须有足够交集 ──
+        # 收集模板所有表头，检查与 source_headers 的匹配度
+        template_all_fields: set[str] = set()
+        for table in tables:
+            _, _, pre_field_columns = self._detect_layout(table, known_field_names)
+            template_all_fields.update(fn for _, fn in pre_field_columns)
+        if not template_all_fields:
+            self._logger.info("Direct search skipped: no template fields detected")
+            return None
+        overlap = template_all_fields & known_field_names
+        overlap_ratio = len(overlap) / len(template_all_fields) if template_all_fields else 0
+        self._logger.info(
+            "Direct search field overlap: template=%d, source=%d, overlap=%d (%.0f%%)",
+            len(template_all_fields), len(known_field_names), len(overlap), overlap_ratio * 100,
+        )
+        if overlap_ratio < 0.3:
+            self._logger.info("Direct search skipped: field overlap too low (%.0f%%)", overlap_ratio * 100)
+            return None
+
         all_updates_xlsx: list[CellWrite] = []
         all_updates_docx: list[WordCellWrite] = []
         all_filled: list[FilledCellRecord] = []
@@ -597,11 +626,17 @@ class TemplateService:
                 target_hour=constraints.get("hour", ""),
             )
 
-            # Sort by entity name and cap to template rows
-            rows_after_header = [row for row in table.rows if row.row_index > header_row]
-            max_rows = len(rows_after_header) if rows_after_header else 50
+            # Filter out aggregate/summary rows (全国, 合计, etc.)
+            if entity_col_name:
+                matching_rows = [
+                    r for r in matching_rows
+                    if str(r.get(entity_col_name, "")).strip() not in _AGGREGATE_ENTITY_NAMES
+                ]
+
+            # Sort by entity name
             matching_rows.sort(key=lambda r: str(r.get(entity_col_name, "")))
-            matching_rows = matching_rows[:max_rows]
+
+            rows_after_header = [row for row in table.rows if row.row_index > header_row]
 
             # Fill template
             self._logger.info(
@@ -1559,9 +1594,6 @@ class TemplateService:
                     getattr(g.get("__entity__"), "entity_name", "")) in entity_set)
             ]
             filtered_groups.sort(key=lambda g: getattr(g.get("__entity__"), "entity_name", ""))
-            # Cap to template placeholder row count to avoid generating excessive rows
-            max_rows = len(rows_after_header) if rows_after_header else 50
-            filtered_groups = filtered_groups[:max_rows]
             row_idx = 0
             for group in filtered_groups:
                 entity_holder = group.get("__entity__")
@@ -1663,9 +1695,6 @@ class TemplateService:
                     getattr(g.get("__entity__"), "entity_name", "")) in entity_set)
             ]
             filtered_groups.sort(key=lambda g: getattr(g.get("__entity__"), "entity_name", ""))
-            # Cap to template placeholder row count to avoid generating excessive rows
-            max_rows = len(rows_after_header) if rows_after_header else 50
-            filtered_groups = filtered_groups[:max_rows]
             row_idx = 0
             for group in filtered_groups:
                 entity_holder = group.get("__entity__")

@@ -218,9 +218,13 @@ class AgentService:
 
         if self._openai_client.is_configured:
             try:
-                return self._plan_with_openai_llm(message, context_id=context_id)
-            except OpenAIClientError:
-                pass
+                plan = self._plan_with_openai_llm(message, context_id=context_id)
+                self._logger.info("LLM planner succeeded, intent=%s", plan.get("intent"))
+                return plan
+            except OpenAIClientError as exc:
+                self._logger.warning("LLM planner failed, falling back to rules: %s", exc)
+        else:
+            self._logger.warning("OpenAI client not configured, using rule-based planner")
         return self._fallback_plan(message)
 
     def _plan_with_openai_legacy(self, message: str, *, context_id: str | None = None) -> dict[str, object]:

@@ -146,15 +146,12 @@ class DocumentInteractionService:
         """执行自然语言描述的文档操作。    Execute a document operation described in natural language."""
 
         with log_operation(self._logger, "agent_execute"):
-            plan = self._agent_service.chat(message, context_id, store_preview_message=False)
             resolved_document_ids = self._resolve_document_ids(document_ids, document_set_id)
             resolved_document_ids = self._narrow_by_message(message, resolved_document_ids)
-            intent = str(plan["intent"])
-            self._logger.info(f"intent resolved: {intent}", extra={"detail": intent})
 
+            # ── 模板回填：跳过 LLM 意图规划，直接提交任务 ──
             if template_content is not None:
                 execution = self._queue_template_fill(
-                    plan=plan,
                     template_name=template_name,
                     template_content=template_content,
                     document_set_id=document_set_id,
@@ -163,7 +160,22 @@ class DocumentInteractionService:
                     auto_match=auto_match,
                     user_requirement=user_requirement,
                 )
-            elif intent in {"extract_facts", "query_facts"}:
+                execution.setdefault("entities", [])
+                execution.setdefault("fields", [])
+                execution.setdefault("need_db_store", True)
+                execution.setdefault("context_id", context_id)
+                execution.setdefault("preview", [])
+                execution.setdefault("edits", [])
+                execution.setdefault("planner", "skip")
+                self._agent_service.record_execution_result(context_id, str(execution.get("summary", "")))
+                return execution
+
+            # ── 其他操作：先做 LLM 意图规划 ──
+            plan = self._agent_service.chat(message, context_id, store_preview_message=False)
+            intent = str(plan["intent"])
+            self._logger.info(f"intent resolved: {intent}", extra={"detail": intent})
+
+            if intent in {"extract_facts", "query_facts"}:
                 execution = self._query_facts(plan, resolved_document_ids)
             elif intent == "edit_document":
                 execution = self._edit_documents(plan, resolved_document_ids)
@@ -185,7 +197,7 @@ class DocumentInteractionService:
             elif intent == "query_status":
                 execution = self._query_status(resolved_document_ids)
             elif intent == "small_talk":
-                execution = self._small_talk(message, resolved_document_ids, bool(template_content))
+                execution = self._small_talk(message, resolved_document_ids, False)
             elif intent == "general_qa":
                 execution = self._general_qa(message, plan, resolved_document_ids)
             elif intent == "extract_fields":
@@ -274,7 +286,6 @@ class DocumentInteractionService:
     def _queue_template_fill(
         self,
         *,
-        plan: dict[str, object],
         template_name: str | None,
         template_content: bytes,
         document_set_id: str | None,

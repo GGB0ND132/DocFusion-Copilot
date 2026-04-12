@@ -5,7 +5,7 @@ from collections.abc import Iterable
 
 from app.core.catalog import CITY_NAMES, ENTITY_COLUMN_ALIASES, DATE_COLUMN_ALIASES, FIELD_ALIASES, FIELD_CANONICAL_UNITS
 
-_BRACKET_TEXT_RE = re.compile(r"[（(].*?[)）]")
+_BRACKET_TEXT_RE = re.compile(r"[（(].*?[)）]|[（(][^)）]*$")
 _WHITESPACE_RE = re.compile(r"\s+")
 _NUMERIC_RE = re.compile(r"(?P<value>-?\d[\d,]*(?:\.\d+)?)\s*(?P<unit>万亿元|亿元|万元|元|万人|人|%)?")
 _YEAR_RE = re.compile(r"(?P<year>(?:19|20)\d{2})年")

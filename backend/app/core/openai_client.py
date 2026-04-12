@@ -72,7 +72,19 @@ class OpenAICompatibleClient:
                     "type": "json_schema",
                     "json_schema": {"name": "docfusion_response", "schema": json_schema},
                 }
-            response = self._raw_client.chat.completions.create(**kwargs)
+            try:
+                response = self._raw_client.chat.completions.create(**kwargs)
+            except APIError as first_err:
+                # 部分模型（如 deepseek-chat）不支持 json_schema，降级为 json_object
+                if json_schema is not None and "response_format" in str(first_err):
+                    logger.info("json_schema not supported, falling back to json_object")
+                    kwargs["response_format"] = {"type": "json_object"}
+                    # 将 schema 要求追加到 system prompt 中，确保输出结构
+                    schema_hint = f"\n\n请严格按此 JSON schema 输出：{json.dumps(json_schema, ensure_ascii=False)}"
+                    messages[0]["content"] += schema_hint
+                    response = self._raw_client.chat.completions.create(**kwargs)
+                else:
+                    raise
             if not response.choices:
                 raise OpenAIClientError("OpenAI API returned empty choices")
             content = response.choices[0].message.content or ""
