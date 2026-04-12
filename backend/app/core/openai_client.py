@@ -97,6 +97,35 @@ class OpenAICompatibleClient:
         except json.JSONDecodeError as exc:
             raise OpenAIClientError(f"Invalid JSON from API: {exc}") from exc
 
+    # ── plain text completion (for code generation) ──
+    def create_text_completion(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        temperature: float = 0.0,
+    ) -> str:
+        """Return raw text completion without JSON parsing."""
+        if not self.is_configured or self._raw_client is None:
+            raise OpenAIClientError("OpenAI client is not configured.")
+        try:
+            response = self._raw_client.chat.completions.create(
+                model=self.model,
+                temperature=temperature,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+            )
+            if not response.choices:
+                raise OpenAIClientError("OpenAI API returned empty choices")
+            content = response.choices[0].message.content or ""
+            import re as _re
+            content = _re.sub(r"<think>[\s\S]*?</think>\s*", "", content).strip()
+            return content
+        except (APIError, APIConnectionError, APITimeoutError) as exc:
+            raise OpenAIClientError(f"OpenAI API error: {exc}") from exc
+
     # ── NEW: instructor structured completion ──
     def create_structured_completion(
         self,

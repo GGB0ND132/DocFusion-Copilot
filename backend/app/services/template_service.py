@@ -91,6 +91,74 @@ class TemplateService:
         self._openai_client = openai_client
         self._extraction_service = extraction_service
 
+    def suggest_documents(
+        self,
+        *,
+        template_name: str,
+        content: bytes,
+        document_set_id: str | None = None,
+    ) -> dict:
+        """分析模板并返回带有匹配分数的候选源文档列表。
+        Analyse a template and return scored candidate source documents for user selection.
+        """
+        suffix = Path(template_name).suffix.lower()
+        if suffix not in self._settings.supported_template_extensions:
+            raise ValueError(f"Unsupported template type: {suffix}")
+
+        # 保存临时文件用于分析
+        temp_name = f"suggest_{new_id('tmp')}_{safe_filename(template_name)}"
+        template_path = self._settings.temp_dir / temp_name
+        template_path.write_bytes(content)
+
+        try:
+            profile = self._build_template_profile(template_name, template_path)
+            candidate_ids = self.resolve_document_ids(document_set_id, None)
+            if not candidate_ids:
+                return {
+                    "template_profile": profile,
+                    "candidates": [],
+                    "message": "当前没有可用的已解析源文档，请先上传并完成解析。",
+                }
+            candidates = self._build_document_match_cards(candidate_ids)
+            _, match_mode, reason, scored_candidates = self._match_documents(profile, candidates)
+
+            # 为每个候选文档添加 recommended 标记
+            recommended_ids = set()
+            if match_mode not in ("fallback_all",):
+                recommended_ids = {
+                    str(c["doc_id"]) for c in scored_candidates
+                    if c.get("entity_hits") or c.get("field_hits")
+                }
+
+            # Normalize scores to 0~1 range
+            max_score = max((float(c.get("score", 0)) for c in scored_candidates), default=1.0) or 1.0
+
+            result_candidates = []
+            for c in scored_candidates:
+                doc_id = str(c["doc_id"])
+                raw_score = float(c.get("score", 0))
+                result_candidates.append({
+                    "doc_id": doc_id,
+                    "file_name": str(c.get("file_name", "")),
+                    "score": round(raw_score / max_score, 4),
+                    "field_hits": list(c.get("field_hits", [])),
+                    "entity_hits": list(c.get("entity_hits", []))[:10],
+                    "keyword_hits": list(c.get("keyword_hits", []))[:5],
+                    "recommended": doc_id in recommended_ids,
+                })
+
+            return {
+                "template_profile": {
+                    "template_name": profile.get("template_name"),
+                    "field_names": profile.get("field_names", []),
+                    "entity_names": list(profile.get("entity_names", []))[:20],
+                },
+                "candidates": result_candidates,
+                "match_reason": reason,
+            }
+        finally:
+            template_path.unlink(missing_ok=True)
+
     def submit_fill_task(
         self,
         *,
@@ -199,7 +267,37 @@ class TemplateService:
         resolved_output_file_name = output_file_name or f"{task_id}_{safe_filename(template_name)}"
         output_path = self._settings.outputs_dir / resolved_output_file_name
 
-        # ── Fast path: direct block-metadata search (no fact extraction) ──
+        # ── Primary path: LLM-driven data transformation ──
+        try:
+            from app.services.llm_transform import run_llm_transform_pipeline
+            llm_result = run_llm_transform_pipeline(
+                openai_client=self._openai_client,
+                repository=self._repository,
+                template_path=template_path,
+                output_path=output_path,
+                document_ids=document_ids,
+                user_requirement=user_requirement,
+            )
+            if llm_result is not None:
+                self._logger.info("LLM transform succeeded with %d cells", len(llm_result))
+                result = TemplateResultRecord(
+                    task_id=task_id,
+                    template_name=template_name,
+                    output_path=str(output_path),
+                    output_file_name=resolved_output_file_name,
+                    created_at=datetime.now(timezone.utc),
+                    fill_mode=fill_mode,
+                    document_ids=document_ids,
+                    filled_cells=llm_result,
+                    warnings=[],
+                )
+                if persist_result:
+                    self._repository.save_template_result(result)
+                return result
+        except Exception as exc:
+            self._logger.error("LLM transform pipeline failed, falling back: %s", exc, exc_info=True)
+
+        # ── Fallback 1: direct block-metadata search (no fact extraction) ──
         direct_result = self._try_direct_search(
             template_path=template_path,
             output_path=output_path,
@@ -342,6 +440,41 @@ class TemplateService:
             if date_to and str(fact_date) > date_to:
                 continue
             filtered.append(fact)
+        return filtered
+
+    @staticmethod
+    def _filter_rows_by_date(
+        rows: list[dict],
+        time_col: str,
+        date_from: str | None,
+        date_to: str | None,
+    ) -> list[dict]:
+        """按日期范围过滤结构化行数据。支持 YYYY-MM-DD 和 YYYY/M/D 等格式。
+        Filter structured rows by date range on the given time column."""
+        if not date_from and not date_to:
+            return rows
+        filtered: list[dict] = []
+        for row in rows:
+            raw = str(row.get(time_col, "")).strip()
+            if not raw:
+                filtered.append(row)
+                continue
+            # Normalise date: extract YYYY-MM-DD from various formats
+            norm = re.sub(r"[/年月]", "-", raw).rstrip("-日").strip()
+            parts = norm.split("-")
+            try:
+                y = int(parts[0])
+                m = int(parts[1]) if len(parts) > 1 else 1
+                d = int(parts[2]) if len(parts) > 2 else 1
+                normalised = f"{y:04d}-{m:02d}-{d:02d}"
+            except (ValueError, IndexError):
+                filtered.append(row)
+                continue
+            if date_from and normalised < date_from:
+                continue
+            if date_to and normalised > date_to:
+                continue
+            filtered.append(row)
         return filtered
 
     @staticmethod
@@ -547,19 +680,35 @@ class TemplateService:
 
         # Collect structured blocks (table_row with row_values)
         structured_blocks: list[dict] = []
-        source_headers: list[str] = []
+        all_source_headers: list[str] = []
+        seen_headers: set[str] = set()
+        docs_with_structured_data: set[str] = set()
         for doc_id in document_ids[:5]:
             blocks = self._repository.list_blocks(doc_id)
             for b in blocks:
                 rv = b.metadata.get("row_values") if b.metadata else None
                 if rv and isinstance(rv, dict):
                     structured_blocks.append(rv)
-                    if not source_headers:
-                        headers = b.metadata.get("headers")
-                        if headers:
-                            source_headers = list(headers)
+                    docs_with_structured_data.add(doc_id)
+                    headers = b.metadata.get("headers")
+                    if headers:
+                        for h in headers:
+                            if h not in seen_headers:
+                                seen_headers.add(h)
+                                all_source_headers.append(h)
+        source_headers = all_source_headers
         if not structured_blocks or not source_headers:
             return None  # No structured data available — fall back
+
+        # If not ALL requested documents contributed structured data, fall back
+        # to the slow path which can handle both structured and unstructured docs.
+        if docs_with_structured_data != set(document_ids[:5]):
+            self._logger.info(
+                "Direct search skipped: only %d/%d docs have structured blocks (%s missing)",
+                len(docs_with_structured_data), len(document_ids[:5]),
+                sorted(set(document_ids[:5]) - docs_with_structured_data),
+            )
+            return None
 
         # Parse template tables
         if suffix == ".docx":
@@ -625,6 +774,12 @@ class TemplateService:
                 target_date=constraints.get("date", ""),
                 target_hour=constraints.get("hour", ""),
             )
+
+            # Apply user_requirement date range filtering on structured rows
+            if user_requirement and time_col_name:
+                ur_date_from, ur_date_to = parse_date_range_from_text(user_requirement)
+                if ur_date_from or ur_date_to:
+                    matching_rows = self._filter_rows_by_date(matching_rows, time_col_name, ur_date_from, ur_date_to)
 
             # Filter out aggregate/summary rows (全国, 合计, etc.)
             if entity_col_name:

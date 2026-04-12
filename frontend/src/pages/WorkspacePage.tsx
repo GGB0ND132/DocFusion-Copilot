@@ -51,13 +51,18 @@ export default function WorkspacePage() {
     }
   }, [uploadedDocuments.length]);
 
-  // Load facts when a document is selected
+  // Load facts when a document is selected (with stale-request guard)
   useEffect(() => {
     if (!selectedDocId) {
       setFacts([]);
+      setFactsTotal(0);
       return;
     }
-    getDocumentFacts(selectedDocId).then((res) => { setFacts(res.items); setFactsTotal(res.total); }).catch(() => {});
+    let cancelled = false;
+    getDocumentFacts(selectedDocId).then((res) => {
+      if (!cancelled) { setFacts(res.items); setFactsTotal(res.total); }
+    }).catch(() => {});
+    return () => { cancelled = true; };
   }, [selectedDocId]);
 
   const handleUpload = useCallback(

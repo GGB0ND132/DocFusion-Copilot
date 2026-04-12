@@ -151,6 +151,7 @@ class DocumentInteractionService:
 
             # ── 模板回填：跳过 LLM 意图规划，直接提交任务 ──
             if template_content is not None:
+                effective_requirement = user_requirement or message
                 execution = self._queue_template_fill(
                     template_name=template_name,
                     template_content=template_content,
@@ -158,7 +159,7 @@ class DocumentInteractionService:
                     document_ids=document_ids or None,
                     fill_mode=fill_mode,
                     auto_match=auto_match,
-                    user_requirement=user_requirement,
+                    user_requirement=effective_requirement,
                 )
                 execution.setdefault("entities", [])
                 execution.setdefault("fields", [])
@@ -185,8 +186,8 @@ class DocumentInteractionService:
                 execution = self._reformat_documents(plan, resolved_document_ids)
             elif intent == "extract_and_fill_template":
                 execution = {
-                    "execution_type": "plan_only",
-                    "summary": "Template filling requires an uploaded template_file.",
+                    "execution_type": "template_fill_pending",
+                    "summary": "已识别为模板回填意图，请选择源文档后确认。",
                     "facts": [],
                     "artifacts": [],
                     "document_ids": resolved_document_ids,

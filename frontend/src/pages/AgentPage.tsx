@@ -41,12 +41,15 @@ import {
   createConversation,
   getConversation,
   deleteConversation,
+  suggestDocuments,
   type AgentExecuteResponse,
   type ConversationResponse,
   type DocumentResponse,
   type FilledCellResponse,
+  type SuggestDocumentCandidate,
   type TaskResponse,
 } from '@/services';
+import DocumentSelectDialog from '@/components/DocumentSelectDialog';
 
 export default function AgentPage() {
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -69,6 +72,15 @@ export default function AgentPage() {
   const [traceInput, setTraceInput] = useState('');
   const [availableDocuments, setAvailableDocuments] = useState<DocumentResponse[]>([]);
   const [documentsHydrated, setDocumentsHydrated] = useState(false);
+
+  // ── Document selection dialog state ──
+  const [docSelectOpen, setDocSelectOpen] = useState(false);
+  const [docSelectCandidates, setDocSelectCandidates] = useState<SuggestDocumentCandidate[]>([]);
+  const [docSelectTemplateName, setDocSelectTemplateName] = useState('');
+  const [docSelectFieldNames, setDocSelectFieldNames] = useState<string[]>([]);
+  const [pendingFillText, setPendingFillText] = useState('');
+  const [pendingFillContextId, setPendingFillContextId] = useState<string | null>(null);
+  const [pendingFillDocSetId, setPendingFillDocSetId] = useState<string | null>(null);
 
   const uploadedDocuments = useUiStore((s) => s.uploadedDocuments);
   const currentDocumentSetId = useUiStore((s) => s.currentDocumentSetId);
@@ -139,6 +151,69 @@ export default function AgentPage() {
   const refreshConversations = useCallback(() => {
     listConversations().then(setConversationList).catch(() => {});
   }, [setConversationList]);
+
+  // ── Document selection confirm handler ──
+  const handleDocSelectConfirm = useCallback(async (selectedDocIds: string[]) => {
+    setDocSelectOpen(false);
+    if (!templateFile || selectedDocIds.length === 0) return;
+    const selectedNames = selectedDocIds
+      .map((id) => docSelectCandidates.find((c) => c.doc_id === id)?.file_name ?? id)
+      .join('、');
+    addAgentMessage({
+      role: 'assistant',
+      text: `已选择 ${selectedDocIds.length} 个源文档：${selectedNames}\n正在提交回填任务…`,
+      timestamp: Date.now(),
+    });
+    const ac = new AbortController();
+    abortControllerRef.current = ac;
+    setIsExecuting(true);
+    setThinkingStartTime(Date.now());
+    try {
+      const resp = await runAgentExecute({
+        message: pendingFillText,
+        contextId: pendingFillContextId ?? undefined,
+        documentSetId: pendingFillDocSetId ?? undefined,
+        documentIds: selectedDocIds,
+        autoMatch: false,
+        templateFile,
+        userRequirement: pendingFillText,
+      }, { signal: ac.signal });
+      if (resp.context_id && resp.context_id !== agentContextId) {
+        setAgentContextId(resp.context_id);
+      }
+      if (!resp.task_id) {
+        throw new Error('未返回模板回填任务 ID');
+      }
+      setFillTaskId(resp.task_id);
+      const task = await getTaskStatus(resp.task_id);
+      setFillTask(task);
+      upsertTaskSnapshot(task);
+      addAgentMessage({
+        role: 'assistant',
+        text: `模板回填任务已提交。\n模板：${resp.template_name}\n任务 ID：${resp.task_id}\n状态：${task.status}`,
+        timestamp: Date.now(),
+        taskId: resp.task_id,
+      });
+      refreshConversations();
+    } catch (err) {
+      if (err instanceof DOMException && err.name === 'AbortError') {
+        addAgentMessage({ role: 'assistant', text: '已中止回答。', timestamp: Date.now() });
+      } else {
+        const msg = err instanceof Error ? err.message : '模板回填失败';
+        addAgentMessage({ role: 'assistant', text: `错误：${msg}`, timestamp: Date.now() });
+        toast.error(msg);
+      }
+    } finally {
+      abortControllerRef.current = null;
+      setIsExecuting(false);
+      setThinkingStartTime(null);
+    }
+  }, [templateFile, pendingFillText, pendingFillContextId, pendingFillDocSetId, docSelectCandidates, agentContextId, setAgentContextId, addAgentMessage, upsertTaskSnapshot, refreshConversations]);
+
+  const handleDocSelectCancel = useCallback(() => {
+    setDocSelectOpen(false);
+    addAgentMessage({ role: 'assistant', text: '已取消模板回填。', timestamp: Date.now() });
+  }, [addAgentMessage]);
 
   const handleNewConversation = useCallback(() => {
     startNewConversation();
@@ -257,62 +332,7 @@ export default function AgentPage() {
       // Keep the locally derived scope if refresh fails.
     }
 
-    if (templateFile && runtimeParsedDocIds.length === 0) {
-      const warning = '当前还没有已解析的源文档。请先上传并完成原始文档解析，再回填模板。';
-      addAgentMessage({ role: 'assistant', text: warning, timestamp: Date.now() });
-      toast.info(warning);
-      return;
-    }
-
-    // If there's a template file, do template fill instead of agent execute
-    if (templateFile) {
-      const ac = new AbortController();
-      abortControllerRef.current = ac;
-      setIsExecuting(true);
-      setThinkingStartTime(Date.now());
-      try {
-        const resp = await runAgentExecute({
-          message: text,
-          contextId: activeContextId ?? undefined,
-          documentSetId: runtimeDocumentSetId ?? undefined,
-          documentIds: runtimeParsedDocIds,
-          autoMatch: true,
-          templateFile,
-        }, { signal: ac.signal });
-        if (resp.context_id && resp.context_id !== agentContextId) {
-          setAgentContextId(resp.context_id);
-        }
-        if (!resp.task_id) {
-          throw new Error('未返回模板回填任务 ID');
-        }
-        setFillTaskId(resp.task_id);
-        const task = await getTaskStatus(resp.task_id);
-        setFillTask(task);
-        upsertTaskSnapshot(task);
-        addAgentMessage({
-          role: 'assistant',
-          text: `模板回填任务已提交。\n模板：${resp.template_name}\n任务 ID：${resp.task_id}\n状态：${task.status}`,
-          timestamp: Date.now(),
-          taskId: resp.task_id,
-        });
-        refreshConversations();
-      } catch (err) {
-        if (err instanceof DOMException && err.name === 'AbortError') {
-          addAgentMessage({ role: 'assistant', text: '已中止回答。', timestamp: Date.now() });
-        } else {
-          const msg = err instanceof Error ? err.message : '模板回填失败';
-          addAgentMessage({ role: 'assistant', text: `错误：${msg}`, timestamp: Date.now() });
-          toast.error(msg);
-        }
-      } finally {
-        abortControllerRef.current = null;
-        setIsExecuting(false);
-        setThinkingStartTime(null);
-      }
-      return;
-    }
-
-    // Otherwise run agent execute
+    // Always run agent execute first (without template) to determine intent
     const ac = new AbortController();
     abortControllerRef.current = ac;
     setIsExecuting(true);
@@ -328,15 +348,52 @@ export default function AgentPage() {
       if (r.context_id && r.context_id !== agentContextId) {
         setAgentContextId(r.context_id);
       }
-      const elapsed = thinkingStartTime ? ((Date.now() - thinkingStartTime) / 1000).toFixed(1) : null;
-      const summary = formatAgentReply(r);
-      const timeTag = elapsed ? `\n\n> \u23f1\ufe0f \u601d\u8003\u8017\u65f6 ${elapsed}s` : '';
-      addAgentMessage({
-        role: 'assistant',
-        text: summary + timeTag,
-        timestamp: Date.now(),
-        data: shouldRenderOperationCard(r) ? r : undefined,
-      });
+
+      // If backend determined this is a template fill AND we have a template file,
+      // trigger the document selection flow instead of the normal response
+      if ((r.execution_type === 'template_fill_pending' || r.execution_type === 'template_fill_task') && templateFile) {
+        addAgentMessage({ role: 'assistant', text: '正在分析模板并匹配源文档…', timestamp: Date.now() });
+        try {
+          const suggestion = await suggestDocuments(templateFile, runtimeDocumentSetId ?? undefined);
+          if (suggestion.candidates.length === 0) {
+            addAgentMessage({
+              role: 'assistant',
+              text: suggestion.message || '没有找到可用于回填的已解析源文档。',
+              timestamp: Date.now(),
+            });
+          } else {
+            setPendingFillText(text);
+            setPendingFillContextId(activeContextId);
+            setPendingFillDocSetId(runtimeDocumentSetId);
+            setDocSelectCandidates(suggestion.candidates);
+            setDocSelectTemplateName(suggestion.template_profile?.template_name ?? templateFile.name);
+            setDocSelectFieldNames(suggestion.template_profile?.field_names ?? []);
+            setDocSelectOpen(true);
+          }
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : '模板分析失败';
+          addAgentMessage({ role: 'assistant', text: `错误：${msg}`, timestamp: Date.now() });
+          toast.error(msg);
+        }
+      } else if ((r.execution_type === 'template_fill_pending' || r.execution_type === 'template_fill_task') && !templateFile) {
+        // Backend wants to fill but no template uploaded
+        addAgentMessage({
+          role: 'assistant',
+          text: '检测到模板回填意图，但尚未选择模板文件。请先点击📎按钮上传模板。',
+          timestamp: Date.now(),
+        });
+      } else {
+        // Normal response for non-fill intents
+        const elapsed = thinkingStartTime ? ((Date.now() - thinkingStartTime) / 1000).toFixed(1) : null;
+        const summary = formatAgentReply(r);
+        const timeTag = elapsed ? `\n\n> ⏱️ 思考耗时 ${elapsed}s` : '';
+        addAgentMessage({
+          role: 'assistant',
+          text: summary + timeTag,
+          timestamp: Date.now(),
+          data: shouldRenderOperationCard(r) ? r : undefined,
+        });
+      }
       refreshConversations();
     } catch (err) {
       if (err instanceof DOMException && err.name === 'AbortError') {
@@ -427,6 +484,7 @@ export default function AgentPage() {
   const fillTaskDone = fillTask && ['succeeded', 'completed', 'success'].includes(fillTask.status);
 
   return (
+    <>
     <ResizablePanelGroup className="h-full">
       {/* ── Left: Conversation Sidebar ── */}
       <ResizablePanel defaultSize={22} minSize={12}>
@@ -918,6 +976,16 @@ export default function AgentPage() {
       </div>
       </ResizablePanel>
     </ResizablePanelGroup>
+
+    <DocumentSelectDialog
+      open={docSelectOpen}
+      candidates={docSelectCandidates}
+      templateName={docSelectTemplateName}
+      fieldNames={docSelectFieldNames}
+      onConfirm={handleDocSelectConfirm}
+      onCancel={handleDocSelectCancel}
+    />
+    </>
   );
 }
 
