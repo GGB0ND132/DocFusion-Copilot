@@ -146,26 +146,35 @@ def get_document_blocks(
     return {"items": items, "total": total, "offset": offset, "limit": limit}
 
 
-@router.get("/{doc_id}/facts", response_model=list[FactResponse])
+@router.get("/{doc_id}/facts")
 def get_document_facts(
     doc_id: str,
     canonical_only: bool = Query(default=False),
     status: str | None = Query(default=None),
     min_confidence: float | None = Query(default=None, ge=0.0, le=1.0),
-) -> list[FactResponse]:
-    """获取指定文档关联的事实记录。
-    Fetch fact records associated with a document.
+    limit: int = Query(default=200, ge=1, le=2000, description="每页条数"),
+    offset: int = Query(default=0, ge=0, description="偏移量"),
+) -> dict:
+    """获取指定文档关联的事实记录（分页）。
+    Fetch fact records associated with a document (paginated).
     """
     document = get_container().document_service.get_document(doc_id)
     if document is None:
         raise HTTPException(status_code=404, detail="Document not found.")
-    facts = get_container().document_service.get_document_facts(
+    all_facts = get_container().document_service.get_document_facts(
         doc_id,
         canonical_only=canonical_only,
         status=status,
         min_confidence=min_confidence,
     )
-    return [FactResponse.model_validate(fact) for fact in facts]
+    total = len(all_facts)
+    page = all_facts[offset:offset + limit]
+    return {
+        "items": [FactResponse.model_validate(fact) for fact in page],
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+    }
 
 
 @router.get("/{doc_id}/raw")

@@ -27,6 +27,13 @@ export interface PaginatedBlocksResponse {
   limit: number | null;
 }
 
+export interface PaginatedFactsResponse {
+  items: FactResponse[];
+  total: number;
+  offset: number;
+  limit: number;
+}
+
 export interface FactResponse {
   fact_id: string;
   entity_type: string;

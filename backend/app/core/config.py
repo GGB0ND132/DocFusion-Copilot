@@ -98,7 +98,7 @@ class Settings:
     cors_expose_headers_raw: tuple[str, ...] = field(
         default_factory=lambda: _split_csv_env(
             "DOCFUSION_CORS_EXPOSE_HEADERS",
-            ("Content-Disposition", "Content-Type"),
+            ("Content-Disposition", "Content-Type", "ETag"),
         )
     )
     cors_allow_credentials: bool = field(

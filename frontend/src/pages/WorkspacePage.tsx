@@ -27,6 +27,7 @@ export default function WorkspacePage() {
   const [documents, setDocuments] = useState<DocumentResponse[]>([]);
   const [selectedDocId, setSelectedDocId] = useState<string | null>(null);
   const [facts, setFacts] = useState<FactResponse[]>([]);
+  const [factsTotal, setFactsTotal] = useState(0);
   const [isUploading, setIsUploading] = useState(false);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
 
@@ -56,7 +57,7 @@ export default function WorkspacePage() {
       setFacts([]);
       return;
     }
-    getDocumentFacts(selectedDocId).then(setFacts).catch(() => {});
+    getDocumentFacts(selectedDocId).then((res) => { setFacts(res.items); setFactsTotal(res.total); }).catch(() => {});
   }, [selectedDocId]);
 
   const handleUpload = useCallback(
@@ -352,7 +353,7 @@ export default function WorkspacePage() {
                     <InfoRow label="类型" value={selectedDoc.doc_type.toUpperCase()} />
                     <InfoRow label="状态" value={selectedDoc.status} />
                     <InfoRow label="文档 ID" value={selectedDoc.doc_id} />
-                    <InfoRow label="事实数" value={String(facts.length)} />
+                    <InfoRow label="事实数" value={factsTotal > facts.length ? `${facts.length} / ${factsTotal}` : String(facts.length)} />
                     <Separator />
                     <InfoRow label="上传时间" value={selectedDoc.upload_time} />
                   </>
