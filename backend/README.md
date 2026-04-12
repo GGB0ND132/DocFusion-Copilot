@@ -118,47 +118,66 @@ CREATE DATABASE docfusion_copilot;
 
 如果你不想改密码，也可以保留现有密码，只要把下面的 `DOCFUSION_DATABASE_URL` 改成真实密码即可。
 
-### 4. 配置当前终端环境变量
+### 4. 配置环境变量
 
-以下命令只对当前 PowerShell 会话生效。
+#### 4.1 推荐：使用 `.env` 文件（一次配置，长期生效）
 
-#### 4.1 数据库
+仓库已提供示例文件 `.env.example`，复制并修改即可：
 
 ```powershell
+Copy-Item backend\.env.example backend\.env
+```
+
+然后用编辑器打开 `backend/.env`，填入你的真实值：
+
+```dotenv
+# 数据库（必填，改成你的真实密码）
+DOCFUSION_DATABASE_URL=postgresql+psycopg://postgres:你的密码@127.0.0.1:5432/docfusion_copilot
+
+# LLM（可选，不填则回退到本地规则）
+DOCFUSION_OPENAI_API_KEY=sk-xxx
+DOCFUSION_OPENAI_BASE_URL=https://your-openai-compatible-endpoint/v1
+DOCFUSION_OPENAI_MODEL=gpt-4o-mini
+```
+
+> `.env` 文件已被 `.gitignore` 排除，不会被提交到仓库。
+
+完整变量列表见 `.env.example`。
+
+#### 4.2 备选：手动设置 PowerShell 环境变量
+
+如果不想用 `.env` 文件，也可以在当前终端手动设置（仅对当前会话生效）：
+
+```powershell
+# 数据库
 $env:DOCFUSION_DATABASE_URL="postgresql+psycopg://postgres:postgres@127.0.0.1:5432/docfusion_copilot"
-$env:DOCFUSION_DATABASE_ECHO="false"
-```
 
-如果你的 PostgreSQL 密码不是 `postgres`，请把连接串中的密码改成真实值。
-
-#### 4.2 CORS
-
-如果前端本地跑在 Vite 默认端口，通常这样就够了：
-
-```powershell
-$env:DOCFUSION_CORS_ALLOW_ORIGINS="http://localhost:5173,http://127.0.0.1:5173"
-$env:DOCFUSION_CORS_ALLOW_METHODS="*"
-$env:DOCFUSION_CORS_ALLOW_HEADERS="*"
-$env:DOCFUSION_CORS_ALLOW_CREDENTIALS="false"
-```
-
-#### 4.3 OpenAI-compatible，可选
-
-如果当前先不接模型，这一步可以跳过，后端会回退到本地规则逻辑。
-
-```powershell
+# LLM（可选）
 $env:DOCFUSION_OPENAI_API_KEY="your_api_key"
 $env:DOCFUSION_OPENAI_BASE_URL="https://your-openai-compatible-endpoint/v1"
-$env:DOCFUSION_OPENAI_MODEL="gpt-5-mini"
-$env:DOCFUSION_OPENAI_TIMEOUT_SECONDS="45"
+$env:DOCFUSION_OPENAI_MODEL="gpt-4o-mini"
+
+# CORS
+$env:DOCFUSION_CORS_ALLOW_ORIGINS="http://localhost:5173,http://127.0.0.1:5173"
 ```
 
-说明：
+#### 4.3 配置说明
+
+| 变量 | 必填 | 默认值 | 说明 |
+|---|---|---|---|
+| `DOCFUSION_DATABASE_URL` | 是 | `postgres:postgres@localhost:5432/docfusion_copilot` | PostgreSQL 连接串 |
+| `DOCFUSION_HOST` | 否 | `127.0.0.1` | 后端监听地址 |
+| `DOCFUSION_PORT` | 否 | `8000` | 后端监听端口 |
+| `DOCFUSION_MAX_WORKERS` | 否 | `4` | 异步任务线程池大小 |
+| `DOCFUSION_OPENAI_API_KEY` | 否 | 空 | OpenAI 兼容 API 密钥 |
+| `DOCFUSION_OPENAI_BASE_URL` | 否 | 空 | OpenAI 兼容 API 地址 |
+| `DOCFUSION_OPENAI_MODEL` | 否 | 空 | 模型名称 |
+| `DOCFUSION_OPENAI_TIMEOUT_SECONDS` | 否 | `90` | LLM 请求超时（秒） |
+| `DOCFUSION_CORS_ALLOW_ORIGINS` | 否 | `localhost:3000,5173,8080` | 允许跨域的前端源 |
 
 - 不配置 OpenAI 也可运行，系统会使用本地规则完成解析、匹配和回填
-- 配置后，`agent/chat`、文档摘要和模板文档匹配会优先尝试调用 OpenAI-compatible 接口
-- 仓库只保留接口模板，不内置真实 `api_key` 和 `base_url`
-- 后端已启用 `CORSMiddleware`，默认放行常见本地开发源：`3000 / 5173 / 8080`
+- 配置后，`agent/chat`、文档摘要和模板文档匹配会优先尝试调用 LLM
+- 仓库只保留 `.env.example`，不内置真实 `api_key`
 
 ### 5. 启动后端
 

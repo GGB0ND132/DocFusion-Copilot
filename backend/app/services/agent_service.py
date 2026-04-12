@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from datetime import datetime, timezone
 
-from app.core.catalog import FIELD_ALIASES, INTENT_KEYWORDS
+from app.core.catalog import DB_STORE_INTENTS, FIELD_ALIASES, INTENT_KEYWORDS, PLACEHOLDER_ENTITIES, TEMPLATE_TARGET_INTENTS
 from app.core.logging import ErrorCode, get_logger, log_operation
 from app.core.openai_client import OpenAIClientError, OpenAICompatibleClient
 from app.models.domain import ConversationRecord
@@ -97,7 +97,7 @@ class AgentService:
         return []
 
     def _get_cached_history_ref(self, context_id: str) -> list[dict[str, str]]:
-        """???????????????    Return a mutable cached history reference."""
+        """返回可变的缓存历史引用。    Return a mutable cached history reference."""
         history = self._conversations.get(context_id)
         if history is not None:
             return history
@@ -177,17 +177,18 @@ class AgentService:
             preview_facts = self._preview_facts(fields, entities)
             result = {
                 "intent": intent,
-                "entities": entities or (["城市"] if "城市" in message else []),
+                "entities": entities or ([e for e in PLACEHOLDER_ENTITIES if e in message][:1]),
                 "fields": fields,
                 "target": str(
                     plan.get("target")
                     or ("uploaded_template" if intent == "extract_and_fill_template" else "fact_store")
                 ),
-                "need_db_store": bool(plan.get("need_db_store", intent in {"extract_and_fill_template", "extract_facts"})),
+                "need_db_store": bool(plan.get("need_db_store", intent in DB_STORE_INTENTS)),
                 "context_id": context_id,
                 "preview": preview_facts,
                 "edits": edits,
                 "planner": "openai" if plan.get("planner") == "openai" else "rules",
+                "original_message": message,
             }
 
             if context_id and store_preview_message:
@@ -196,7 +197,7 @@ class AgentService:
             return result
 
     def record_execution_result(self, context_id: str | None, summary: str) -> None:
-        """灏嗘墽琛岀殑鏈€缁堝洖澶嶅悓姝ュ埌瀵硅瘽璁板綍銆?
+        """将执行的最终回复同步到对话记录。
         Persist the final execution reply into the conversation history.
         """
 
@@ -217,9 +218,13 @@ class AgentService:
 
         if self._openai_client.is_configured:
             try:
-                return self._plan_with_openai_llm(message, context_id=context_id)
-            except OpenAIClientError:
-                pass
+                plan = self._plan_with_openai_llm(message, context_id=context_id)
+                self._logger.info("LLM planner succeeded, intent=%s", plan.get("intent"))
+                return plan
+            except OpenAIClientError as exc:
+                self._logger.warning("LLM planner failed, falling back to rules: %s", exc)
+        else:
+            self._logger.warning("OpenAI client not configured, using rule-based planner")
         return self._fallback_plan(message)
 
     def _plan_with_openai_legacy(self, message: str, *, context_id: str | None = None) -> dict[str, object]:
@@ -233,12 +238,14 @@ class AgentService:
                 "请把用户消息转换成稳定、简洁、可执行的 JSON 计划。"
                 "intent 只能从以下值中选择："
                 "extract_facts, query_facts, extract_and_fill_template, trace_fact, edit_document, summarize_document, reformat_document, query_status, general_qa, extract_fields, export_results。\n\n"
+                "关键区分：'XX说了什么/有什么内容'→summarize_document；'XX的YY是多少'→query_facts；'XX怎么样'→general_qa。\n\n"
                 "以下是典型示例：\n"
                 '用户：帮我智能填表 → {"intent":"extract_and_fill_template","entities":[],"fields":[],"target":"uploaded_template","need_db_store":true,"edits":[]}\n'
                 '用户：查一下上海的GDP → {"intent":"query_facts","entities":["上海"],"fields":["GDP总量"],"target":"fact_store","need_db_store":false,"edits":[]}\n'
+                '用户：这份报告说了什么 → {"intent":"summarize_document","entities":[],"fields":[],"target":"fact_store","need_db_store":false,"edits":[]}\n'
+                '用户：请总结这份文档 → {"intent":"summarize_document","entities":[],"fields":[],"target":"fact_store","need_db_store":false,"edits":[]}\n'
                 '用户：将南京甲公司替换为南京采购中心 → {"intent":"edit_document","entities":[],"fields":[],"target":"fact_store","need_db_store":false,"edits":[{"old_text":"南京甲公司","new_text":"南京采购中心"}]}\n'
                 '用户：删除文档中的山东省 → {"intent":"edit_document","entities":[],"fields":[],"target":"fact_store","need_db_store":false,"edits":[{"old_text":"山东省","new_text":""}]}\n'
-                '用户：请总结这份文档 → {"intent":"summarize_document","entities":[],"fields":[],"target":"fact_store","need_db_store":false,"edits":[]}\n'
                 '用户：请帮我整理一下格式 → {"intent":"reformat_document","entities":[],"fields":[],"target":"fact_store","need_db_store":false,"edits":[]}\n'
                 '用户：从这些报告中提取各城市的常住人口和GDP数据 → {"intent":"extract_facts","entities":["城市"],"fields":["常住人口","GDP总量"],"target":"fact_store","need_db_store":true,"edits":[]}\n'
                 '用户：追溯fact_001的来源 → {"intent":"trace_fact","entities":[],"fields":[],"target":"fact_store","need_db_store":false,"edits":[]}\n'
@@ -285,32 +292,42 @@ class AgentService:
                 "允许的 intent 值：small_talk, extract_facts, query_facts, "
                 "extract_and_fill_template, trace_fact, edit_document, summarize_document, "
                 "reformat_document, query_status, general_qa, extract_fields, export_results。\n\n"
-                "intent 使用规则：\n"
-                "- small_talk: 寒暄、问好、感谢、问你能做什么\n"
-                "- summarize_document: 总结、概括、摘要相关请求\n"
-                "- general_qa: 针对文档的开放性问答（如XX的空气质量怎么样、XX有什么数据）\n"
-                "- extract_and_fill_template: 模板回填、表格填充、智能填表\n"
-                "- query_facts: 查询特定实体的特定字段值\n"
-                "- extract_facts: 从文档中抽取新事实\n"
-                "- edit_document: 文本替换或删除\n"
-                "- extract_fields: 提取指定字段导出\n"
-                "- export_results: 导出为文件\n"
-                "- reformat_document: 排版整理\n"
-                "- query_status: 查询系统状态\n\n"
-                "entities 和 fields 只填用户明确提到的，保持简短。\n\n"
+                "## intent 判断优先级（按顺序检查）\n"
+                "1. small_talk: 寒暄、问好、感谢、问你能做什么\n"
+                "2. extract_and_fill_template: 明确提到模板回填、表格填充、智能填表\n"
+                "3. edit_document: 明确要求替换、删除、修改文本内容\n"
+                "4. query_facts: 查询、统计、列出特定实体或字段的数值数据（如'上海的GDP是多少'、'统计产品产量'、'写一个表格统计XX'）\n"
+                "5. summarize_document: 要求总结、概括、摘要，或问'XX说了什么/讲了什么/有什么内容/主要内容'\n"
+                "6. general_qa: 针对文档内容的开放性问答（如'XX怎么样''有什么特点'）\n"
+                "7. extract_facts: 明确要求从文档中抽取/提取事实\n"
+                "8. extract_fields: 要求提取指定字段\n"
+                "9. export_results: 导出为文件\n"
+                "10. reformat_document: 排版、格式整理\n"
+                "11. query_status: 查询系统状态\n\n"
+                "## 关键区分\n"
+                "- 'XX说了什么/讲了什么/有什么内容' → summarize_document（不是 query_facts）\n"
+                "- 'XX的YY是多少'（有明确实体+字段） → query_facts\n"
+                "- '统计/列出/写一个表格统计XX的YY' → query_facts（即使没有'查'或'是多少'也算）\n"
+                "- 'XX怎么样/情况如何' → general_qa\n"
+                "- entities/fields 只填用户明确提到的，保持简短。\n\n"
                 "── 示例 ──\n"
                 '用户：你好 → {"intent":"small_talk","entities":[],"fields":[],"target":"fact_store","need_db_store":false,"edits":[]}\n'
                 '用户：你能做什么 → {"intent":"small_talk","entities":[],"fields":[],"target":"fact_store","need_db_store":false,"edits":[]}\n'
                 '用户：帮我总结一下这些文档 → {"intent":"summarize_document","entities":[],"fields":[],"target":"fact_store","need_db_store":false,"edits":[]}\n'
                 '用户：总结山东省的空气质量 → {"intent":"summarize_document","entities":["山东"],"fields":["空气质量"],"target":"fact_store","need_db_store":false,"edits":[]}\n'
+                '用户：这份报告说了什么 → {"intent":"summarize_document","entities":[],"fields":[],"target":"fact_store","need_db_store":false,"edits":[]}\n'
+                '用户：2023年文化和旅游发展统计公报.md说了什么 → {"intent":"summarize_document","entities":[],"fields":[],"target":"fact_store","need_db_store":false,"edits":[]}\n'
+                '用户：这个文档有什么内容 → {"intent":"summarize_document","entities":[],"fields":[],"target":"fact_store","need_db_store":false,"edits":[]}\n'
                 '用户：山东省环境空气质量怎么样 → {"intent":"general_qa","entities":["山东"],"fields":["空气质量"],"target":"fact_store","need_db_store":false,"edits":[]}\n'
                 '用户：COVID-19确诊人数有多少 → {"intent":"general_qa","entities":[],"fields":["确诊人数"],"target":"fact_store","need_db_store":false,"edits":[]}\n'
                 '用户：查一下上海的GDP → {"intent":"query_facts","entities":["上海"],"fields":["GDP总量"],"target":"fact_store","need_db_store":false,"edits":[]}\n'
+                '用户：北京2023年的人口是多少 → {"intent":"query_facts","entities":["北京"],"fields":["人口"],"target":"fact_store","need_db_store":false,"edits":[]}\n'
+                '用户：写一个表格统计主要产品产量及增长情况 → {"intent":"query_facts","entities":[],"fields":["产品产量","增长"],"target":"fact_store","need_db_store":false,"edits":[]}\n'
+                '用户：列出各城市的GDP和人口数据 → {"intent":"query_facts","entities":["城市"],"fields":["GDP","人口"],"target":"fact_store","need_db_store":false,"edits":[]}\n'
                 '用户：帮我智能填表 → {"intent":"extract_and_fill_template","entities":[],"fields":[],"target":"uploaded_template","need_db_store":true,"edits":[]}\n'
                 '用户：帮我用这些数据回填模板 → {"intent":"extract_and_fill_template","entities":[],"fields":[],"target":"uploaded_template","need_db_store":true,"edits":[]}\n'
                 '用户：将南京甲公司替换为南京采购中心 → {"intent":"edit_document","entities":[],"fields":[],"target":"fact_store","need_db_store":false,"edits":[{"old_text":"南京甲公司","new_text":"南京采购中心"}]}\n'
                 '用户：删除文档中的山东省 → {"intent":"edit_document","entities":[],"fields":[],"target":"fact_store","need_db_store":false,"edits":[{"old_text":"山东省","new_text":""}]}\n'
-                '用户：把甲方删掉 → {"intent":"edit_document","entities":[],"fields":[],"target":"fact_store","need_db_store":false,"edits":[{"old_text":"甲方","new_text":""}]}\n'
                 '用户：从这些报告中提取各城市的常住人口和GDP数据 → {"intent":"extract_facts","entities":["城市"],"fields":["常住人口","GDP总量"],"target":"fact_store","need_db_store":true,"edits":[]}\n'
                 '用户：提取所有城市的GDP和人均收入字段 → {"intent":"extract_fields","entities":["城市"],"fields":["GDP总量","人均收入"],"target":"fact_store","need_db_store":false,"edits":[]}\n'
                 '用户：把提取结果导出为xlsx → {"intent":"export_results","entities":[],"fields":[],"target":"fact_store","need_db_store":false,"edits":[]}\n'
@@ -347,21 +364,32 @@ class AgentService:
         intent = str(payload.get("intent", "general_qa")).strip() or "general_qa"
         if intent not in _ALLOWED_INTENTS:
             intent = "general_qa"
+        # ── 本地规则纠偏：LLM 可能误判，用关键词规则做二次检查 ──
+        if intent == "general_qa":
+            local_intent = self._infer_intent(message)
+            if local_intent != "general_qa":
+                intent = local_intent
         return {
             "intent": intent,
             "entities": [str(entity).strip() for entity in payload.get("entities", []) if str(entity).strip()],
             "fields": [str(field).strip() for field in payload.get("fields", []) if str(field).strip()],
             "target": str(
                 payload.get("target")
-                or ("uploaded_template" if intent == "extract_and_fill_template" else "fact_store")
+                or ("uploaded_template" if intent in TEMPLATE_TARGET_INTENTS else "fact_store")
             ),
             "need_db_store": bool(
-                payload.get("need_db_store", intent in {"extract_and_fill_template", "extract_facts"})
+                payload.get("need_db_store", intent in DB_STORE_INTENTS)
             ),
             "edits": self._normalize_edits(payload.get("edits", [])),
             "planner": "openai",
             "original_message": message,
         }
+
+    # Patterns that always indicate summarize_document, regardless of other keywords
+    _SUMMARIZE_PATTERNS = (
+        "说了什么", "讲了什么", "写了什么", "主要讲什么",
+        "内容是什么", "有什么内容", "主要内容", "概括一下",
+    )
 
     def _infer_intent(self, message: str) -> str:
         """根据关键词规则推断最匹配的意图。    Infer the best-matching intent from keyword rules."""
@@ -371,6 +399,12 @@ class AgentService:
             return "edit_document"
         if self._is_small_talk(message):
             return "small_talk"
+
+        # High-priority: "说了什么" type queries always → summarize
+        if any(keyword in message for keyword in self._SUMMARIZE_PATTERNS):
+            return "summarize_document"
+        if any(keyword in message for keyword in ("摘要", "总结", "概述")):
+            return "summarize_document"
 
         lowered = message.lower()
         best_intent: str | None = None
@@ -382,21 +416,6 @@ class AgentService:
                     best_intent = intent
         if best_intent is not None:
             return best_intent
-        if any(
-            keyword in message
-            for keyword in (
-                "\u8bf4\u4e86\u4ec0\u4e48",
-                "\u8bb2\u4e86\u4ec0\u4e48",
-                "\u5199\u4e86\u4ec0\u4e48",
-                "\u4e3b\u8981\u8bb2\u4ec0\u4e48",
-                "\u5185\u5bb9\u662f\u4ec0\u4e48",
-            )
-        ):
-            return "summarize_document"
-        if any(keyword in message for keyword in ("摘要", "总结", "概述")):
-            return "summarize_document"
-        if any(keyword in message for keyword in ("排版", "格式", "整理", "规范", "重排", "清理")):
-            return "reformat_document"
         return "general_qa"
 
     def _fallback_plan(self, message: str) -> dict[str, object]:
@@ -407,8 +426,8 @@ class AgentService:
             "intent": intent,
             "entities": find_entity_mentions(message),
             "fields": self._infer_fields(message),
-            "target": "uploaded_template" if intent == "extract_and_fill_template" else "fact_store",
-            "need_db_store": intent in {"extract_and_fill_template", "extract_facts"},
+            "target": "uploaded_template" if intent in TEMPLATE_TARGET_INTENTS else "fact_store",
+            "need_db_store": intent in DB_STORE_INTENTS,
             "edits": self._infer_edits(message),
             "planner": "rules",
             "original_message": message,
@@ -456,7 +475,7 @@ class AgentService:
         return cleaned.strip(_QUOTE_CHARS).strip()
 
     def _is_small_talk(self, message: str) -> bool:
-        """鍒ゆ柇娑堟伅鏄惁灞炰簬瀵掓殏銆佹眰鍔╂垨绠€鍗曢棽鑱娿€?
+        """判断消息是否属于寒暄、求助或简单闲聊。
         Determine whether a message is a greeting, help request, or light chit-chat.
         """
 
@@ -467,7 +486,7 @@ class AgentService:
         return any(keyword in lowered or keyword in message for keyword in _SMALL_TALK_CONTAINS)
 
     def _build_preview_message(self, result: dict[str, object]) -> str:
-        """涓虹粨鏋勫寲璁″垝鐢熸垚鏇磋嚜鐒剁殑瀵硅瘽棰勮銆?
+        """为结构化计划生成更自然的对话预览。
         Build a more natural assistant preview message for a structured plan.
         """
 

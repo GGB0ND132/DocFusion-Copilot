@@ -40,14 +40,47 @@ async function parseError(response: Response): Promise<never> {
   throw new ApiError(message, response.status, detail);
 }
 
+const _etagCache = new Map<string, { etag: string; data: unknown }>();
+
 export async function requestJson<T>(path: string, options: RequestOptions = {}): Promise<T> {
-  const response = await fetch(buildApiUrl(path), options);
+  const url = buildApiUrl(path);
+  const method = (options.method ?? 'GET').toUpperCase();
+
+  // Attach cached ETag for GET requests
+  const headers: Record<string, string> = {};
+  if (method === 'GET') {
+    const cached = _etagCache.get(url);
+    if (cached) {
+      headers['If-None-Match'] = cached.etag;
+    }
+  }
+
+  const response = await fetch(url, {
+    ...options,
+    headers: { ...headers, ...(options.headers as Record<string, string> | undefined) },
+  });
+
+  // 304 Not Modified — return cached data
+  if (response.status === 304) {
+    const cached = _etagCache.get(url);
+    if (cached) return cached.data as T;
+  }
 
   if (!response.ok) {
     return parseError(response);
   }
 
-  return (await response.json()) as T;
+  const data = (await response.json()) as T;
+
+  // Cache ETag for GET responses
+  if (method === 'GET') {
+    const etag = response.headers.get('etag');
+    if (etag) {
+      _etagCache.set(url, { etag, data });
+    }
+  }
+
+  return data;
 }
 
 export async function requestFile(path: string, options: RequestOptions = {}): Promise<{ blob: Blob; fileName: string }> {

@@ -222,6 +222,13 @@ class PostgresRepository:
             session.flush()
             return self._task_from_row(row)
 
+    def delete_facts_by_doc_id(self, doc_id: str) -> int:
+        """删除指定文档的全部事实记录，返回删除条数。"""
+        with self._session() as session:
+            stmt = delete(FactRow).where(FactRow.source_doc_id == doc_id)
+            result = session.execute(stmt)
+            return result.rowcount  # type: ignore[return-value]
+
     def add_facts(self, facts: list[FactRecord]) -> list[FactRecord]:
         """批量保存事实记录。
         Persist fact records in batch.

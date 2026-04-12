@@ -28,6 +28,28 @@
     background: hsl(var(--background));
     font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
   }
+
+  .dark {
+    --background: 220 20% 10%;
+    --foreground: 40 20% 90%;
+    --card: 220 18% 13%;
+    --card-foreground: 40 20% 90%;
+    --popover: 220 18% 13%;
+    --popover-foreground: 40 20% 90%;
+    --primary: 174 60% 40%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 220 14% 18%;
+    --secondary-foreground: 40 20% 90%;
+    --muted: 220 14% 18%;
+    --muted-foreground: 220 8% 56%;
+    --accent: 36 80% 50%;
+    --accent-foreground: 0 0% 100%;
+    --destructive: 0 62% 50%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 220 12% 20%;
+    --input: 220 12% 20%;
+    --ring: 174 60% 40%;
+  }
 }
 
 body {

@@ -27,6 +27,13 @@ export interface PaginatedBlocksResponse {
   limit: number | null;
 }
 
+export interface PaginatedFactsResponse {
+  items: FactResponse[];
+  total: number;
+  offset: number;
+  limit: number;
+}
+
 export interface FactResponse {
   fact_id: string;
   entity_type: string;
@@ -135,6 +142,29 @@ export interface AgentExecuteResponse {
   task_id?: string | null;
   task_status?: string | null;
   template_name?: string | null;
+}
+
+// ── Template suggest types ──
+
+export interface SuggestDocumentCandidate {
+  doc_id: string;
+  file_name: string;
+  score: number;
+  field_hits: string[];
+  entity_hits: string[];
+  keyword_hits: string[];
+  recommended: boolean;
+}
+
+export interface SuggestDocumentsResponse {
+  template_profile: {
+    template_name: string;
+    field_names: string[];
+    entity_names: string[];
+  };
+  candidates: SuggestDocumentCandidate[];
+  match_reason?: string;
+  message?: string;
 }
 
 export interface DownloadFileResult {

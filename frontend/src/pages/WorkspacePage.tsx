@@ -27,6 +27,7 @@ export default function WorkspacePage() {
   const [documents, setDocuments] = useState<DocumentResponse[]>([]);
   const [selectedDocId, setSelectedDocId] = useState<string | null>(null);
   const [facts, setFacts] = useState<FactResponse[]>([]);
+  const [factsTotal, setFactsTotal] = useState(0);
   const [isUploading, setIsUploading] = useState(false);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
 
@@ -50,13 +51,18 @@ export default function WorkspacePage() {
     }
   }, [uploadedDocuments.length]);
 
-  // Load facts when a document is selected
+  // Load facts when a document is selected (with stale-request guard)
   useEffect(() => {
     if (!selectedDocId) {
       setFacts([]);
+      setFactsTotal(0);
       return;
     }
-    getDocumentFacts(selectedDocId).then(setFacts).catch(() => {});
+    let cancelled = false;
+    getDocumentFacts(selectedDocId).then((res) => {
+      if (!cancelled) { setFacts(res.items); setFactsTotal(res.total); }
+    }).catch(() => {});
+    return () => { cancelled = true; };
   }, [selectedDocId]);
 
   const handleUpload = useCallback(
@@ -148,7 +154,7 @@ export default function WorkspacePage() {
   return (
     <ResizablePanelGroup className="h-full">
       {/* ── Left: File Tree ── */}
-      <ResizablePanel defaultSize={20} minSize={12}>
+      <ResizablePanel defaultSize={22} minSize={12}>
       <div className="flex h-full flex-col bg-card">
         <div className="flex items-center justify-between border-b px-3 py-2">
           <span className="text-sm font-medium flex items-center gap-1.5">
@@ -193,7 +199,7 @@ export default function WorkspacePage() {
         <Separator />
 
         {/* File list */}
-        <ScrollArea className="flex-1">
+        <div className="flex-1 overflow-y-auto overflow-x-hidden">
           <div className="p-2 space-y-0.5">
             {documents.length === 0 && (
               <p className="px-2 py-4 text-center text-xs text-muted-foreground">暂无文档</p>
@@ -210,7 +216,7 @@ export default function WorkspacePage() {
             {documents.map((doc) => (
               <div
                 key={doc.doc_id}
-                className={`group flex w-full min-w-0 items-center gap-1.5 overflow-hidden rounded-md px-2 py-1.5 text-left text-sm transition-colors hover:bg-muted ${
+                className={`flex w-full min-w-0 items-center gap-1.5 rounded-md px-2 py-1.5 text-left text-sm transition-colors hover:bg-muted ${
                   selectedDocId === doc.doc_id ? 'bg-muted font-medium' : ''
                 }`}
               >
@@ -235,7 +241,7 @@ export default function WorkspacePage() {
                 <span
                   role="button"
                   tabIndex={0}
-                  className="shrink-0 rounded p-0.5 text-muted-foreground opacity-0 transition-opacity hover:text-destructive group-hover:opacity-100"
+                  className="shrink-0 rounded p-0.5 text-muted-foreground/40 hover:text-destructive transition-colors"
                   onClick={(e) => {
                     e.stopPropagation();
                     handleDelete(doc.doc_id, doc.file_name);
@@ -252,7 +258,7 @@ export default function WorkspacePage() {
               </div>
             ))}
           </div>
-        </ScrollArea>
+        </div>
 
         {currentDocumentSetId && (
           <div className="border-t px-3 py-1.5 text-[10px] text-muted-foreground truncate">
@@ -265,7 +271,7 @@ export default function WorkspacePage() {
       <ResizableHandle withHandle />
 
       {/* ── Middle: Document Preview ── */}
-      <ResizablePanel defaultSize={50} minSize={25}>
+      <ResizablePanel defaultSize={48} minSize={25}>
       <div className="flex h-full flex-col">
         <div className="flex items-center gap-2 border-b px-4 py-2">
           <Eye className="h-4 w-4 text-muted-foreground" />
@@ -352,7 +358,7 @@ export default function WorkspacePage() {
                     <InfoRow label="类型" value={selectedDoc.doc_type.toUpperCase()} />
                     <InfoRow label="状态" value={selectedDoc.status} />
                     <InfoRow label="文档 ID" value={selectedDoc.doc_id} />
-                    <InfoRow label="事实数" value={String(facts.length)} />
+                    <InfoRow label="事实数" value={factsTotal > facts.length ? `${facts.length} / ${factsTotal}` : String(facts.length)} />
                     <Separator />
                     <InfoRow label="上传时间" value={selectedDoc.upload_time} />
                   </>
@@ -383,7 +389,7 @@ function FileIcon({ docType }: { docType: string }) {
 }
 
 function StatusDot({ status }: { status: string }) {
-  const color = status === 'parsed' ? 'bg-green-500' : status === 'parsing' ? 'bg-amber-400' : status === 'failed' ? 'bg-red-500' : 'bg-gray-300';
+  const color = status === 'parsed' ? 'bg-green-500' : status === 'parsing' ? 'bg-amber-400' : status === 'failed' ? 'bg-red-500' : 'bg-gray-300 dark:bg-gray-600';
   return <span className={`inline-block h-2 w-2 rounded-full ${color}`} />;
 }
 

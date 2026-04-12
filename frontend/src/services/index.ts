@@ -3,7 +3,7 @@ export { runAgentExecute, downloadAgentArtifact, clearAgentConversation, listCon
 export { listDocuments, getDocumentBlocks, getDocumentFacts, deleteDocument, batchDeleteDocuments, getDocumentRawUrl } from '@/services/documentDetails';
 export { uploadDocumentBatch } from '@/services/documents';
 export { getTaskStatus } from '@/services/tasks';
-export { downloadTemplateResult } from '@/services/templates';
+export { suggestDocuments, downloadTemplateResult } from '@/services/templates';
 export { getFactTrace } from '@/services/trace';
 export type {
   AgentExecuteRequest,
@@ -20,5 +20,7 @@ export type {
   FilledCellResponse,
   PaginatedBlocksResponse,
   TaskResponse,
+  SuggestDocumentCandidate,
+  SuggestDocumentsResponse,
   TemplateResultResponse,
 } from '@/services/types';

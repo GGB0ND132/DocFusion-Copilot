@@ -72,13 +72,59 @@ class OpenAICompatibleClient:
                     "type": "json_schema",
                     "json_schema": {"name": "docfusion_response", "schema": json_schema},
                 }
-            response = self._raw_client.chat.completions.create(**kwargs)
+            try:
+                response = self._raw_client.chat.completions.create(**kwargs)
+            except APIError as first_err:
+                # 部分模型（如 deepseek-chat）不支持 json_schema，降级为 json_object
+                if json_schema is not None and "response_format" in str(first_err):
+                    logger.info("json_schema not supported, falling back to json_object")
+                    kwargs["response_format"] = {"type": "json_object"}
+                    # 将 schema 要求追加到 system prompt 中，确保输出结构
+                    schema_hint = f"\n\n请严格按此 JSON schema 输出：{json.dumps(json_schema, ensure_ascii=False)}"
+                    messages[0]["content"] += schema_hint
+                    response = self._raw_client.chat.completions.create(**kwargs)
+                else:
+                    raise
+            if not response.choices:
+                raise OpenAIClientError("OpenAI API returned empty choices")
             content = response.choices[0].message.content or ""
+            # 推理模型可能返回 <think>...</think> 前缀，剥离后再解析 JSON
+            import re as _re
+            content = _re.sub(r"<think>[\s\S]*?</think>\s*", "", content).strip()
             return json.loads(content)
         except (APIError, APIConnectionError, APITimeoutError) as exc:
             raise OpenAIClientError(f"OpenAI API error: {exc}") from exc
         except json.JSONDecodeError as exc:
             raise OpenAIClientError(f"Invalid JSON from API: {exc}") from exc
+
+    # ── plain text completion (for code generation) ──
+    def create_text_completion(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        temperature: float = 0.0,
+    ) -> str:
+        """Return raw text completion without JSON parsing."""
+        if not self.is_configured or self._raw_client is None:
+            raise OpenAIClientError("OpenAI client is not configured.")
+        try:
+            response = self._raw_client.chat.completions.create(
+                model=self.model,
+                temperature=temperature,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+            )
+            if not response.choices:
+                raise OpenAIClientError("OpenAI API returned empty choices")
+            content = response.choices[0].message.content or ""
+            import re as _re
+            content = _re.sub(r"<think>[\s\S]*?</think>\s*", "", content).strip()
+            return content
+        except (APIError, APIConnectionError, APITimeoutError) as exc:
+            raise OpenAIClientError(f"OpenAI API error: {exc}") from exc
 
     # ── NEW: instructor structured completion ──
     def create_structured_completion(

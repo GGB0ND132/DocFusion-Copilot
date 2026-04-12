@@ -9,7 +9,7 @@ from app.schemas.facts import FactReviewRequest, FactTraceResponse
 router = APIRouter()
 
 
-@router.get("", response_model=list[FactResponse])
+@router.get("")
 def list_facts(
     entity_name: str | None = Query(default=None),
     field_name: str | None = Query(default=None),
@@ -17,12 +17,14 @@ def list_facts(
     min_confidence: float | None = Query(default=None, ge=0.0, le=1.0),
     canonical_only: bool = Query(default=False),
     document_ids: str | None = Query(default=None),
-) -> list[FactResponse]:
-    """按条件查询事实记录。
-    Query fact records with optional filters.
+    limit: int = Query(default=200, ge=1, le=2000, description="每页条数"),
+    offset: int = Query(default=0, ge=0, description="偏移量"),
+) -> dict:
+    """按条件查询事实记录（分页）。
+    Query fact records with optional filters (paginated).
     """
     parsed_document_ids = {item.strip() for item in (document_ids or "").split(",") if item.strip()} or None
-    facts = get_container().repository.list_facts(
+    all_facts = get_container().repository.list_facts(
         entity_name=entity_name,
         field_name=field_name,
         status=status,
@@ -30,7 +32,14 @@ def list_facts(
         canonical_only=canonical_only,
         document_ids=parsed_document_ids,
     )
-    return [FactResponse.model_validate(fact) for fact in facts]
+    total = len(all_facts)
+    page = all_facts[offset:offset + limit]
+    return {
+        "items": [FactResponse.model_validate(fact) for fact in page],
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+    }
 
 
 @router.get("/low-confidence", response_model=list[FactResponse])

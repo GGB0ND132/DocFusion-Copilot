@@ -279,7 +279,9 @@ class DocumentService:
             "输出要求",
             "填报说明",
         ]
-        return any(marker in preview for marker in instruction_markers) and "README" in file_name.upper()
+        if "README" in file_name.upper():
+            return True
+        return any(marker in preview for marker in instruction_markers)
 
     def _should_skip_fact_extraction(self, document: DocumentRecord) -> bool:
         """判断该文档是否应跳过事实抽取。

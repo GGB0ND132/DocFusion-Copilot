@@ -22,9 +22,43 @@ from app.utils.normalizers import (
 )
 
 _BRACKET_UNIT_RE = re.compile(r"[（(](.*?)[)）]")
-_GENERIC_NUMBER_RE = re.compile(r"(?P<value>-?\d[\d,]*(?:\.\d+)?)\s*(?P<unit>万亿元|亿元|万元|元|万人|人|%)?")
+_GENERIC_NUMBER_RE = re.compile(r"(?P<value>-?\d[\d,]*(?:\.\d+)?)\s*(?P<unit>万亿元|亿元|万元|元|万人|人|万|%)?")
 _DATE_RE = re.compile(r"(?P<date>(?:19|20)\d{2}[年/-]\d{1,2}[月/-]\d{1,2}日?)")
 _TEXT_VALUE_RE = re.compile(r"(?:为|是|:|：)\s*(?P<value>[^，。；;\n]{2,40})")
+# CJK-ASCII boundary space normalization
+_CJK_RANGE = r'\u4e00-\u9fff\u3400-\u4dbf'
+_COLLAPSE_SPACE_RE = re.compile(
+    rf'(?<=[{_CJK_RANGE}])\s+(?=[A-Za-z0-9%])|(?<=[A-Za-z0-9%])\s+(?=[{_CJK_RANGE}])'
+)
+
+# Unit compatibility: fields whose value should NOT be in '%'
+_MONETARY_UNITS = {'亿元', '万元', '元', '万亿元'}
+_POPULATION_UNITS = {'万人', '人', '万'}
+
+
+def _is_unit_compatible(canonical_name: str, detected_unit: str | None) -> bool:
+    """检查检测到的单位是否与字段的标准单位兼容。"""
+    if not detected_unit:
+        return True
+    canonical_unit = FIELD_CANONICAL_UNITS.get(canonical_name)
+    if not canonical_unit:
+        return True
+    # '%' is only valid for percentage fields
+    if detected_unit == '%' and canonical_unit != '%':
+        return False
+    # monetary unit for population field or vice versa
+    if canonical_unit in _MONETARY_UNITS and detected_unit in _POPULATION_UNITS:
+        return False
+    if canonical_unit in _POPULATION_UNITS and detected_unit in _MONETARY_UNITS:
+        return False
+    # Per-capita fields (canonical unit '元') should not match '亿元' or '万元'
+    # because per-capita values are typically small (tens of thousands), not billions.
+    if canonical_unit == '元' and detected_unit in {'亿元', '万亿元'}:
+        return False
+    # Population fields should not match '元' variants
+    if canonical_unit == '万人' and detected_unit in _MONETARY_UNITS:
+        return False
+    return True
 
 
 class FactExtractionService:
@@ -191,9 +225,13 @@ class FactExtractionService:
     def _extract_from_text(self, document: DocumentRecord, block: DocumentBlock) -> list[FactRecord]:
         """从自由文本段落或标题中抽取事实。    Extract facts from free-form paragraph or heading text."""
 
-        content = block.text
-        if not content:
+        original_content = block.text
+        if not original_content:
             return []
+
+        # Collapse spaces at CJK-ASCII boundaries so aliases like 'GDP总量'
+        # match text like 'GDP 总量' or '人均 GDP'.
+        content = _COLLAPSE_SPACE_RE.sub('', original_content)
 
         entity_positions = self._find_entity_positions(content, block.section_path)
         year = infer_year(content) or infer_year(document.file_name)
@@ -210,6 +248,8 @@ class FactExtractionService:
         for canonical_name, alias in alias_pairs:
             for match in re.finditer(re.escape(alias), content, flags=re.IGNORECASE):
                 if self._is_overlapping(match.start(), match.end(), occupied_spans):
+                    continue
+                if self._is_alias_part_of_longer_field(content, match, canonical_name):
                     continue
 
                 fact = self._build_text_fact(
@@ -258,10 +298,18 @@ class FactExtractionService:
                 return None
         else:
             value_num, detected_unit = self._find_numeric_after_alias(content, match.end())
+            # If forward-found unit is incompatible with this field, discard and try backward
+            if value_num is not None and not _is_unit_compatible(canonical_name, detected_unit):
+                value_num, detected_unit = None, None
+            if value_num is None:
+                value_num, detected_unit = self._find_numeric_before_alias(content, match.start())
+            # Validate backward result too
+            if value_num is not None and not _is_unit_compatible(canonical_name, detected_unit):
+                return None
             if value_num is None:
                 return None
             value_num, unit = convert_to_canonical_unit(canonical_name, value_num, detected_unit)
-            value_text = content[max(0, match.start() - 16) : min(len(content), match.end() + 24)].strip()
+            value_text = content[max(0, match.start() - 24) : min(len(content), match.end() + 24)].strip()
 
         confidence = 0.88 if entity_name else 0.72
         return FactRecord(
@@ -326,11 +374,39 @@ class FactExtractionService:
     def _find_numeric_after_alias(self, text: str, anchor_end: int) -> tuple[float | None, str | None]:
         """在字段别名后方查找最近数值。    Find the nearest numeric expression after a detected field alias."""
 
-        window = text[anchor_end : min(len(text), anchor_end + 36)]
+        window = text[anchor_end : min(len(text), anchor_end + 40)]
         match = _GENERIC_NUMBER_RE.search(window)
         if not match or match.group("value") is None:
             return None, None
         return float(match.group("value").replace(",", "")), match.group("unit")
+
+    def _find_numeric_before_alias(self, text: str, anchor_start: int) -> tuple[float | None, str | None]:
+        """在字段别名前方查找最近数值（中文常将数值置于字段名前）。
+        Find the nearest numeric expression before a detected field alias.
+        Chinese text often places values before field names, e.g. '56,708.71亿元的GDP总量'.
+        """
+
+        before_start = max(0, anchor_start - 40)
+        window = text[before_start:anchor_start]
+        matches = list(_GENERIC_NUMBER_RE.finditer(window))
+        if not matches:
+            return None, None
+        last = matches[-1]
+        value_str = last.group("value")
+        if value_str is None:
+            return None, None
+        num = float(value_str.replace(",", ""))
+        # Skip if it looks like a year (e.g. 2025)
+        if last.group("unit") is None and 1900 <= num <= 2100 and num == int(num):
+            if len(matches) >= 2:
+                last = matches[-2]
+                value_str = last.group("value")
+                if value_str is None:
+                    return None, None
+                num = float(value_str.replace(",", ""))
+            else:
+                return None, None
+        return num, last.group("unit")
 
     def _find_date_after_alias(self, text: str, anchor_end: int) -> str:
         """在字段别名后方查找日期值。    Find a date value after a detected field alias."""
@@ -365,6 +441,27 @@ class FactExtractionService:
 
         return any(start < existing_end and end > existing_start for existing_start, existing_end in spans)
 
+    def _is_alias_part_of_longer_field(self, content: str, match: re.Match[str], canonical_name: str) -> bool:
+        """检测短别名是否属于文本中另一个更长字段名的一部分。
+        Detect whether a short alias is embedded in a longer, different field name in the text.
+
+        Example: alias 'GDP' inside '人均GDP' should be skipped because '人均GDP' is a separate field.
+        Note: content has already been space-normalized, so '人均 GDP' becomes '人均GDP'.
+        """
+        context_start = max(0, match.start() - 8)
+        context_end = min(len(content), match.end() + 8)
+        context = content[context_start:context_end].lower()
+        matched_text = match.group().lower()
+        for other_canonical, other_aliases in FIELD_ALIASES.items():
+            if other_canonical == canonical_name:
+                continue
+            for other_alias in {other_canonical, *other_aliases}:
+                if len(other_alias) <= len(matched_text):
+                    continue
+                if matched_text in other_alias.lower() and other_alias.lower() in context:
+                    return True
+        return False
+
     def _extract_with_llm_fallback(self, document: DocumentRecord, blocks: list[DocumentBlock]) -> list[FactRecord]:
         """当规则引擎未抽取到事实时，使用 LLM 进行语义抽取。
         Use LLM to extract facts when the rule engine yields nothing.
@@ -377,17 +474,20 @@ class FactExtractionService:
         if not text_blocks:
             return []
 
-        preview = "\n".join(b.text[:300] for b in text_blocks[:8])[:3000]
+        preview = "\n".join(b.text[:400] for b in text_blocks[:20])[:6000]
         year = infer_year(preview) or infer_year(document.file_name)
 
         try:
             from app.core.openai_client import OpenAIClientError
             payload = self._openai_client.create_json_completion(
                 system_prompt=(
-                    "你是结构化信息抽取引擎。从给定文本中提取所有可量化的事实三元组。"
-                    "每条事实包含 entity_name（实体名，如城市/国家/公司）、field_name（指标名）、"
-                    "value（数值或文本值）、unit（单位，可为空）。"
-                    "只输出文本中明确给出的事实，不要编造。最多输出 30 条。"
+                    "你是高精度结构化信息抽取引擎。从给定文本中提取所有可量化的事实。\n"
+                    "严格规则：\n"
+                    "1. 每条事实必须包含 entity_name（实体名，如城市/国家/公司/人名等）、field_name（指标名）、value（原始数值，保留原文精度）、unit（原文单位）。\n"
+                    "2. value 必须是文本中明确出现的原始数值，不要做单位换算或四舍五入。\n"
+                    "3. 不同名称的指标是不同字段，即使含义相似也不要混淆。名称中含有'人均'、'总量'、'增速'等修饰词时，它们分别代表不同指标。\n"
+                    "4. entity_name 应使用文本中的实体简称（如城市名不带'市'后缀），不要使用文档名。\n"
+                    "5. 只输出文本中明确给出的数据，绝不编造。尽可能多地提取（最多200条）。\n"
                 ),
                 user_prompt=f"文档名: {document.file_name}\n\n文本内容:\n{preview}",
                 json_schema={
@@ -485,24 +585,38 @@ class FactExtractionService:
         if not text_blocks:
             return []
 
-        preview = "\n".join(b.text[:400] for b in text_blocks[:12])[:4000]
+        preview = "\n".join(b.text[:400] for b in text_blocks[:25])[:8000]
         year = infer_year(preview) or infer_year(document.file_name)
         entity_hint = ""
         if target_entities:
-            entity_hint = f"\n目标实体（优先匹配）: {', '.join(target_entities[:20])}"
+            entity_hint = f"\n目标实体列表（请为每个实体提取所有目标字段的值）:\n{', '.join(target_entities[:100])}"
+
+        # Build field-unit hints from catalog
+        field_unit_hints: list[str] = []
+        for field in target_fields[:50]:
+            canonical_unit = FIELD_CANONICAL_UNITS.get(field, "")
+            if canonical_unit:
+                field_unit_hints.append(f"  - {field}（标准单位: {canonical_unit}）")
+            else:
+                field_unit_hints.append(f"  - {field}")
+        fields_description = "\n".join(field_unit_hints)
 
         try:
             payload = self._openai_client.create_json_completion(
                 system_prompt=(
-                    "你是结构化信息定向抽取引擎。用户指定了需要提取的目标字段列表，"
-                    "请从给定文本中精确查找这些字段对应的数值或文本值。"
-                    "每条结果包含 entity_name（实体名）、field_name（必须使用用户给定的目标字段名）、"
-                    "value（数值或文本值）、unit（单位，可为空）。"
-                    "只输出文本中明确给出的数据，不要编造。如果某个目标字段在文本中找不到，不要输出。"
+                    "你是高精度结构化信息定向抽取引擎。\n"
+                    "严格规则：\n"
+                    "1. 从文本中精确查找用户指定的目标字段对应的数值。\n"
+                    "2. value 必须填写文本中原始出现的数值（保留原文精度），不要换算单位。\n"
+                    "3. unit 必须填写文本中该数值紧跟的原始单位。\n"
+                    "4. entity_name 应使用文本中的实体简称（如城市名不带'市'后缀）。\n"
+                    "5. field_name 必须严格使用下方目标字段列表中给出的名称，不要自创。\n"
+                    "6. 不同名称的指标是不同字段。注意每个目标字段旁标注的标准单位，它提示了该字段的量级和类型，帮助你区分相似指标。\n"
+                    "7. 只输出文本中明确给出的数据，绝不编造。为每个实体尽可能提取所有目标字段。\n"
                 ),
                 user_prompt=(
                     f"文档名: {document.file_name}\n"
-                    f"目标字段: {target_fields[:50]}"
+                    f"目标字段:\n{fields_description}"
                     f"{entity_hint}\n\n"
                     f"文本内容:\n{preview}"
                 ),
@@ -553,23 +667,32 @@ class FactExtractionService:
                 continue
 
             value_num, detected_unit = extract_numeric_with_unit(raw_value)
+            # Resolve field name to canonical form if possible
+            canonical_field = normalize_field_name(field)
+            resolved_field = canonical_field or field
+            if resolved_field.lower() not in target_set_lower:
+                resolved_field = field
+            # Convert to canonical unit using the resolved field name
+            final_unit = detected_unit or unit
+            if value_num is not None and canonical_field:
+                value_num, final_unit = convert_to_canonical_unit(canonical_field, value_num, final_unit)
             entity = normalize_entity_name(entity) or entity
 
             results.append(
                 FactRecord(
                     fact_id=new_id("fact"),
-                    entity_type=FIELD_ENTITY_TYPES.get(field, "generic"),
+                    entity_type=FIELD_ENTITY_TYPES.get(resolved_field, "generic"),
                     entity_name=entity,
-                    field_name=field,
+                    field_name=resolved_field,
                     value_num=value_num,
                     value_text=raw_value,
-                    unit=detected_unit or unit if value_num is not None else None,
+                    unit=final_unit if value_num is not None else None,
                     year=year,
                     source_doc_id=document.doc_id,
                     source_block_id=first_block_id,
                     source_span=preview[:200],
-                    confidence=0.78,
-                    status="pending_review",
+                    confidence=0.90,
+                    status="confirmed",
                     metadata={"extraction_method": "llm_targeted"},
                 )
             )

@@ -7,7 +7,12 @@ import type {
   DownloadFileResult,
 } from '@/services/types';
 
-export async function runAgentExecute(payload: AgentExecuteRequest): Promise<AgentExecuteResponse> {
+export async function runAgentExecute(
+  payload: AgentExecuteRequest,
+  options?: { signal?: AbortSignal },
+): Promise<AgentExecuteResponse> {
+  const signal = options?.signal;
+
   if (payload.templateFile) {
     const formData = new FormData();
     formData.append('message', payload.message);
@@ -30,6 +35,7 @@ export async function runAgentExecute(payload: AgentExecuteRequest): Promise<Age
     return requestJson<AgentExecuteResponse>('/api/v1/agent/execute', {
       method: 'POST',
       body: formData,
+      signal,
     });
   }
 
@@ -46,6 +52,7 @@ export async function runAgentExecute(payload: AgentExecuteRequest): Promise<Age
       fill_mode: payload.fillMode ?? 'canonical',
       auto_match: payload.autoMatch ?? true,
     }),
+    signal,
   });
 }
 
