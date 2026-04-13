@@ -26,12 +26,18 @@ class XlsxParser(DocumentParser):
         for sheet in workbook.sheets:
             if not sheet.rows:
                 continue
-            raw_headers = next((row.values for row in sheet.rows if any(cell.strip() for cell in row.values)), [])
+            header_index = next(
+                (i for i, row in enumerate(sheet.rows) if any(cell.strip() for cell in row.values)),
+                None,
+            )
+            if header_index is None:
+                continue
+            raw_headers = sheet.rows[header_index].values
             headers = self._normalize_headers(raw_headers)
             if not headers:
                 continue
 
-            for row in sheet.rows[1:]:
+            for row in sheet.rows[header_index + 1:]:
                 trimmed_values = self._trim_row_values(row.values, len(headers))
                 if not any(cell.strip() for cell in trimmed_values):
                     continue

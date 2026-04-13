@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import re
 import zipfile
 from dataclasses import dataclass
@@ -17,6 +18,20 @@ NS = {
 
 ET.register_namespace("", MAIN_NS)
 ET.register_namespace("r", WORKBOOK_REL_NS)
+ET.register_namespace("mc", "http://schemas.openxmlformats.org/markup-compatibility/2006")
+
+
+def _register_namespaces_from_xml(raw_xml: bytes) -> None:
+    """从原始 XML 中提取并注册所有命名空间前缀，确保重新序列化时保持一致。
+    Extract and register all namespace prefixes from raw XML so re-serialization preserves them.
+    """
+    for _event, elem in ET.iterparse(io.BytesIO(raw_xml), events=["start-ns"]):
+        prefix, uri = elem
+        if prefix:
+            try:
+                ET.register_namespace(prefix, uri)
+            except ValueError:
+                pass
 
 _CELL_REF_RE = re.compile(r"(?P<column>[A-Z]+)(?P<row>\d+)")
 
@@ -154,42 +169,28 @@ def apply_xlsx_updates(
     output_path: str | Path,
     updates: list[CellWrite],
 ) -> None:
-    """在保留未修改 ZIP 条目的前提下应用工作簿单元格更新。
-    Apply cell updates to a workbook while preserving untouched ZIP entries.
+    """使用 openpyxl 应用工作簿单元格更新，确保输出文件完全符合 OOXML 规范。
+    Apply cell updates to a workbook via openpyxl, producing a spec-compliant output.
     """
+    from openpyxl import load_workbook as _load_wb
+
     template_file = Path(template_path)
     destination_file = Path(output_path)
     destination_file.parent.mkdir(parents=True, exist_ok=True)
 
-    grouped_updates: dict[str, list[CellWrite]] = {}
+    wb = _load_wb(template_file)
+
     for update in updates:
-        grouped_updates.setdefault(update.sheet_name, []).append(update)
+        if update.sheet_name not in wb.sheetnames:
+            raise ValueError(f"Sheet '{update.sheet_name}' not found in workbook.")
+        ws = wb[update.sheet_name]
+        cell = ws[update.cell_ref.upper()]
+        if isinstance(update.value, (int, float)) and not isinstance(update.value, bool):
+            cell.value = update.value
+        else:
+            cell.value = str(update.value)
 
-    with zipfile.ZipFile(template_file, "r") as source_archive:
-        sheet_targets = dict(_load_sheet_targets(source_archive))
-        modified_entries: dict[str, bytes] = {}
-
-        for sheet_name, sheet_updates in grouped_updates.items():
-            sheet_target = sheet_targets.get(sheet_name)
-            if not sheet_target:
-                raise ValueError(f"Sheet '{sheet_name}' not found in workbook.")
-            root = ET.fromstring(source_archive.read(sheet_target))
-            sheet_data = root.find("main:sheetData", NS)
-            if sheet_data is None:
-                sheet_data = ET.SubElement(root, _q("sheetData"))
-
-            for update in sorted(sheet_updates, key=lambda item: split_cell_ref(item.cell_ref)):
-                row_index, _ = split_cell_ref(update.cell_ref)
-                row_el = _get_or_create_row(sheet_data, row_index)
-                cell_el = _get_or_create_cell(row_el, update.cell_ref.upper())
-                _set_cell_value(cell_el, update.value)
-
-            modified_entries[sheet_target] = ET.tostring(root, encoding="utf-8", xml_declaration=True)
-
-        with zipfile.ZipFile(destination_file, "w", compression=zipfile.ZIP_DEFLATED) as destination_archive:
-            for file_info in source_archive.infolist():
-                payload = modified_entries.get(file_info.filename, source_archive.read(file_info.filename))
-                destination_archive.writestr(file_info, payload)
+    wb.save(destination_file)
 
 
 def _load_shared_strings(archive: zipfile.ZipFile) -> list[str]:
@@ -212,15 +213,17 @@ def _load_sheet_targets(archive: zipfile.ZipFile) -> list[tuple[str, str]]:
     """
     workbook_root = ET.fromstring(archive.read("xl/workbook.xml"))
     rels_root = ET.fromstring(archive.read("xl/_rels/workbook.xml.rels"))
-    relations = {
-        relation.get("Id"): f"xl/{relation.get('Target')}"
-        for relation in rels_root.findall("rel:Relationship", NS)
-    }
+    relations = {}
+    for relation in rels_root.findall("rel:Relationship", NS):
+        target_path = relation.get("Target", "")
+        if not target_path.startswith("xl/"):
+            target_path = f"xl/{target_path}"
+        relations[relation.get("Id")] = target_path
 
     targets: list[tuple[str, str]] = []
     for sheet_el in workbook_root.findall("main:sheets/main:sheet", {"main": MAIN_NS}):
         relation_id = sheet_el.get(f"{{{WORKBOOK_REL_NS}}}id")
-        if not relation_id:
+        if not relation_id or relation_id not in relations:
             continue
         targets.append((sheet_el.get("name", "Sheet1"), relations[relation_id]))
     return targets
@@ -313,3 +316,72 @@ def _set_cell_value(cell_el: ET.Element, value: str | float | int) -> None:
     inline_str = ET.SubElement(cell_el, _q("is"))
     text_node = ET.SubElement(inline_str, _q("t"))
     text_node.text = str(value)
+
+
+MC_NS = "http://schemas.openxmlformats.org/markup-compatibility/2006"
+
+# Well-known OOXML namespace URIs that mc:Ignorable may reference.
+_OOXML_KNOWN_NS: dict[str, str] = {
+    "x14ac": "http://schemas.microsoft.com/office/spreadsheetml/2009/9/ac",
+    "xr": "http://schemas.microsoft.com/office/spreadsheetml/2014/revision",
+    "xr2": "http://schemas.microsoft.com/office/spreadsheetml/2015/revision2",
+    "xr3": "http://schemas.microsoft.com/office/spreadsheetml/2016/revision3",
+    "xr6": "http://schemas.microsoft.com/office/spreadsheetml/2014/revision6",
+    "xr10": "http://schemas.microsoft.com/office/spreadsheetml/2014/revision10",
+    "x16r2": "http://schemas.microsoft.com/office/spreadsheetml/2015/02/main",
+}
+
+
+def _patch_mc_ignorable(root: ET.Element, raw_xml: bytes) -> None:
+    """确保 mc:Ignorable 中列出的所有命名空间前缀都有对应的声明。
+    Ensure every prefix listed in mc:Ignorable has a matching xmlns declaration.
+
+    Python's ElementTree strips unused namespace declarations during
+    serialization. OOXML requires them to be present if referenced by
+    mc:Ignorable, otherwise Excel reports content problems.
+    """
+    ignorable = root.get(f"{{{MC_NS}}}Ignorable")
+    if not ignorable:
+        return
+
+    # Collect namespace URIs declared in the original XML
+    original_ns: dict[str, str] = {}
+    for _event, elem in ET.iterparse(io.BytesIO(raw_xml), events=["start-ns"]):
+        prefix, uri = elem
+        if prefix:
+            original_ns[prefix] = uri
+
+    # For each prefix in mc:Ignorable, ensure the root element carries its xmlns
+    for prefix in ignorable.split():
+        uri = original_ns.get(prefix) or _OOXML_KNOWN_NS.get(prefix)
+        if uri:
+            root.set(f"xmlns:{prefix}", uri)
+
+
+def _update_dimension(root: ET.Element, sheet_data: ET.Element) -> None:
+    """根据实际数据范围更新 worksheet 的 dimension 元素。
+    Update the worksheet dimension element to reflect the actual data range.
+    """
+    max_row = 0
+    max_col = 0
+    for row_el in sheet_data.findall("main:row", NS):
+        row_idx = int(row_el.get("r", "0"))
+        if row_idx > max_row:
+            max_row = row_idx
+        for cell_el in row_el.findall("main:c", NS):
+            ref = cell_el.get("r")
+            if ref:
+                _, col_idx = split_cell_ref(ref)
+                if col_idx > max_col:
+                    max_col = col_idx
+
+    if max_row == 0 or max_col == 0:
+        return
+
+    new_ref = f"A1:{index_to_column_letters(max_col)}{max_row}"
+    dim_el = root.find("main:dimension", NS)
+    if dim_el is not None:
+        dim_el.set("ref", new_ref)
+    else:
+        dim_el = ET.Element(_q("dimension"), {"ref": new_ref})
+        root.insert(0, dim_el)

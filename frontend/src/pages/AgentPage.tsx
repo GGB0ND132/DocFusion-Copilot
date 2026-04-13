@@ -18,12 +18,14 @@ import {
   AlertTriangle,
   MessageSquarePlus,
   Trash2,
-  PanelLeftClose,
-  PanelLeftOpen,
   Sparkles,
+<<<<<<< HEAD
   CheckSquare,
   Square,
   X,
+=======
+  Square,
+>>>>>>> 2552b228659033d875a73d402eceb5449821552e
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
@@ -45,12 +47,15 @@ import {
   createConversation,
   getConversation,
   deleteConversation,
+  suggestDocuments,
   type AgentExecuteResponse,
   type ConversationResponse,
   type DocumentResponse,
   type FilledCellResponse,
+  type SuggestDocumentCandidate,
   type TaskResponse,
 } from '@/services';
+import DocumentSelectDialog from '@/components/DocumentSelectDialog';
 
 export default function AgentPage() {
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -65,12 +70,23 @@ export default function AgentPage() {
 
   const [inputText, setInputText] = useState('');
   const [isExecuting, setIsExecuting] = useState(false);
+  const [thinkingStartTime, setThinkingStartTime] = useState<number | null>(null);
+  const abortControllerRef = useRef<AbortController | null>(null);
   const [templateFile, setTemplateFile] = useState<File | null>(null);
   const [fillTaskId, setFillTaskId] = useState<string | null>(null);
   const [fillTask, setFillTask] = useState<TaskResponse | null>(null);
   const [traceInput, setTraceInput] = useState('');
   const [availableDocuments, setAvailableDocuments] = useState<DocumentResponse[]>([]);
   const [documentsHydrated, setDocumentsHydrated] = useState(false);
+
+  // ── Document selection dialog state ──
+  const [docSelectOpen, setDocSelectOpen] = useState(false);
+  const [docSelectCandidates, setDocSelectCandidates] = useState<SuggestDocumentCandidate[]>([]);
+  const [docSelectTemplateName, setDocSelectTemplateName] = useState('');
+  const [docSelectFieldNames, setDocSelectFieldNames] = useState<string[]>([]);
+  const [pendingFillText, setPendingFillText] = useState('');
+  const [pendingFillContextId, setPendingFillContextId] = useState<string | null>(null);
+  const [pendingFillDocSetId, setPendingFillDocSetId] = useState<string | null>(null);
 
   const uploadedDocuments = useUiStore((s) => s.uploadedDocuments);
   const currentDocumentSetId = useUiStore((s) => s.currentDocumentSetId);
@@ -83,9 +99,12 @@ export default function AgentPage() {
   const startNewConversation = useUiStore((s) => s.startNewConversation);
   const removeConversationFromList = useUiStore((s) => s.removeConversationFromList);
 
+<<<<<<< HEAD
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [selectMode, setSelectMode] = useState(false);
   const [selectedConvIds, setSelectedConvIds] = useState<Set<string>>(new Set());
+=======
+>>>>>>> 2552b228659033d875a73d402eceb5449821552e
 
   const refreshAvailableDocuments = useCallback(async () => {
     const docs = await listDocuments();
@@ -144,6 +163,69 @@ export default function AgentPage() {
   const refreshConversations = useCallback(() => {
     listConversations().then(setConversationList).catch(() => {});
   }, [setConversationList]);
+
+  // ── Document selection confirm handler ──
+  const handleDocSelectConfirm = useCallback(async (selectedDocIds: string[]) => {
+    setDocSelectOpen(false);
+    if (!templateFile || selectedDocIds.length === 0) return;
+    const selectedNames = selectedDocIds
+      .map((id) => docSelectCandidates.find((c) => c.doc_id === id)?.file_name ?? id)
+      .join('、');
+    addAgentMessage({
+      role: 'assistant',
+      text: `已选择 ${selectedDocIds.length} 个源文档：${selectedNames}\n正在提交回填任务…`,
+      timestamp: Date.now(),
+    });
+    const ac = new AbortController();
+    abortControllerRef.current = ac;
+    setIsExecuting(true);
+    setThinkingStartTime(Date.now());
+    try {
+      const resp = await runAgentExecute({
+        message: pendingFillText,
+        contextId: pendingFillContextId ?? undefined,
+        documentSetId: pendingFillDocSetId ?? undefined,
+        documentIds: selectedDocIds,
+        autoMatch: false,
+        templateFile,
+        userRequirement: pendingFillText,
+      }, { signal: ac.signal });
+      if (resp.context_id && resp.context_id !== agentContextId) {
+        setAgentContextId(resp.context_id);
+      }
+      if (!resp.task_id) {
+        throw new Error('未返回模板回填任务 ID');
+      }
+      setFillTaskId(resp.task_id);
+      const task = await getTaskStatus(resp.task_id);
+      setFillTask(task);
+      upsertTaskSnapshot(task);
+      addAgentMessage({
+        role: 'assistant',
+        text: `模板回填任务已提交。\n模板：${resp.template_name}\n任务 ID：${resp.task_id}\n状态：${task.status}`,
+        timestamp: Date.now(),
+        taskId: resp.task_id,
+      });
+      refreshConversations();
+    } catch (err) {
+      if (err instanceof DOMException && err.name === 'AbortError') {
+        addAgentMessage({ role: 'assistant', text: '已中止回答。', timestamp: Date.now() });
+      } else {
+        const msg = err instanceof Error ? err.message : '模板回填失败';
+        addAgentMessage({ role: 'assistant', text: `错误：${msg}`, timestamp: Date.now() });
+        toast.error(msg);
+      }
+    } finally {
+      abortControllerRef.current = null;
+      setIsExecuting(false);
+      setThinkingStartTime(null);
+    }
+  }, [templateFile, pendingFillText, pendingFillContextId, pendingFillDocSetId, docSelectCandidates, agentContextId, setAgentContextId, addAgentMessage, upsertTaskSnapshot, refreshConversations]);
+
+  const handleDocSelectCancel = useCallback(() => {
+    setDocSelectOpen(false);
+    addAgentMessage({ role: 'assistant', text: '已取消模板回填。', timestamp: Date.now() });
+  }, [addAgentMessage]);
 
   const handleNewConversation = useCallback(() => {
     startNewConversation();
@@ -258,6 +340,13 @@ export default function AgentPage() {
     if (templateInputRef.current) templateInputRef.current.value = '';
   }, []);
 
+  const handleAbort = useCallback(() => {
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+      abortControllerRef.current = null;
+    }
+  }, []);
+
   const handleSend = useCallback(async () => {
     const text = inputText.trim();
     if (!text || isExecuting) return;
@@ -297,54 +386,11 @@ export default function AgentPage() {
       // Keep the locally derived scope if refresh fails.
     }
 
-    if (templateFile && runtimeParsedDocIds.length === 0) {
-      const warning = '当前还没有已解析的源文档。请先上传并完成原始文档解析，再回填模板。';
-      addAgentMessage({ role: 'assistant', text: warning, timestamp: Date.now() });
-      toast.info(warning);
-      return;
-    }
-
-    // If there's a template file, do template fill instead of agent execute
-    if (templateFile) {
-      setIsExecuting(true);
-      try {
-        const resp = await runAgentExecute({
-          message: text,
-          contextId: activeContextId ?? undefined,
-          documentSetId: runtimeDocumentSetId ?? undefined,
-          documentIds: runtimeParsedDocIds,
-          autoMatch: true,
-          templateFile,
-        });
-        if (resp.context_id && resp.context_id !== agentContextId) {
-          setAgentContextId(resp.context_id);
-        }
-        if (!resp.task_id) {
-          throw new Error('未返回模板回填任务 ID');
-        }
-        setFillTaskId(resp.task_id);
-        const task = await getTaskStatus(resp.task_id);
-        setFillTask(task);
-        upsertTaskSnapshot(task);
-        addAgentMessage({
-          role: 'assistant',
-          text: `模板回填任务已提交。\n模板：${resp.template_name}\n任务 ID：${resp.task_id}\n状态：${task.status}`,
-          timestamp: Date.now(),
-          taskId: resp.task_id,
-        });
-        refreshConversations();
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : '模板回填失败';
-        addAgentMessage({ role: 'assistant', text: `错误：${msg}`, timestamp: Date.now() });
-        toast.error(msg);
-      } finally {
-        setIsExecuting(false);
-      }
-      return;
-    }
-
-    // Otherwise run agent execute
+    // Always run agent execute first (without template) to determine intent
+    const ac = new AbortController();
+    abortControllerRef.current = ac;
     setIsExecuting(true);
+    setThinkingStartTime(Date.now());
     try {
       const r = await runAgentExecute({
         message: text,
@@ -352,10 +398,11 @@ export default function AgentPage() {
         documentSetId: runtimeDocumentSetId ?? undefined,
         documentIds: runtimeParsedDocIds,
         autoMatch: true,
-      });
+      }, { signal: ac.signal });
       if (r.context_id && r.context_id !== agentContextId) {
         setAgentContextId(r.context_id);
       }
+<<<<<<< HEAD
       // 如果 agent 在对话中调用了 fill_template 工具，后端会返回 task_id
       if (r.task_id) {
         setFillTaskId(r.task_id);
@@ -372,15 +419,69 @@ export default function AgentPage() {
         timestamp: Date.now(),
         data: shouldRenderOperationCard(r) ? r : undefined,
       });
+=======
+
+      // If backend determined this is a template fill AND we have a template file,
+      // trigger the document selection flow instead of the normal response
+      if ((r.execution_type === 'template_fill_pending' || r.execution_type === 'template_fill_task') && templateFile) {
+        addAgentMessage({ role: 'assistant', text: '正在分析模板并匹配源文档…', timestamp: Date.now() });
+        try {
+          const suggestion = await suggestDocuments(templateFile, runtimeDocumentSetId ?? undefined);
+          if (suggestion.candidates.length === 0) {
+            addAgentMessage({
+              role: 'assistant',
+              text: suggestion.message || '没有找到可用于回填的已解析源文档。',
+              timestamp: Date.now(),
+            });
+          } else {
+            setPendingFillText(text);
+            setPendingFillContextId(activeContextId);
+            setPendingFillDocSetId(runtimeDocumentSetId);
+            setDocSelectCandidates(suggestion.candidates);
+            setDocSelectTemplateName(suggestion.template_profile?.template_name ?? templateFile.name);
+            setDocSelectFieldNames(suggestion.template_profile?.field_names ?? []);
+            setDocSelectOpen(true);
+          }
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : '模板分析失败';
+          addAgentMessage({ role: 'assistant', text: `错误：${msg}`, timestamp: Date.now() });
+          toast.error(msg);
+        }
+      } else if ((r.execution_type === 'template_fill_pending' || r.execution_type === 'template_fill_task') && !templateFile) {
+        // Backend wants to fill but no template uploaded
+        addAgentMessage({
+          role: 'assistant',
+          text: '检测到模板回填意图，但尚未选择模板文件。请先点击📎按钮上传模板。',
+          timestamp: Date.now(),
+        });
+      } else {
+        // Normal response for non-fill intents
+        const elapsed = thinkingStartTime ? ((Date.now() - thinkingStartTime) / 1000).toFixed(1) : null;
+        const summary = formatAgentReply(r);
+        const timeTag = elapsed ? `\n\n> ⏱️ 思考耗时 ${elapsed}s` : '';
+        addAgentMessage({
+          role: 'assistant',
+          text: summary + timeTag,
+          timestamp: Date.now(),
+          data: shouldRenderOperationCard(r) ? r : undefined,
+        });
+      }
+>>>>>>> 2552b228659033d875a73d402eceb5449821552e
       refreshConversations();
     } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Agent 执行失败';
-      addAgentMessage({ role: 'assistant', text: `错误：${msg}`, timestamp: Date.now() });
-      toast.error(msg);
+      if (err instanceof DOMException && err.name === 'AbortError') {
+        addAgentMessage({ role: 'assistant', text: '已中止回答。', timestamp: Date.now() });
+      } else {
+        const msg = err instanceof Error ? err.message : 'Agent 执行失败';
+        addAgentMessage({ role: 'assistant', text: `错误：${msg}`, timestamp: Date.now() });
+        toast.error(msg);
+      }
     } finally {
+      abortControllerRef.current = null;
       setIsExecuting(false);
+      setThinkingStartTime(null);
     }
-  }, [inputText, isExecuting, templateFile, parsedScopedDocIds, effectiveDocumentSetId, refreshAvailableDocuments, uploadedDocuments, currentDocumentSetId, upsertTaskSnapshot, addAgentMessage, agentContextId, setAgentContextId, refreshConversations]);
+  }, [inputText, isExecuting, templateFile, parsedScopedDocIds, effectiveDocumentSetId, refreshAvailableDocuments, uploadedDocuments, currentDocumentSetId, upsertTaskSnapshot, addAgentMessage, agentContextId, setAgentContextId, refreshConversations, thinkingStartTime]);
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
@@ -456,8 +557,10 @@ export default function AgentPage() {
   const fillTaskDone = fillTask && ['succeeded', 'completed', 'success'].includes(fillTask.status);
 
   return (
-    <div className="flex h-full">
+    <>
+    <ResizablePanelGroup className="h-full">
       {/* ── Left: Conversation Sidebar ── */}
+<<<<<<< HEAD
       <div className={`flex flex-col border-r bg-muted/30 transition-all ${sidebarOpen ? 'w-56' : 'w-0 overflow-hidden'}`}>
         <div className="flex items-center justify-between gap-1 border-b px-2 py-2">
           {selectMode ? (
@@ -493,14 +596,33 @@ export default function AgentPage() {
               </div>
             </>
           )}
+=======
+      <ResizablePanel defaultSize={22} minSize={12}>
+      <div className="flex h-full flex-col bg-card">
+        <div className="flex items-center justify-between border-b px-3 py-2">
+          <span className="text-sm font-medium flex items-center gap-1.5">
+            <MessageSquarePlus className="h-4 w-4 text-primary" />
+            对话列表
+          </span>
+          <div className="flex gap-1">
+            <Button variant="ghost" size="icon" className="h-7 w-7" onClick={handleNewConversation} title="新建对话">
+              <MessageSquarePlus className="h-3.5 w-3.5" />
+            </Button>
+          </div>
+>>>>>>> 2552b228659033d875a73d402eceb5449821552e
         </div>
-        <ScrollArea className="flex-1">
-          <div className="space-y-0.5 p-1">
+        <div className="flex-1 overflow-y-auto overflow-x-hidden">
+          <div className="p-2 space-y-0.5">
             {conversationList.map((conv) => (
               <div
                 key={conv.conversation_id}
+<<<<<<< HEAD
                 className={`group flex items-center gap-1 rounded px-2 py-1.5 text-xs cursor-pointer hover:bg-muted overflow-hidden ${agentContextId === conv.conversation_id ? 'bg-muted font-medium' : ''} ${selectMode && selectedConvIds.has(conv.conversation_id) ? 'bg-primary/10' : ''}`}
                 onClick={() => selectMode ? toggleConvSelection(conv.conversation_id) : handleSwitchConversation(conv)}
+=======
+                className={`flex w-full min-w-0 items-center gap-1.5 rounded-md px-2 py-1.5 text-left text-sm cursor-pointer transition-colors hover:bg-muted ${agentContextId === conv.conversation_id ? 'bg-muted font-medium' : ''}`}
+                onClick={() => handleSwitchConversation(conv)}
+>>>>>>> 2552b228659033d875a73d402eceb5449821552e
               >
                 {selectMode && (
                   <span className="shrink-0">
@@ -516,25 +638,32 @@ export default function AgentPage() {
                     <span className="truncate">{getConversationPreview(conv)}</span>
                   </div>
                 </div>
+<<<<<<< HEAD
+=======
+                <span
+                  role="button"
+                  tabIndex={0}
+                  className="shrink-0 rounded p-0.5 text-muted-foreground/40 hover:text-destructive transition-colors"
+                  onClick={(e) => { e.stopPropagation(); handleDeleteConversation(conv.conversation_id); }}
+                  onKeyDown={(e) => { if (e.key === 'Enter') { e.stopPropagation(); handleDeleteConversation(conv.conversation_id); } }}
+                >
+                  <Trash2 className="h-3 w-3" />
+                </span>
+>>>>>>> 2552b228659033d875a73d402eceb5449821552e
               </div>
             ))}
             {conversationList.length === 0 && (
-              <p className="text-[10px] text-muted-foreground text-center py-4">暂无历史对话</p>
+              <p className="px-2 py-4 text-center text-xs text-muted-foreground">暂无历史对话</p>
             )}
           </div>
-        </ScrollArea>
+        </div>
       </div>
+      </ResizablePanel>
 
-      {/* Sidebar toggle when collapsed */}
-      {!sidebarOpen && (
-        <Button variant="ghost" size="icon" className="h-full w-8 shrink-0 rounded-none border-r" onClick={() => setSidebarOpen(true)} title="展开对话列表">
-          <PanelLeftOpen className="h-4 w-4" />
-        </Button>
-      )}
+      <ResizableHandle withHandle />
 
-    <ResizablePanelGroup className="h-full">
       {/* ── Main chat area ── */}
-      <ResizablePanel defaultSize={70} minSize={40}>
+      <ResizablePanel defaultSize={48} minSize={30}>
       <div className="flex h-full flex-col">
         {/* Chat messages */}
         <ScrollArea className="flex-1" ref={scrollRef}>
@@ -608,7 +737,17 @@ export default function AgentPage() {
                 <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-primary/10">
                   <Loader2 className="h-4 w-4 animate-spin text-primary" />
                 </div>
-                <div className="rounded-lg border bg-card px-3 py-2 text-sm text-muted-foreground">思考中…</div>
+                <div className="rounded-lg border bg-card px-3 py-2 text-sm text-muted-foreground flex items-center gap-2">
+                  思考中…
+                  {thinkingStartTime && <ThinkingTimer startTime={thinkingStartTime} />}
+                  <button
+                    onClick={handleAbort}
+                    className="ml-1 rounded-md border px-1.5 py-0.5 text-xs text-destructive hover:bg-destructive/10 transition-colors flex items-center gap-1"
+                    title="中止回答"
+                  >
+                    <Square className="h-3 w-3 fill-current" /> 停止
+                  </button>
+                </div>
               </div>
             )}
           </div>
@@ -670,9 +809,15 @@ export default function AgentPage() {
                 style={{ minHeight: '40px', maxHeight: '200px' }}
               />
             </div>
-            <Button size="icon" className="h-9 w-9 shrink-0" disabled={!inputText.trim() || isExecuting} onClick={handleSend}>
-              <Send className="h-4 w-4" />
-            </Button>
+            {isExecuting ? (
+              <Button size="icon" className="h-9 w-9 shrink-0" variant="destructive" onClick={handleAbort} title="中止回答">
+                <Square className="h-4 w-4 fill-current" />
+              </Button>
+            ) : (
+              <Button size="icon" className="h-9 w-9 shrink-0" disabled={!inputText.trim()} onClick={handleSend}>
+                <Send className="h-4 w-4" />
+              </Button>
+            )}
           </div>
         </div>
       </div>
@@ -704,7 +849,10 @@ export default function AgentPage() {
                         <span className="text-xs font-medium">模板回填任务</span>
                         <TaskStatusBadge status={fillTask.status} />
                       </div>
-                      <div className="text-[10px] text-muted-foreground truncate">{fillTaskId}</div>
+                      <div className="flex items-center justify-between text-[10px] text-muted-foreground">
+                        <span className="truncate">{fillTaskId}</span>
+                        <TaskElapsed task={fillTask} />
+                      </div>
                       <div className="h-1.5 w-full rounded-full bg-muted">
                         <div
                           className="h-1.5 rounded-full bg-primary transition-all"
@@ -955,7 +1103,16 @@ export default function AgentPage() {
       </div>
       </ResizablePanel>
     </ResizablePanelGroup>
-    </div>
+
+    <DocumentSelectDialog
+      open={docSelectOpen}
+      candidates={docSelectCandidates}
+      templateName={docSelectTemplateName}
+      fieldNames={docSelectFieldNames}
+      onConfirm={handleDocSelectConfirm}
+      onCancel={handleDocSelectCancel}
+    />
+    </>
   );
 }
 
@@ -969,9 +1126,26 @@ function TaskStatusBadge({ status }: { status: string }) {
   return <Badge variant="secondary" className="text-[9px] h-4 gap-0.5"><Clock className="h-2.5 w-2.5" />进行中</Badge>;
 }
 
+function TaskElapsed({ task }: { task: TaskResponse }) {
+  const done = ['succeeded', 'completed', 'success', 'failed'].includes(task.status);
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => {
+    if (done) return;
+    const t = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(t);
+  }, [done]);
+  const start = new Date(task.created_at).getTime();
+  const end = done ? new Date(task.updated_at).getTime() : now;
+  const sec = Math.max(0, Math.round((end - start) / 1000));
+  const m = Math.floor(sec / 60);
+  const s = sec % 60;
+  const label = m > 0 ? `${m}分${s}秒` : `${s}秒`;
+  return <span className="shrink-0 tabular-nums">{done ? `耗时 ${label}` : `已用 ${label}`}</span>;
+}
+
 function StatusDot({ status }: { status: string }) {
   const color =
-    status === 'parsed' ? 'bg-green-500' : status === 'parsing' ? 'bg-amber-400' : status === 'failed' ? 'bg-red-500' : 'bg-gray-300';
+    status === 'parsed' ? 'bg-green-500' : status === 'parsing' ? 'bg-amber-400' : status === 'failed' ? 'bg-red-500' : 'bg-gray-300 dark:bg-gray-600';
   return <span className={`inline-block h-1.5 w-1.5 rounded-full ${color}`} />;
 }
 
@@ -988,7 +1162,7 @@ function mergeKnownDocuments(
     merged.set(entry.document.doc_id, {
       ...(existing ?? entry.document),
       ...entry.document,
-      status: entry.status || entry.document.status || existing?.status || 'uploaded',
+      status: existing?.status || entry.status || entry.document.status || 'uploaded',
     });
   });
   return Array.from(merged.values());
@@ -1051,7 +1225,8 @@ function getConversationDisplayTitle(conv: ConversationResponse): string {
   }
   const firstUserMessage = conv.messages.find((message) => String(message.role ?? '') === 'user');
   const fallback = String(firstUserMessage?.content ?? '').trim();
-  return fallback || '未命名对话';
+  const text = fallback || '未命名对话';
+  return text.length > 20 ? text.slice(0, 20) + '…' : text;
 }
 
 function getConversationPreview(conv: ConversationResponse): string {
@@ -1063,7 +1238,8 @@ function getConversationPreview(conv: ConversationResponse): string {
   if (!lastMessage) {
     return '暂无消息';
   }
-  return String(lastMessage.content ?? '').replace(/\s+/g, ' ').trim();
+  const text = String(lastMessage.content ?? '').replace(/\s+/g, ' ').trim();
+  return text.length > 50 ? text.slice(0, 50) + '…' : text;
 }
 
 function formatAgentReply(data: AgentExecuteResponse): string {
@@ -1201,4 +1377,18 @@ function OperationResultCard({
       )}
     </div>
   );
+}
+
+function ThinkingTimer({ startTime }: { startTime: number }) {
+  const [elapsed, setElapsed] = useState(0);
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      setElapsed(Math.floor((Date.now() - startTime) / 1000));
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [startTime]);
+  const minutes = Math.floor(elapsed / 60);
+  const seconds = elapsed % 60;
+  const display = minutes > 0 ? `${minutes}:${String(seconds).padStart(2, '0')}` : `${seconds}s`;
+  return <span className="text-xs font-mono tabular-nums text-muted-foreground/70">{display}</span>;
 }

@@ -550,7 +550,7 @@ CITY_NAMES: tuple[str, ...] = (
 INTENT_KEYWORDS: dict[str, tuple[str, ...]] = {
     "extract_and_fill_template": ("模板", "填表", "回填", "填充", "智能填", "自动填"),
     "extract_facts": ("提取", "抽取", "识别", "入库"),
-    "query_facts": ("查询", "汇总", "统计", "列出"),
+    "query_facts": ("查询", "汇总", "列出", "查一下", "统计", "写一个表格"),
     "trace_fact": ("追溯", "来源", "证据"),
     "edit_document": ("编辑", "修改", "替换", "改成", "改为"),
     "summarize_document": ("摘要", "总结", "概述"),
@@ -560,3 +560,12 @@ INTENT_KEYWORDS: dict[str, tuple[str, ...]] = {
     "extract_fields": ("字段提取", "提取字段", "抽取字段", "字段抽取", "指标提取"),
     "export_results": ("导出", "下载", "输出为", "保存为", "转为excel", "转为xlsx", "转为json"),
 }
+
+# 占位实体黑名单：LLM 可能将这些通用词作为实体返回，在过滤时应忽略
+PLACEHOLDER_ENTITIES: frozenset[str] = frozenset({"城市", "地区", "公司", "企业", "机构"})
+
+# 需要持久化到数据库的意图
+DB_STORE_INTENTS: frozenset[str] = frozenset({"extract_and_fill_template", "extract_facts"})
+
+# 使用上传模板作为 target 的意图
+TEMPLATE_TARGET_INTENTS: frozenset[str] = frozenset({"extract_and_fill_template"})

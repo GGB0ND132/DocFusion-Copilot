@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import re
 import zipfile
 from copy import deepcopy
@@ -12,6 +13,18 @@ XML_NS = "http://www.w3.org/XML/1998/namespace"
 W = {"w": W_NS}
 
 ET.register_namespace("w", W_NS)
+
+
+def _register_all_namespaces(xml_bytes: bytes) -> None:
+    """注册 XML 中所有命名空间前缀，防止序列化时丢失。
+    Register every namespace prefix found in *xml_bytes* so that
+    ``ET.tostring`` preserves them instead of rewriting to ns0/ns1/…"""
+    for _, (prefix, uri) in ET.iterparse(io.BytesIO(xml_bytes), events=["start-ns"]):
+        if prefix and uri:
+            try:
+                ET.register_namespace(prefix, uri)
+            except ValueError:
+                pass
 
 _DOCX_HEADING_RE = re.compile(
     r"^(?P<prefix>(?:[一二三四五六七八九十]+[、.．]|\d{1,2}(?:\.\d{1,2}){0,2}[、.．]))\s*(?P<title>\S.*)$"
@@ -33,6 +46,7 @@ class WordTable:
     table_index: int
     name: str
     rows: list[WordTableRow]
+    context_text: str = ""
 
 
 @dataclass(slots=True)
@@ -58,92 +72,156 @@ def _w(tag: str) -> str:
     return f"{{{W_NS}}}{tag}"
 
 
+def _parse_table_rows(table_el: ET.Element) -> list[WordTableRow]:
+    """解析单张表格的所有行。    Parse all rows from one table element."""
+
+    rows: list[WordTableRow] = []
+    for row_index, row_el in enumerate(table_el.findall("w:tr", W), start=1):
+        values: list[str] = []
+        logical_col = 0
+        for cell_el in row_el.findall("w:tc", W):
+            tc_pr = cell_el.find("w:tcPr", W)
+            # Check for vertical merge continuation — skip these cells' content
+            v_merge = tc_pr.find("w:vMerge", W) if tc_pr is not None else None
+            is_v_merge_continue = False
+            if v_merge is not None:
+                val = v_merge.get(_w("val"), "")
+                if val != "restart":
+                    is_v_merge_continue = True
+
+            grid_span = 1
+            if tc_pr is not None:
+                gs_el = tc_pr.find("w:gridSpan", W)
+                if gs_el is not None:
+                    try:
+                        grid_span = int(gs_el.get(_w("val"), "1"))
+                    except (ValueError, TypeError):
+                        grid_span = 1
+
+            text = "" if is_v_merge_continue else _text_from_element(cell_el).strip()
+
+            while len(values) < logical_col:
+                values.append("")
+            values.append(text)
+            for _ in range(grid_span - 1):
+                values.append("")
+            logical_col += grid_span
+
+        rows.append(WordTableRow(row_index=row_index, values=values))
+    return rows
+
+
 def load_docx_tables(path: str | Path) -> WordDocument:
-    """读取 DOCX 中的表格结构，正确处理合并单元格。
-    Read DOCX table structures into memory, handling merged cells correctly."""
+    """读取 DOCX 中的表格结构，正确处理合并单元格，并收集每张表前的段落文字。
+    Read DOCX table structures into memory, handling merged cells correctly,
+    and capture preceding paragraph text for each table."""
 
     docx_path = Path(path)
     with zipfile.ZipFile(docx_path, "r") as archive:
         root = ET.fromstring(archive.read("word/document.xml"))
 
+    body = root.find(_w("body"))
+    if body is None:
+        return WordDocument(tables=[])
+
     tables: list[WordTable] = []
-    for table_index, table_el in enumerate(root.findall(".//w:tbl", W), start=1):
-        rows: list[WordTableRow] = []
-        for row_index, row_el in enumerate(table_el.findall("w:tr", W), start=1):
-            values: list[str] = []
-            logical_col = 0
-            for cell_el in row_el.findall("w:tc", W):
-                tc_pr = cell_el.find("w:tcPr", W)
-                # Check for vertical merge continuation — skip these cells' content
-                v_merge = tc_pr.find("w:vMerge", W) if tc_pr is not None else None
-                is_v_merge_continue = False
-                if v_merge is not None:
-                    # val="restart" means this is the start; no val or val="continue" means continuation
-                    val = v_merge.get(_w("val"), "")
-                    if val != "restart":
-                        is_v_merge_continue = True
+    pending_paragraphs: list[str] = []
+    table_counter = 0
+    tbl_tag = _w("tbl")
+    p_tag = _w("p")
 
-                # Determine horizontal span from gridSpan
-                grid_span = 1
-                if tc_pr is not None:
-                    gs_el = tc_pr.find("w:gridSpan", W)
-                    if gs_el is not None:
-                        try:
-                            grid_span = int(gs_el.get(_w("val"), "1"))
-                        except (ValueError, TypeError):
-                            grid_span = 1
+    for child in body:
+        if child.tag == p_tag:
+            text = _text_from_element(child).strip()
+            if text:
+                pending_paragraphs.append(text)
+        elif child.tag == tbl_tag:
+            table_counter += 1
+            context_text = "\n".join(pending_paragraphs[-6:])
+            pending_paragraphs.clear()
+            rows = _parse_table_rows(child)
+            tables.append(WordTable(
+                table_index=table_counter,
+                name=f"table_{table_counter}",
+                rows=rows,
+                context_text=context_text,
+            ))
 
-                text = "" if is_v_merge_continue else _text_from_element(cell_el).strip()
-
-                # Fill values list up to logical_col, then place text at this position
-                while len(values) < logical_col:
-                    values.append("")
-                values.append(text)
-                # For gridSpan > 1, fill remaining spanned columns with empty strings
-                for _ in range(grid_span - 1):
-                    values.append("")
-                logical_col += grid_span
-
-            rows.append(WordTableRow(row_index=row_index, values=values))
-        tables.append(WordTable(table_index=table_index, name=f"table_{table_index}", rows=rows))
     return WordDocument(tables=tables)
 
 
 def apply_docx_updates(template_path: str | Path, output_path: str | Path, updates: list[WordCellWrite]) -> None:
-    """将单元格更新写回 DOCX 表格。    Apply cell updates back into a DOCX table document."""
+    """将单元格更新写回 DOCX 表格（基于 python-docx）。
+    Apply cell updates back into a DOCX table document using python-docx."""
+    from docx import Document as DocxDocument
+    from docx.oxml.ns import qn
 
     source_file = Path(template_path)
     destination_file = Path(output_path)
     destination_file.parent.mkdir(parents=True, exist_ok=True)
 
+    doc = DocxDocument(str(source_file))
+    tables = doc.tables
+
     grouped_updates: dict[int, list[WordCellWrite]] = {}
     for update in updates:
         grouped_updates.setdefault(update.table_index, []).append(update)
 
-    with zipfile.ZipFile(source_file, "r") as source_archive:
-        root = ET.fromstring(source_archive.read("word/document.xml"))
-        tables = root.findall(".//w:tbl", W)
+    for table_index, table_updates in grouped_updates.items():
+        if table_index < 1 or table_index > len(tables):
+            raise ValueError(f"Table index out of range: {table_index}")
 
-        for table_index, table_updates in grouped_updates.items():
-            if table_index < 1 or table_index > len(tables):
-                raise ValueError(f"Table index out of range: {table_index}")
+        table = tables[table_index - 1]
 
-            table_el = tables[table_index - 1]
-            required_columns = max((update.column_index for update in table_updates), default=1)
-            for update in sorted(table_updates, key=lambda item: (item.row_index, item.column_index)):
-                row_el = _get_or_create_table_row(table_el, update.row_index, required_columns)
-                cell_el = _get_or_create_table_cell(row_el, update.column_index)
-                _set_cell_text(cell_el, str(update.value))
+        # Determine how many rows / columns we need
+        max_row = max(u.row_index for u in table_updates)
+        max_col = max(u.column_index for u in table_updates)
 
-        document_payload = ET.tostring(root, encoding="utf-8", xml_declaration=True)
-        with zipfile.ZipFile(destination_file, "w", compression=zipfile.ZIP_DEFLATED) as destination_archive:
-            for file_info in source_archive.infolist():
-                payload = (
-                    document_payload
-                    if file_info.filename == "word/document.xml"
-                    else source_archive.read(file_info.filename)
-                )
-                destination_archive.writestr(file_info, payload)
+        # Add missing rows by cloning the last row (preserving column structure)
+        while len(table.rows) < max_row:
+            last_row_el = table.rows[-1]._tr
+            new_row_el = deepcopy(last_row_el)
+            # Clear text and vertical merge continuations in cloned cells
+            for tc in new_row_el.findall(qn("w:tc")):
+                for p in tc.findall(qn("w:p")):
+                    for r in p.findall(qn("w:r")):
+                        p.remove(r)
+                tc_pr = tc.find(qn("w:tcPr"))
+                if tc_pr is not None:
+                    v_merge = tc_pr.find(qn("w:vMerge"))
+                    if v_merge is not None:
+                        tc_pr.remove(v_merge)
+            table._tbl.append(new_row_el)
+
+        for update in sorted(table_updates, key=lambda u: (u.row_index, u.column_index)):
+            row = table.rows[update.row_index - 1]
+            # Add missing cells if column doesn't exist
+            while len(row.cells) < update.column_index:
+                last_cell_el = row.cells[-1]._tc
+                new_cell_el = deepcopy(last_cell_el)
+                for p in new_cell_el.findall(qn("w:p")):
+                    for r in p.findall(qn("w:r")):
+                        p.remove(r)
+                row._tr.append(new_cell_el)
+
+            cell = row.cells[update.column_index - 1]
+            # Preserve first paragraph's formatting, replace text
+            if cell.paragraphs:
+                para = cell.paragraphs[0]
+                # Clear existing runs
+                for run in para.runs:
+                    run.text = ""
+                if para.runs:
+                    para.runs[0].text = str(update.value)
+                else:
+                    para.add_run(str(update.value))
+                # Remove extra paragraphs
+                for extra_para in cell.paragraphs[1:]:
+                    extra_para._element.getparent().remove(extra_para._element)
+            else:
+                cell.text = str(update.value)
+
+    doc.save(str(destination_file))
 
 
 def reformat_docx_document(source_path: str | Path, output_path: str | Path) -> None:
@@ -154,7 +232,9 @@ def reformat_docx_document(source_path: str | Path, output_path: str | Path) -> 
     destination_file.parent.mkdir(parents=True, exist_ok=True)
 
     with zipfile.ZipFile(template_file, "r") as source_archive:
-        root = ET.fromstring(source_archive.read("word/document.xml"))
+        doc_xml = source_archive.read("word/document.xml")
+        _register_all_namespaces(doc_xml)
+        root = ET.fromstring(doc_xml)
         for paragraph_el in root.findall(".//w:p", W):
             text = _text_from_element(paragraph_el).strip()
             if not text:

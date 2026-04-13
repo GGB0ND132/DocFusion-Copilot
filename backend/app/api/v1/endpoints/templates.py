@@ -11,6 +11,28 @@ from app.schemas.templates import TemplateFillAcceptedResponse
 router = APIRouter()
 
 
+@router.post("/suggest-documents")
+async def suggest_documents(
+    template_file: UploadFile = File(...),
+    document_set_id: str | None = Form(default=None),
+) -> dict:
+    """分析模板并返回候选源文档供用户选择。
+    Analyse a template and return candidate source documents for user selection.
+    """
+    if not template_file.filename:
+        raise HTTPException(status_code=400, detail="Missing template file name.")
+    content = await template_file.read()
+    try:
+        result = get_container().template_service.suggest_documents(
+            template_name=template_file.filename,
+            content=content,
+            document_set_id=document_set_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return result
+
+
 @router.post("/fill", response_model=TemplateFillAcceptedResponse)
 async def fill_template(
     template_file: UploadFile = File(...),

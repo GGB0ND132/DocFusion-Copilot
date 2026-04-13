@@ -5,11 +5,12 @@ from collections.abc import Iterable
 
 from app.core.catalog import CITY_NAMES, ENTITY_COLUMN_ALIASES, DATE_COLUMN_ALIASES, FIELD_ALIASES, FIELD_CANONICAL_UNITS
 
-_BRACKET_TEXT_RE = re.compile(r"[（(].*?[)）]")
+_BRACKET_TEXT_RE = re.compile(r"[（(].*?[)）]|[（(][^)）]*$")
 _WHITESPACE_RE = re.compile(r"\s+")
 _NUMERIC_RE = re.compile(r"(?P<value>-?\d[\d,]*(?:\.\d+)?)\s*(?P<unit>万亿元|亿元|万元|元|万人|人|%)?")
 _YEAR_RE = re.compile(r"(?P<year>(?:19|20)\d{2})年")
 _CITY_WITH_SUFFIX_RE = re.compile(r"(?P<name>[\u4e00-\u9fff]{2,4})市")
+_CITY_SET: frozenset[str] = frozenset(CITY_NAMES)
 
 _FIELD_ALIAS_LOOKUP: dict[str, str] = {}
 for canonical_name, aliases in FIELD_ALIASES.items():
@@ -87,7 +88,9 @@ def find_entity_mentions(text: str, extra_candidates: Iterable[str] | None = Non
             _push(city_name)
 
     for match in _CITY_WITH_SUFFIX_RE.finditer(text):
-        _push(match.group("name"))
+        name = match.group("name")
+        if name in _CITY_SET:
+            _push(name)
 
     if extra_candidates:
         for candidate in extra_candidates:
@@ -147,7 +150,7 @@ def convert_to_canonical_unit(
     if field_name == "常住人口":
         if unit == "人":
             return value_num / 10000, "万人"
-        if unit == "万人":
+        if unit in ("万人", "万"):
             return value_num, "万人"
 
     if field_name in {"人均GDP", "合同金额"}:
@@ -158,7 +161,7 @@ def convert_to_canonical_unit(
         if unit == "元":
             return value_num, "元"
 
-    return value_num, canonical_unit
+    return value_num, unit or canonical_unit
 
 
 def format_value(value: float | None) -> str:

@@ -1,6 +1,6 @@
 import { requestJson } from '@/services/http';
 import { buildApiUrl } from '@/services/http';
-import type { BlockResponse, DocumentResponse, FactResponse, PaginatedBlocksResponse } from '@/services/types';
+import type { BlockResponse, DocumentResponse, FactResponse, PaginatedBlocksResponse, PaginatedFactsResponse } from '@/services/types';
 
 export async function listDocuments(): Promise<DocumentResponse[]> {
   return requestJson<DocumentResponse[]>('/api/v1/documents');
@@ -18,8 +18,16 @@ export async function getDocumentBlocks(
   return requestJson<PaginatedBlocksResponse>(url);
 }
 
-export async function getDocumentFacts(docId: string): Promise<FactResponse[]> {
-  return requestJson<FactResponse[]>(`/api/v1/documents/${encodeURIComponent(docId)}/facts`);
+export async function getDocumentFacts(
+  docId: string,
+  options?: { limit?: number; offset?: number },
+): Promise<PaginatedFactsResponse> {
+  const params = new URLSearchParams();
+  if (options?.limit != null) params.set('limit', String(options.limit));
+  if (options?.offset != null) params.set('offset', String(options.offset));
+  const qs = params.toString();
+  const url = `/api/v1/documents/${encodeURIComponent(docId)}/facts${qs ? `?${qs}` : ''}`;
+  return requestJson<PaginatedFactsResponse>(url);
 }
 
 export async function deleteDocument(docId: string): Promise<{ doc_id: string; deleted: boolean }> {

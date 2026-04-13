@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -28,9 +29,11 @@ def create_app():
     """
     from fastapi import FastAPI
     from fastapi.middleware.cors import CORSMiddleware
+    from fastapi.middleware.gzip import GZipMiddleware
 
     from app.api.v1.router import api_router
     from app.core.container import get_container
+    from app.middleware.etag import ETagMiddleware
 
     setup_structured_logging()
     settings = get_settings()
@@ -40,6 +43,8 @@ def create_app():
         version="0.1.0",
         summary="Competition-ready MVP backend for document parsing, fact extraction and template filling.",
     )
+    app.add_middleware(ETagMiddleware)
+    app.add_middleware(GZipMiddleware, minimum_size=1000)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.cors_allow_origins,
@@ -81,9 +86,27 @@ def run() -> None:
             f"'{missing_name}' is missing. Run `pip install -r backend/requirements.txt` first."
         )
 
+    import asyncio
     import uvicorn
 
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    settings = get_settings()
+    workers = int(os.environ.get("DOCFUSION_UVICORN_WORKERS", "1"))
+    if workers > 1:
+        uvicorn.run(
+            "app.main:app",
+            host=settings.host,
+            port=settings.port,
+            workers=workers,
+        )
+    else:
+        loop = asyncio.new_event_loop()
+        loop.set_default_executor(
+            __import__("concurrent.futures").futures.ThreadPoolExecutor(
+                max_workers=int(os.environ.get("DOCFUSION_THREAD_POOL_SIZE", "8"))
+            )
+        )
+        asyncio.set_event_loop(loop)
+        uvicorn.run(app, host=settings.host, port=settings.port)
 
 
 if __name__ == "__main__":

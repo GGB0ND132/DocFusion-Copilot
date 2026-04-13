@@ -167,6 +167,16 @@ class InMemoryRepository:
             task.updated_at = datetime.now(timezone.utc)
             return replace(task)
 
+    def delete_facts_by_doc_id(self, doc_id: str) -> int:
+        """删除指定文档的全部事实记录，返回删除条数。"""
+        with self._lock:
+            to_delete = [fid for fid, f in self._facts.items() if f.source_doc_id == doc_id]
+            for fid in to_delete:
+                del self._facts[fid]
+            if to_delete:
+                self._recompute_canonical_flags()
+            return len(to_delete)
+
     def add_facts(self, facts: list[FactRecord]) -> list[FactRecord]:
         """存储事实、重算 canonical 结果并返回副本。
         Store facts, recompute canonical winners and return stored copies.
@@ -203,6 +213,8 @@ class InMemoryRepository:
             if canonical_only:
                 facts = [fact for fact in facts if fact.is_canonical]
             if document_ids is not None:
+                if not document_ids:
+                    return []
                 facts = [fact for fact in facts if fact.source_doc_id in document_ids]
             return [replace(fact) for fact in facts]
 
@@ -306,7 +318,8 @@ class InMemoryRepository:
     def delete_conversation(self, conversation_id: str) -> ConversationRecord | None:
         """删除对话记录。    Delete a conversation record."""
         with self._lock:
-            return self._conversations.pop(conversation_id, None)
+            record = self._conversations.pop(conversation_id, None)
+            return deepcopy(record) if record else None
 
     # ── Vector search (in-memory cosine similarity) ──
 
