@@ -19,13 +19,10 @@ import {
   MessageSquarePlus,
   Trash2,
   Sparkles,
-<<<<<<< HEAD
   CheckSquare,
   Square,
   X,
-=======
-  Square,
->>>>>>> 2552b228659033d875a73d402eceb5449821552e
+  PanelLeftClose,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
@@ -99,12 +96,9 @@ export default function AgentPage() {
   const startNewConversation = useUiStore((s) => s.startNewConversation);
   const removeConversationFromList = useUiStore((s) => s.removeConversationFromList);
 
-<<<<<<< HEAD
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [selectMode, setSelectMode] = useState(false);
   const [selectedConvIds, setSelectedConvIds] = useState<Set<string>>(new Set());
-=======
->>>>>>> 2552b228659033d875a73d402eceb5449821552e
 
   const refreshAvailableDocuments = useCallback(async () => {
     const docs = await listDocuments();
@@ -402,7 +396,6 @@ export default function AgentPage() {
       if (r.context_id && r.context_id !== agentContextId) {
         setAgentContextId(r.context_id);
       }
-<<<<<<< HEAD
       // 如果 agent 在对话中调用了 fill_template 工具，后端会返回 task_id
       if (r.task_id) {
         setFillTaskId(r.task_id);
@@ -419,54 +412,6 @@ export default function AgentPage() {
         timestamp: Date.now(),
         data: shouldRenderOperationCard(r) ? r : undefined,
       });
-=======
-
-      // If backend determined this is a template fill AND we have a template file,
-      // trigger the document selection flow instead of the normal response
-      if ((r.execution_type === 'template_fill_pending' || r.execution_type === 'template_fill_task') && templateFile) {
-        addAgentMessage({ role: 'assistant', text: '正在分析模板并匹配源文档…', timestamp: Date.now() });
-        try {
-          const suggestion = await suggestDocuments(templateFile, runtimeDocumentSetId ?? undefined);
-          if (suggestion.candidates.length === 0) {
-            addAgentMessage({
-              role: 'assistant',
-              text: suggestion.message || '没有找到可用于回填的已解析源文档。',
-              timestamp: Date.now(),
-            });
-          } else {
-            setPendingFillText(text);
-            setPendingFillContextId(activeContextId);
-            setPendingFillDocSetId(runtimeDocumentSetId);
-            setDocSelectCandidates(suggestion.candidates);
-            setDocSelectTemplateName(suggestion.template_profile?.template_name ?? templateFile.name);
-            setDocSelectFieldNames(suggestion.template_profile?.field_names ?? []);
-            setDocSelectOpen(true);
-          }
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : '模板分析失败';
-          addAgentMessage({ role: 'assistant', text: `错误：${msg}`, timestamp: Date.now() });
-          toast.error(msg);
-        }
-      } else if ((r.execution_type === 'template_fill_pending' || r.execution_type === 'template_fill_task') && !templateFile) {
-        // Backend wants to fill but no template uploaded
-        addAgentMessage({
-          role: 'assistant',
-          text: '检测到模板回填意图，但尚未选择模板文件。请先点击📎按钮上传模板。',
-          timestamp: Date.now(),
-        });
-      } else {
-        // Normal response for non-fill intents
-        const elapsed = thinkingStartTime ? ((Date.now() - thinkingStartTime) / 1000).toFixed(1) : null;
-        const summary = formatAgentReply(r);
-        const timeTag = elapsed ? `\n\n> ⏱️ 思考耗时 ${elapsed}s` : '';
-        addAgentMessage({
-          role: 'assistant',
-          text: summary + timeTag,
-          timestamp: Date.now(),
-          data: shouldRenderOperationCard(r) ? r : undefined,
-        });
-      }
->>>>>>> 2552b228659033d875a73d402eceb5449821552e
       refreshConversations();
     } catch (err) {
       if (err instanceof DOMException && err.name === 'AbortError') {
@@ -560,7 +505,6 @@ export default function AgentPage() {
     <>
     <ResizablePanelGroup className="h-full">
       {/* ── Left: Conversation Sidebar ── */}
-<<<<<<< HEAD
       <div className={`flex flex-col border-r bg-muted/30 transition-all ${sidebarOpen ? 'w-56' : 'w-0 overflow-hidden'}`}>
         <div className="flex items-center justify-between gap-1 border-b px-2 py-2">
           {selectMode ? (
@@ -596,33 +540,14 @@ export default function AgentPage() {
               </div>
             </>
           )}
-=======
-      <ResizablePanel defaultSize={22} minSize={12}>
-      <div className="flex h-full flex-col bg-card">
-        <div className="flex items-center justify-between border-b px-3 py-2">
-          <span className="text-sm font-medium flex items-center gap-1.5">
-            <MessageSquarePlus className="h-4 w-4 text-primary" />
-            对话列表
-          </span>
-          <div className="flex gap-1">
-            <Button variant="ghost" size="icon" className="h-7 w-7" onClick={handleNewConversation} title="新建对话">
-              <MessageSquarePlus className="h-3.5 w-3.5" />
-            </Button>
-          </div>
->>>>>>> 2552b228659033d875a73d402eceb5449821552e
         </div>
         <div className="flex-1 overflow-y-auto overflow-x-hidden">
           <div className="p-2 space-y-0.5">
             {conversationList.map((conv) => (
               <div
                 key={conv.conversation_id}
-<<<<<<< HEAD
                 className={`group flex items-center gap-1 rounded px-2 py-1.5 text-xs cursor-pointer hover:bg-muted overflow-hidden ${agentContextId === conv.conversation_id ? 'bg-muted font-medium' : ''} ${selectMode && selectedConvIds.has(conv.conversation_id) ? 'bg-primary/10' : ''}`}
                 onClick={() => selectMode ? toggleConvSelection(conv.conversation_id) : handleSwitchConversation(conv)}
-=======
-                className={`flex w-full min-w-0 items-center gap-1.5 rounded-md px-2 py-1.5 text-left text-sm cursor-pointer transition-colors hover:bg-muted ${agentContextId === conv.conversation_id ? 'bg-muted font-medium' : ''}`}
-                onClick={() => handleSwitchConversation(conv)}
->>>>>>> 2552b228659033d875a73d402eceb5449821552e
               >
                 {selectMode && (
                   <span className="shrink-0">
@@ -638,18 +563,7 @@ export default function AgentPage() {
                     <span className="truncate">{getConversationPreview(conv)}</span>
                   </div>
                 </div>
-<<<<<<< HEAD
-=======
-                <span
-                  role="button"
-                  tabIndex={0}
-                  className="shrink-0 rounded p-0.5 text-muted-foreground/40 hover:text-destructive transition-colors"
-                  onClick={(e) => { e.stopPropagation(); handleDeleteConversation(conv.conversation_id); }}
-                  onKeyDown={(e) => { if (e.key === 'Enter') { e.stopPropagation(); handleDeleteConversation(conv.conversation_id); } }}
-                >
-                  <Trash2 className="h-3 w-3" />
-                </span>
->>>>>>> 2552b228659033d875a73d402eceb5449821552e
+
               </div>
             ))}
             {conversationList.length === 0 && (
@@ -658,7 +572,6 @@ export default function AgentPage() {
           </div>
         </div>
       </div>
-      </ResizablePanel>
 
       <ResizableHandle withHandle />
 
