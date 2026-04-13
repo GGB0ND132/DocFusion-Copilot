@@ -34,6 +34,7 @@ class InMemoryRepository:
         self._tasks: dict[str, TaskRecord] = {}
         self._template_results: dict[str, TemplateResultRecord] = {}
         self._conversations: dict[str, ConversationRecord] = {}
+        self._embeddings: dict[str, list[float]] = {}  # block_id -> embedding vector
 
     def add_document(self, record: DocumentRecord) -> DocumentRecord:
         """存储文档记录并返回脱离引用的副本。
@@ -306,6 +307,51 @@ class InMemoryRepository:
         """删除对话记录。    Delete a conversation record."""
         with self._lock:
             return self._conversations.pop(conversation_id, None)
+
+    # ── Vector search (in-memory cosine similarity) ──
+
+    def upsert_block_embedding(self, block_id: str, embedding: list[float]) -> None:
+        """更新指定块的向量嵌入（内存存储）。"""
+        with self._lock:
+            self._embeddings[block_id] = embedding
+
+    def vector_search_blocks(
+        self,
+        query_embedding: list[float],
+        *,
+        top_k: int = 10,
+        document_ids: set[str] | None = None,
+    ) -> list[DocumentBlock]:
+        """基于 numpy 余弦相似度检索最相近的文档块。"""
+        import numpy as np
+
+        with self._lock:
+            candidates: list[tuple[str, str, float]] = []  # (block_id, doc_id, score)
+            q = np.array(query_embedding, dtype=np.float32)
+            q_norm = np.linalg.norm(q)
+            if q_norm == 0:
+                return []
+            for doc_id, blocks in self._blocks_by_doc.items():
+                if document_ids is not None and doc_id not in document_ids:
+                    continue
+                for block in blocks:
+                    emb = self._embeddings.get(block.block_id)
+                    if emb is None:
+                        continue
+                    v = np.array(emb, dtype=np.float32)
+                    v_norm = np.linalg.norm(v)
+                    if v_norm == 0:
+                        continue
+                    score = float(np.dot(q, v) / (q_norm * v_norm))
+                    candidates.append((block.block_id, doc_id, score))
+            candidates.sort(key=lambda x: x[2], reverse=True)
+            results: list[DocumentBlock] = []
+            for block_id, doc_id, _ in candidates[:top_k]:
+                for block in self._blocks_by_doc.get(doc_id, []):
+                    if block.block_id == block_id:
+                        results.append(replace(block))
+                        break
+            return results
 
     def _recompute_canonical_flags(self) -> None:
         """将每个冲突组中置信度最高的事实标记为 canonical。

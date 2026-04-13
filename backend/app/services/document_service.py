@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from time import perf_counter
@@ -29,6 +30,7 @@ class DocumentService:
         extraction_service: FactExtractionService,
         executor: TaskExecutor,
         settings: Settings,
+        embedding_service: object | None = None,
     ) -> None:
         """初始化文档处理流程所需依赖。
         Initialize dependencies required for document-processing workflows.
@@ -38,6 +40,7 @@ class DocumentService:
         self._extraction_service = extraction_service
         self._executor = executor
         self._settings = settings
+        self._embedding_service = embedding_service
 
     def upload_document(
         self,
@@ -223,6 +226,9 @@ class DocumentService:
                 f"document_parse completed in {total_elapsed:.2f}s",
                 extra={"doc_id": doc_id, "task_id": task_id, "duration_ms": round(total_elapsed * 1000, 1)},
             )
+
+            # 后台异步生成向量嵌入（不阻塞解析管道，不影响 parsed 状态）
+            self._embed_blocks_async(blocks)
         except Exception as exc:
             self._logger.error(
                 f"document_parse failed: {exc}",
@@ -236,6 +242,21 @@ class DocumentService:
                 message="Document parsing failed.",
                 error=str(exc),
             )
+
+    def _embed_blocks_async(self, blocks: list) -> None:
+        """在后台线程中为文档块生成向量嵌入，不阻塞主解析流程。"""
+        if self._embedding_service is None or not blocks:
+            return
+
+        def _run() -> None:
+            try:
+                count = self._embedding_service.embed_blocks(blocks)
+                self._logger.info("Background embedding completed: %d blocks", count)
+            except Exception as exc:
+                self._logger.warning("Background embedding failed: %s", exc)
+
+        thread = threading.Thread(target=_run, daemon=True)
+        thread.start()
 
     def _build_document_metadata(
         self,

@@ -21,6 +21,9 @@ import {
   PanelLeftClose,
   PanelLeftOpen,
   Sparkles,
+  CheckSquare,
+  Square,
+  X,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
@@ -81,6 +84,8 @@ export default function AgentPage() {
   const removeConversationFromList = useUiStore((s) => s.removeConversationFromList);
 
   const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [selectMode, setSelectMode] = useState(false);
+  const [selectedConvIds, setSelectedConvIds] = useState<Set<string>>(new Set());
 
   const refreshAvailableDocuments = useCallback(async () => {
     const docs = await listDocuments();
@@ -177,6 +182,48 @@ export default function AgentPage() {
       toast.error('删除对话失败');
     }
   }, [agentContextId, removeConversationFromList, startNewConversation]);
+
+  const toggleConvSelection = useCallback((convId: string) => {
+    setSelectedConvIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(convId)) next.delete(convId); else next.add(convId);
+      return next;
+    });
+  }, []);
+
+  const handleBatchDelete = useCallback(async () => {
+    if (selectedConvIds.size === 0) return;
+    const ids = [...selectedConvIds];
+    let deleted = 0;
+    for (const id of ids) {
+      try {
+        await deleteConversation(id);
+        removeConversationFromList(id);
+        if (agentContextId === id) {
+          startNewConversation();
+          setFillTaskId(null);
+          setFillTask(null);
+        }
+        deleted++;
+      } catch { /* continue */ }
+    }
+    setSelectedConvIds(new Set());
+    setSelectMode(false);
+    toast.info(`已删除 ${deleted} 个对话`);
+  }, [selectedConvIds, agentContextId, removeConversationFromList, startNewConversation]);
+
+  const handleSelectAll = useCallback(() => {
+    if (selectedConvIds.size === conversationList.length) {
+      setSelectedConvIds(new Set());
+    } else {
+      setSelectedConvIds(new Set(conversationList.map((c) => c.conversation_id)));
+    }
+  }, [selectedConvIds.size, conversationList]);
+
+  const exitSelectMode = useCallback(() => {
+    setSelectMode(false);
+    setSelectedConvIds(new Set());
+  }, []);
 
   // Poll fill task status
   useEffect(() => {
@@ -309,6 +356,15 @@ export default function AgentPage() {
       if (r.context_id && r.context_id !== agentContextId) {
         setAgentContextId(r.context_id);
       }
+      // 如果 agent 在对话中调用了 fill_template 工具，后端会返回 task_id
+      if (r.task_id) {
+        setFillTaskId(r.task_id);
+        try {
+          const task = await getTaskStatus(r.task_id);
+          setFillTask(task);
+          upsertTaskSnapshot(task);
+        } catch { /* polling will pick it up */ }
+      }
       const summary = formatAgentReply(r);
       addAgentMessage({
         role: 'assistant',
@@ -404,37 +460,62 @@ export default function AgentPage() {
       {/* ── Left: Conversation Sidebar ── */}
       <div className={`flex flex-col border-r bg-muted/30 transition-all ${sidebarOpen ? 'w-56' : 'w-0 overflow-hidden'}`}>
         <div className="flex items-center justify-between gap-1 border-b px-2 py-2">
-          <span className="text-xs font-medium truncate">对话列表</span>
-          <div className="flex gap-0.5">
-            <Button variant="ghost" size="icon" className="h-6 w-6" onClick={handleNewConversation} title="新建对话">
-              <MessageSquarePlus className="h-3.5 w-3.5" />
-            </Button>
-            <Button variant="ghost" size="icon" className="h-6 w-6" onClick={() => setSidebarOpen(false)} title="收起">
-              <PanelLeftClose className="h-3.5 w-3.5" />
-            </Button>
-          </div>
+          {selectMode ? (
+            <>
+              <span className="text-xs font-medium truncate text-destructive">已选 {selectedConvIds.size}</span>
+              <div className="flex gap-0.5">
+                <Button variant="ghost" size="icon" className="h-6 w-6" onClick={handleSelectAll} title={selectedConvIds.size === conversationList.length ? '取消全选' : '全选'}>
+                  <CheckSquare className="h-3.5 w-3.5" />
+                </Button>
+                <Button variant="ghost" size="icon" className="h-6 w-6 text-destructive hover:text-destructive" onClick={handleBatchDelete} title="删除选中" disabled={selectedConvIds.size === 0}>
+                  <Trash2 className="h-3.5 w-3.5" />
+                </Button>
+                <Button variant="ghost" size="icon" className="h-6 w-6" onClick={exitSelectMode} title="取消">
+                  <X className="h-3.5 w-3.5" />
+                </Button>
+              </div>
+            </>
+          ) : (
+            <>
+              <span className="text-xs font-medium truncate">对话列表</span>
+              <div className="flex gap-0.5">
+                <Button variant="ghost" size="icon" className="h-6 w-6" onClick={handleNewConversation} title="新建对话">
+                  <MessageSquarePlus className="h-3.5 w-3.5" />
+                </Button>
+                {conversationList.length > 0 && (
+                  <Button variant="ghost" size="icon" className="h-6 w-6" onClick={() => setSelectMode(true)} title="批量删除">
+                    <Trash2 className="h-3.5 w-3.5" />
+                  </Button>
+                )}
+                <Button variant="ghost" size="icon" className="h-6 w-6" onClick={() => setSidebarOpen(false)} title="收起">
+                  <PanelLeftClose className="h-3.5 w-3.5" />
+                </Button>
+              </div>
+            </>
+          )}
         </div>
         <ScrollArea className="flex-1">
           <div className="space-y-0.5 p-1">
             {conversationList.map((conv) => (
               <div
                 key={conv.conversation_id}
-                className={`group flex items-center gap-1 rounded px-2 py-1.5 text-xs cursor-pointer hover:bg-muted ${agentContextId === conv.conversation_id ? 'bg-muted font-medium' : ''}`}
-                onClick={() => handleSwitchConversation(conv)}
+                className={`group flex items-center gap-1 rounded px-2 py-1.5 text-xs cursor-pointer hover:bg-muted overflow-hidden ${agentContextId === conv.conversation_id ? 'bg-muted font-medium' : ''} ${selectMode && selectedConvIds.has(conv.conversation_id) ? 'bg-primary/10' : ''}`}
+                onClick={() => selectMode ? toggleConvSelection(conv.conversation_id) : handleSwitchConversation(conv)}
               >
+                {selectMode && (
+                  <span className="shrink-0">
+                    {selectedConvIds.has(conv.conversation_id)
+                      ? <CheckSquare className="h-3.5 w-3.5 text-primary" />
+                      : <Square className="h-3.5 w-3.5 text-muted-foreground/50" />}
+                  </span>
+                )}
                 <div className="min-w-0 flex-1">
                   <div className="truncate">{getConversationDisplayTitle(conv)}</div>
-                  <div className="truncate text-[10px] text-muted-foreground">
-                    {getConversationPreview(conv)}
+                  <div className="flex items-center gap-1 text-[10px] text-muted-foreground">
+                    <span className="shrink-0">{formatConversationTime(conv.updated_at)}</span>
+                    <span className="truncate">{getConversationPreview(conv)}</span>
                   </div>
                 </div>
-                <button
-                  className="invisible group-hover:visible shrink-0 text-muted-foreground hover:text-destructive"
-                  onClick={(e) => { e.stopPropagation(); handleDeleteConversation(conv.conversation_id); }}
-                  title="删除"
-                >
-                  <Trash2 className="h-3 w-3" />
-                </button>
               </div>
             ))}
             {conversationList.length === 0 && (
@@ -942,6 +1023,26 @@ function resolveAgentDocumentScope(
   return { scopedDocuments: sourceDocuments, effectiveDocumentSetId: null };
 }
 
+function formatConversationTime(isoString: string | undefined): string {
+  if (!isoString) return '';
+  try {
+    const date = new Date(isoString);
+    const now = new Date();
+    const diffMs = now.getTime() - date.getTime();
+    const diffMin = Math.floor(diffMs / 60000);
+    if (diffMin < 1) return '刚刚';
+    if (diffMin < 60) return `${diffMin}分钟前`;
+    const diffHour = Math.floor(diffMin / 60);
+    if (diffHour < 24) return `${diffHour}小时前`;
+    const isThisYear = date.getFullYear() === now.getFullYear();
+    if (isThisYear) {
+      return `${date.getMonth() + 1}/${date.getDate()} ${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`;
+    }
+    return `${date.getFullYear()}/${date.getMonth() + 1}/${date.getDate()}`;
+  } catch {
+    return '';
+  }
+}
 
 function getConversationDisplayTitle(conv: ConversationResponse): string {
   const title = typeof conv.title === 'string' ? conv.title.trim() : '';

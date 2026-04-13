@@ -68,6 +68,25 @@ class Settings:
     openai_timeout_seconds: float = field(
         default_factory=lambda: float(os.getenv("DOCFUSION_OPENAI_TIMEOUT_SECONDS", "45"))
     )
+    # ── Embedding（硅基流动 bge-m3）──
+    embedding_api_key: str = field(
+        default_factory=lambda: os.getenv("DOCFUSION_EMBEDDING_API_KEY", "")
+    )
+    embedding_base_url: str = field(
+        default_factory=lambda: os.getenv(
+            "DOCFUSION_EMBEDDING_BASE_URL", "https://api.siliconflow.cn/v1"
+        )
+    )
+    embedding_model: str = field(
+        default_factory=lambda: os.getenv("DOCFUSION_EMBEDDING_MODEL", "BAAI/bge-m3")
+    )
+    embedding_dim: int = field(
+        default_factory=lambda: int(os.getenv("DOCFUSION_EMBEDDING_DIM", "1024"))
+    )
+    # ── Agent ──
+    agent_max_iterations: int = field(
+        default_factory=lambda: int(os.getenv("DOCFUSION_AGENT_MAX_ITERATIONS", "10"))
+    )
     cors_allow_origins_raw: tuple[str, ...] = field(
         default_factory=lambda: _split_csv_env(
             "DOCFUSION_CORS_ALLOW_ORIGINS",

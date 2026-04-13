@@ -7,6 +7,11 @@ from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, Integer, Str
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
+try:
+    from pgvector.sqlalchemy import Vector
+except ImportError:  # pgvector not installed – fall back to no-op for memory-only mode
+    Vector = None
+
 
 class Base(DeclarativeBase):
     """SQLAlchemy 声明式基类。
@@ -49,6 +54,9 @@ class DocumentBlockRow(Base):
     section_path: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
     page_or_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
     metadata_json: Mapped[dict[str, Any]] = mapped_column("metadata", JSONB, nullable=False, default=dict)
+    # pgvector embedding column – nullable so existing rows still work
+    if Vector is not None:
+        embedding = mapped_column(Vector(1024), nullable=True)
 
 
 class FactRow(Base):

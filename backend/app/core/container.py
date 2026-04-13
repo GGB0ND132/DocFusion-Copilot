@@ -13,10 +13,8 @@ from app.repositories.memory import InMemoryRepository
 from app.repositories.postgres import PostgresRepository
 
 _logger = logging.getLogger("container")
-from app.services.benchmark_service import BenchmarkService
-from app.services.agent_service import AgentService
 from app.services.document_service import DocumentService
-from app.services.document_interaction_service import DocumentInteractionService
+from app.services.embedding_service import EmbeddingService
 from app.services.fact_service import FactService
 from app.services.fact_extraction import FactExtractionService
 from app.services.template_service import TemplateService
@@ -36,13 +34,12 @@ class ServiceContainer:
     openai_client: OpenAICompatibleClient
     parser_registry: ParserRegistry
     extraction_service: FactExtractionService
+    embedding_service: EmbeddingService
     document_service: DocumentService
     template_service: TemplateService
-    benchmark_service: BenchmarkService
     fact_service: FactService
     trace_service: TraceService
-    agent_service: AgentService
-    document_interaction_service: DocumentInteractionService
+    agent_graph: object  # langgraph CompiledGraph
 
 
 @lru_cache(maxsize=1)
@@ -66,12 +63,23 @@ def get_container() -> ServiceContainer:
     )
     parser_registry = ParserRegistry()
     extraction_service = FactExtractionService(openai_client=openai_client)
+
+    # Embedding service (SiliconFlow bge-m3)
+    from app.core.embeddings import build_embedding_model
+
+    embedding_model = build_embedding_model(settings)
+    embedding_service = EmbeddingService(
+        embedding_model=embedding_model,
+        repository=repository,
+    )
+
     document_service = DocumentService(
         repository=repository,
         parser_registry=parser_registry,
         extraction_service=extraction_service,
         executor=executor,
         settings=settings,
+        embedding_service=embedding_service,
     )
     template_service = TemplateService(
         repository=repository,
@@ -80,22 +88,25 @@ def get_container() -> ServiceContainer:
         openai_client=openai_client,
         extraction_service=extraction_service,
     )
-    benchmark_service = BenchmarkService(
-        repository=repository,
-        executor=executor,
-        settings=settings,
-        template_service=template_service,
-    )
     fact_service = FactService(repository=repository)
     trace_service = TraceService(repository=repository)
-    agent_service = AgentService(repository=repository, openai_client=openai_client)
-    document_interaction_service = DocumentInteractionService(
+
+    # LangGraph agent
+    from app.core.llm import build_chat_model
+    from app.agent.tools import create_tools
+    from app.agent.graph import build_graph
+
+    chat_model = build_chat_model(settings)
+    tools = create_tools(
         repository=repository,
-        agent_service=agent_service,
+        embedding_service=embedding_service,
+        extraction_service=extraction_service,
         template_service=template_service,
+        trace_service=trace_service,
         settings=settings,
-        openai_client=openai_client,
     )
+    agent_graph = build_graph(chat_model=chat_model, tools=tools)
+
     return ServiceContainer(
         settings=settings,
         repository=repository,
@@ -103,11 +114,10 @@ def get_container() -> ServiceContainer:
         openai_client=openai_client,
         parser_registry=parser_registry,
         extraction_service=extraction_service,
+        embedding_service=embedding_service,
         document_service=document_service,
         template_service=template_service,
-        benchmark_service=benchmark_service,
         fact_service=fact_service,
         trace_service=trace_service,
-        agent_service=agent_service,
-        document_interaction_service=document_interaction_service,
+        agent_graph=agent_graph,
     )

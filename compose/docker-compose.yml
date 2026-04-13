@@ -1,0 +1,78 @@
+# DocFusion Copilot — 全容器启动
+#
+# 启动：  docker compose up --build
+# 后台：  docker compose up -d --build
+# 停止：  docker compose down
+# 清数据：docker compose down -v
+#
+# 访问：
+#   前端   http://localhost:8080
+#   后端   http://localhost:8000
+#   API文档 http://localhost:8000/docs
+
+services:
+
+  # ── PostgreSQL（含 pgvector 扩展）──────────────────────────────────────
+  postgres:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: docfusion_copilot
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d docfusion_copilot"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  # ── Backend（FastAPI + LangGraph）─────────────────────────────────────
+  backend:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      # LLM（必填，从 .env 读取）
+      DOCFUSION_OPENAI_API_KEY: ${DOCFUSION_OPENAI_API_KEY}
+      DOCFUSION_OPENAI_BASE_URL: ${DOCFUSION_OPENAI_BASE_URL:-https://api.deepseek.com}
+      DOCFUSION_OPENAI_MODEL: ${DOCFUSION_OPENAI_MODEL:-deepseek-chat}
+      DOCFUSION_OPENAI_TIMEOUT_SECONDS: ${DOCFUSION_OPENAI_TIMEOUT_SECONDS:-45}
+      # 向量检索（选填）
+      DOCFUSION_EMBEDDING_API_KEY: ${DOCFUSION_EMBEDDING_API_KEY:-}
+      DOCFUSION_EMBEDDING_BASE_URL: ${DOCFUSION_EMBEDDING_BASE_URL:-https://api.siliconflow.cn/v1}
+      DOCFUSION_EMBEDDING_MODEL: ${DOCFUSION_EMBEDDING_MODEL:-BAAI/bge-m3}
+      # 数据库（指向 compose 内部 postgres 服务名）
+      DOCFUSION_DATABASE_URL: postgresql+psycopg://postgres:${POSTGRES_PASSWORD:-postgres}@postgres:5432/docfusion_copilot
+      # CORS：允许前端容器端口访问
+      DOCFUSION_CORS_ALLOW_ORIGINS: "http://localhost:${FRONTEND_PORT:-8080},http://127.0.0.1:${FRONTEND_PORT:-8080}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      # 持久化上传文件和生成产物，宿主机路径也可访问
+      - backend_storage:/workspace/backend/storage
+    ports:
+      - "${BACKEND_PORT:-8000}:8000"
+
+  # ── Frontend（Vite 构建 + nginx 静态服务）─────────────────────────────
+  frontend:
+    build:
+      context: ../frontend
+      dockerfile: Dockerfile
+      args:
+        # 浏览器（宿主机）访问的后端地址，NOT 容器内地址
+        VITE_API_BASE_URL: http://localhost:${BACKEND_PORT:-8000}
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "${FRONTEND_PORT:-8080}:80"
+
+volumes:
+  postgres_data:      # PostgreSQL 数据持久化
+  backend_storage:    # 上传文档 & 生成结果持久化

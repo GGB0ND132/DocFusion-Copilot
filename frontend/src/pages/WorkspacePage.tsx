@@ -229,7 +229,7 @@ export default function WorkspacePage() {
                   onClick={() => setSelectedDocId(doc.doc_id)}
                 >
                   <FileIcon docType={doc.doc_type} />
-                  <span className="flex-1 truncate">{doc.file_name}</span>
+                  <span className="flex-1 truncate text-center" title={doc.file_name}>{doc.file_name}</span>
                   <StatusDot status={doc.status} />
                 </button>
                 <span

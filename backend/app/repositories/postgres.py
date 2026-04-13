@@ -52,7 +52,37 @@ class PostgresRepository:
         """创建当前仓储运行所需的数据库表。
         Create the database tables required by the repository.
         """
-        Base.metadata.create_all(self._engine)
+        import logging
+        _log = logging.getLogger("postgres")
+
+        # 尝试启用 pgvector 扩展；如果服务器未安装则跳过（向量搜索不可用）
+        self._vector_available = False
+        try:
+            with self._engine.begin() as connection:
+                connection.exec_driver_sql("CREATE EXTENSION IF NOT EXISTS vector")
+            self._vector_available = True
+            _log.info("pgvector 扩展已就绪")
+        except Exception as exc:
+            _log.warning(
+                "pgvector 扩展不可用，向量搜索功能将被禁用: %s"
+                "\n安装方法: https://github.com/pgvector/pgvector#installation",
+                exc,
+            )
+
+        # 创建表；如果 vector 列导致失败，去掉该列重试
+        try:
+            Base.metadata.create_all(self._engine)
+        except Exception:
+            if not self._vector_available:
+                _log.info("去掉 embedding 列后重新建表")
+                from app.repositories.sqlalchemy_models import DocumentBlockRow
+                # 临时移除 embedding 列定义再建表
+                embedding_col = DocumentBlockRow.__table__.columns.get("embedding")
+                if embedding_col is not None:
+                    DocumentBlockRow.__table__.columns.remove(embedding_col)
+                Base.metadata.create_all(self._engine)
+            else:
+                raise
         self._ensure_indexes()
 
     @contextmanager
@@ -425,6 +455,38 @@ class PostgresRepository:
             record = self._conversation_from_row(row)
             session.delete(row)
             return record
+
+    # ── Vector search ──
+
+    def upsert_block_embedding(self, block_id: str, embedding: list[float]) -> None:
+        """更新指定块的向量嵌入。"""
+        with self._session() as session:
+            row = session.get(DocumentBlockRow, block_id)
+            if row is not None and hasattr(row, "embedding"):
+                row.embedding = embedding
+                session.add(row)
+
+    def vector_search_blocks(
+        self,
+        query_embedding: list[float],
+        *,
+        top_k: int = 10,
+        document_ids: set[str] | None = None,
+    ) -> list[DocumentBlock]:
+        """基于 pgvector 余弦距离检索最相近的文档块。"""
+        if not hasattr(DocumentBlockRow, "embedding"):
+            return []
+        with self._session() as session:
+            distance_col = DocumentBlockRow.embedding.cosine_distance(query_embedding).label("distance")
+            stmt = (
+                select(DocumentBlockRow)
+                .where(DocumentBlockRow.embedding.isnot(None))
+                .order_by(distance_col)
+                .limit(top_k)
+            )
+            if document_ids is not None:
+                stmt = stmt.where(DocumentBlockRow.doc_id.in_(sorted(document_ids)))
+            return [self._block_from_row(row) for row in session.scalars(stmt).all()]
 
     def _recompute_canonical_flags(
         self,

@@ -158,3 +158,17 @@ class Repository(Protocol):
 
     def delete_conversation(self, conversation_id: str) -> ConversationRecord | None:
         """删除对话记录。    Delete a conversation record."""
+
+    # ── Vector search ──
+
+    def upsert_block_embedding(self, block_id: str, embedding: list[float]) -> None:
+        """更新指定块的向量嵌入。    Store or update the embedding vector for a block."""
+
+    def vector_search_blocks(
+        self,
+        query_embedding: list[float],
+        *,
+        top_k: int = 10,
+        document_ids: set[str] | None = None,
+    ) -> list[DocumentBlock]:
+        """按向量相似度检索文档块。    Retrieve document blocks by vector similarity."""
