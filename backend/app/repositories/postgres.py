@@ -479,21 +479,27 @@ class PostgresRepository:
         *,
         top_k: int = 10,
         document_ids: set[str] | None = None,
-    ) -> list[DocumentBlock]:
+        min_score: float = 0.0,
+    ) -> list[tuple[DocumentBlock, float]]:
         """基于 pgvector 余弦距离检索最相近的文档块。"""
         if not hasattr(DocumentBlockRow, "embedding"):
             return []
         with self._session() as session:
             distance_col = DocumentBlockRow.embedding.cosine_distance(query_embedding).label("distance")
             stmt = (
-                select(DocumentBlockRow)
+                select(DocumentBlockRow, distance_col)
                 .where(DocumentBlockRow.embedding.isnot(None))
                 .order_by(distance_col)
                 .limit(top_k)
             )
             if document_ids is not None:
                 stmt = stmt.where(DocumentBlockRow.doc_id.in_(sorted(document_ids)))
-            return [self._block_from_row(row) for row in session.scalars(stmt).all()]
+            results: list[tuple[DocumentBlock, float]] = []
+            for row, dist in session.execute(stmt).all():
+                score = 1.0 - dist  # cosine_distance = 1 - similarity
+                if score >= min_score:
+                    results.append((self._block_from_row(row), score))
+            return results
 
     def _recompute_canonical_flags(
         self,

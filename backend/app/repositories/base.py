@@ -176,5 +176,6 @@ class Repository(Protocol):
         *,
         top_k: int = 10,
         document_ids: set[str] | None = None,
-    ) -> list[DocumentBlock]:
-        """按向量相似度检索文档块。    Retrieve document blocks by vector similarity."""
+        min_score: float = 0.0,
+    ) -> list[tuple[DocumentBlock, float]]:
+        """按向量相似度检索文档块，返回 (block, score) 列表。    Retrieve document blocks by vector similarity."""

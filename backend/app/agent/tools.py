@@ -83,7 +83,7 @@ def create_tools(
         if not blocks:
             return "未找到相关文档片段。"
         results = []
-        for b in blocks:
+        for b, _score in blocks:
             text_preview = b.text[:300] + ("..." if len(b.text) > 300 else "")
             results.append(f"[{b.doc_id} / {b.block_type}]\n{text_preview}")
         return f"找到 {len(blocks)} 个相关片段：\n\n" + "\n---\n".join(results)

@@ -237,3 +237,76 @@ def parse_date_range_from_text(text: str) -> tuple[str | None, str | None]:
     if len(dates) == 1:
         return dates[0], dates[0]
     return None, None
+
+
+# ── Entity / Year constraint parsing from user requirement ──
+
+_ENTITY_LIST_RE = re.compile(
+    r"(?:城市|地区|区域|省份|实体|包含|包括|选取|筛选|只.*?)[：:]\s*"
+    r"([\u4e00-\u9fff\w]+(?:[,，、/ \t]+[\u4e00-\u9fff\w]+)*)",
+)
+_ENTITY_SINGLE_RE = re.compile(
+    r"(?:城市|地区|区域|省份)[：:]\s*([\u4e00-\u9fff]{2,6}(?:市|县|区|省)?)"
+)
+_ENTITY_SPLIT_RE = re.compile(r"[,，、/ \t]+")
+
+
+def parse_entity_filter_from_text(text: str) -> list[str]:
+    """从用户需求文本中提取目标实体列表。
+
+    支持模式如：
+    - "城市：济南市、青岛市、烟台市"  (逗号/顿号分隔)
+    - "筛选：济南, 青岛"
+    - "地区：潍坊/德州/聊城"
+    - 多行重复 "城市：德州市" / "城市：潍坊市"
+    """
+    if not text:
+        return []
+
+    entities: list[str] = []
+    seen: set[str] = set()
+
+    # 1. 尝试列表模式 (逗号/顿号分隔)
+    m = _ENTITY_LIST_RE.search(text)
+    if m:
+        raw = m.group(1).strip()
+        for e in _ENTITY_SPLIT_RE.split(raw):
+            cleaned = e.strip().rstrip("市县区省")
+            if cleaned and len(cleaned) >= 2 and cleaned not in seen:
+                seen.add(cleaned)
+                entities.append(cleaned)
+
+    # 2. 收集所有 "城市：X" 单独出现的模式
+    for sm in _ENTITY_SINGLE_RE.finditer(text):
+        cleaned = sm.group(1).strip().rstrip("市县区省")
+        if cleaned and len(cleaned) >= 2 and cleaned not in seen:
+            seen.add(cleaned)
+            entities.append(cleaned)
+
+    return entities
+
+
+_YEAR_RANGE_RE = re.compile(
+    r"(?P<y1>(?:19|20)\d{2})\s*[-~至到—]\s*(?P<y2>(?:19|20)\d{2})"
+)
+
+
+def parse_year_filter_from_text(text: str) -> tuple[int | None, int | None]:
+    """从用户需求文本中提取年份范围约束。
+
+    支持模式如：
+    - "2020-2024年"
+    - "2018至2023"
+    - 单独提到的 "2024年" 视为精确匹配
+    """
+    if not text:
+        return None, None
+    m = _YEAR_RANGE_RE.search(text)
+    if m:
+        return int(m.group("y1")), int(m.group("y2"))
+    years = [int(y.group("year")) for y in _YEAR_RE.finditer(text)]
+    if len(years) >= 2:
+        return min(years), max(years)
+    if len(years) == 1:
+        return years[0], years[0]
+    return None, None

@@ -150,7 +150,10 @@ def load_xlsx(path: str | Path) -> SpreadsheetDocument:
                     cell_ref = cell_el.get("r")
                     if not cell_ref:
                         continue
-                    _, column_index = split_cell_ref(cell_ref)
+                    try:
+                        _, column_index = split_cell_ref(cell_ref)
+                    except ValueError:
+                        continue  # skip malformed cell references
                     value_map[column_index] = _read_cell_value(cell_el, shared_strings)
                 row_maps.append((row_index, value_map))
 
@@ -216,6 +219,8 @@ def _load_sheet_targets(archive: zipfile.ZipFile) -> list[tuple[str, str]]:
     relations = {}
     for relation in rels_root.findall("rel:Relationship", NS):
         target_path = relation.get("Target", "")
+        # Strip leading '/' (absolute OPC path) before normalising
+        target_path = target_path.lstrip("/")
         if not target_path.startswith("xl/"):
             target_path = f"xl/{target_path}"
         relations[relation.get("Id")] = target_path

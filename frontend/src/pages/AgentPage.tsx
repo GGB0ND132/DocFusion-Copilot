@@ -23,6 +23,7 @@ import {
   Square,
   X,
   PanelLeftClose,
+  PanelLeftOpen,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
@@ -380,7 +381,6 @@ export default function AgentPage() {
       // Keep the locally derived scope if refresh fails.
     }
 
-    // Always run agent execute first (without template) to determine intent
     const ac = new AbortController();
     abortControllerRef.current = ac;
     setIsExecuting(true);
@@ -392,32 +392,41 @@ export default function AgentPage() {
         documentSetId: runtimeDocumentSetId ?? undefined,
         documentIds: runtimeParsedDocIds,
         autoMatch: true,
+        ...(templateFile ? { templateFile, userRequirement: text } : {}),
       }, { signal: ac.signal });
       if (r.context_id && r.context_id !== agentContextId) {
         setAgentContextId(r.context_id);
       }
-      // 如果 agent 在对话中调用了 fill_template 工具，后端会返回 task_id
       if (r.task_id) {
+        // 模板回填任务已提交
         setFillTaskId(r.task_id);
         try {
           const task = await getTaskStatus(r.task_id);
           setFillTask(task);
           upsertTaskSnapshot(task);
         } catch { /* polling will pick it up */ }
+        addAgentMessage({
+          role: 'assistant',
+          text: `模板回填任务已提交。\n模板：${r.template_name ?? templateFile?.name}\n任务 ID：${r.task_id}\n状态：${r.task_status ?? 'queued'}`,
+          timestamp: Date.now(),
+          taskId: r.task_id,
+        });
+        setTemplateFile(null);
+      } else {
+        const summary = formatAgentReply(r);
+        addAgentMessage({
+          role: 'assistant',
+          text: summary,
+          timestamp: Date.now(),
+          data: shouldRenderOperationCard(r) ? r : undefined,
+        });
       }
-      const summary = formatAgentReply(r);
-      addAgentMessage({
-        role: 'assistant',
-        text: summary,
-        timestamp: Date.now(),
-        data: shouldRenderOperationCard(r) ? r : undefined,
-      });
       refreshConversations();
     } catch (err) {
       if (err instanceof DOMException && err.name === 'AbortError') {
         addAgentMessage({ role: 'assistant', text: '已中止回答。', timestamp: Date.now() });
       } else {
-        const msg = err instanceof Error ? err.message : 'Agent 执行失败';
+        const msg = err instanceof Error ? err.message : templateFile ? '模板回填失败' : 'Agent 执行失败';
         addAgentMessage({ role: 'assistant', text: `错误：${msg}`, timestamp: Date.now() });
         toast.error(msg);
       }
@@ -573,7 +582,14 @@ export default function AgentPage() {
         </div>
       </div>
 
-      <ResizableHandle withHandle />
+      {/* ── Sidebar expand button (visible when collapsed) ── */}
+      {!sidebarOpen && (
+        <div className="flex items-center border-r">
+          <Button variant="ghost" size="icon" className="h-8 w-8 rounded-none" onClick={() => setSidebarOpen(true)} title="展开对话列表">
+            <PanelLeftOpen className="h-4 w-4" />
+          </Button>
+        </div>
+      )}
 
       {/* ── Main chat area ── */}
       <ResizablePanel defaultSize={48} minSize={30}>

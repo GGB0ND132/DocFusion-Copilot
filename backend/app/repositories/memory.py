@@ -334,8 +334,9 @@ class InMemoryRepository:
         *,
         top_k: int = 10,
         document_ids: set[str] | None = None,
-    ) -> list[DocumentBlock]:
-        """基于 numpy 余弦相似度检索最相近的文档块。"""
+        min_score: float = 0.0,
+    ) -> list[tuple[DocumentBlock, float]]:
+        """基于 numpy 余弦相似度检索最相近的文档块，返回 (block, score) 列表。"""
         import numpy as np
 
         with self._lock:
@@ -356,13 +357,14 @@ class InMemoryRepository:
                     if v_norm == 0:
                         continue
                     score = float(np.dot(q, v) / (q_norm * v_norm))
-                    candidates.append((block.block_id, doc_id, score))
+                    if score >= min_score:
+                        candidates.append((block.block_id, doc_id, score))
             candidates.sort(key=lambda x: x[2], reverse=True)
-            results: list[DocumentBlock] = []
-            for block_id, doc_id, _ in candidates[:top_k]:
+            results: list[tuple[DocumentBlock, float]] = []
+            for block_id, doc_id, score in candidates[:top_k]:
                 for block in self._blocks_by_doc.get(doc_id, []):
                     if block.block_id == block_id:
-                        results.append(replace(block))
+                        results.append((replace(block), score))
                         break
             return results
 

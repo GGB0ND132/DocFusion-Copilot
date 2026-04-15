@@ -87,6 +87,7 @@ def get_container() -> ServiceContainer:
         settings=settings,
         openai_client=openai_client,
         extraction_service=extraction_service,
+        embedding_service=embedding_service,
     )
     fact_service = FactService(repository=repository)
     trace_service = TraceService(repository=repository)

@@ -109,12 +109,6 @@ class DocumentService:
         """
         return self._repository.get_document(doc_id)
 
-    def get_document_blocks(self, doc_id: str) -> list:
-        """返回指定文档的全部解析块。
-        Return all parsed blocks for a document.
-        """
-        return self._repository.list_blocks(doc_id)
-
     def get_document_facts(
         self,
         doc_id: str,
@@ -165,7 +159,7 @@ class DocumentService:
             if document is None:
                 raise RuntimeError(f"Document {doc_id} disappeared during parsing.")
 
-            if self._should_skip_fact_extraction(document):
+            if self._should_skip_fact_extraction(document, block_count=len(blocks)):
                 total_elapsed = round(perf_counter() - started_at, 3)
                 self._repository.update_document(
                     doc_id,
@@ -175,14 +169,14 @@ class DocumentService:
                         "fact_count": 0,
                         "parse_seconds": parse_elapsed,
                         "total_seconds": total_elapsed,
-                        "processing_note": "Prompt/instruction text detected, skipped fact extraction.",
+                        "processing_note": "Fact extraction skipped (instruction text or large spreadsheet).",
                     },
                 )
                 self._repository.update_task(
                     task_id,
                     status=TaskStatus.succeeded,
                     progress=1.0,
-                    message="Instruction text parsed and excluded from fact extraction.",
+                    message=f"Document parsed in {total_elapsed:.2f}s, fact extraction skipped.",
                     result_updates={
                         "fact_count": 0,
                         "total_seconds": total_elapsed,
@@ -228,7 +222,7 @@ class DocumentService:
             )
 
             # 后台异步生成向量嵌入（不阻塞解析管道，不影响 parsed 状态）
-            self._embed_blocks_async(blocks)
+            self._embed_blocks_async(blocks, file_name=document.file_name)
         except Exception as exc:
             self._logger.error(
                 f"document_parse failed: {exc}",
@@ -243,15 +237,15 @@ class DocumentService:
                 error=str(exc),
             )
 
-    def _embed_blocks_async(self, blocks: list) -> None:
+    def _embed_blocks_async(self, blocks: list, *, file_name: str = "") -> None:
         """在后台线程中为文档块生成向量嵌入，不阻塞主解析流程。"""
         if self._embedding_service is None or not blocks:
             return
 
         def _run() -> None:
             try:
-                count = self._embedding_service.embed_blocks(blocks)
-                self._logger.info("Background embedding completed: %d blocks", count)
+                count = self._embedding_service.embed_blocks(blocks, file_name=file_name)
+                self._logger.info("Background embedding completed: %d blocks (file=%s)", count, file_name)
             except Exception as exc:
                 self._logger.warning("Background embedding failed: %s", exc)
 
@@ -304,9 +298,20 @@ class DocumentService:
             return True
         return any(marker in preview for marker in instruction_markers)
 
-    def _should_skip_fact_extraction(self, document: DocumentRecord) -> bool:
+    def _should_skip_fact_extraction(self, document: DocumentRecord, *, block_count: int = 0) -> bool:
         """判断该文档是否应跳过事实抽取。
         Return whether fact extraction should be skipped for this document.
+        Skip when: (1) metadata explicitly says so (prompt/instruction text),
+        or (2) large spreadsheet (>5000 blocks) — direct_search uses blocks directly.
         """
-
-        return bool(document.metadata.get("skip_fact_extraction"))
+        if document.metadata.get("skip_fact_extraction"):
+            return True
+        # Large spreadsheets: fact extraction is very slow and unnecessary;
+        # direct_search will use block metadata (row_values) directly.
+        if document.doc_type in ("xlsx", "xls", "csv") and block_count > 2000:
+            self._logger.info(
+                "Skipping fact extraction for large spreadsheet: doc_type=%s, blocks=%d",
+                document.doc_type, block_count,
+            )
+            return True
+        return False

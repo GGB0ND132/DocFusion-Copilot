@@ -202,3 +202,38 @@ def get_document_raw(doc_id: str):
         media_type=media_types.get(suffix, "application/octet-stream"),
         filename=document.file_name,
     )
+
+
+@router.post("/reindex-embeddings")
+def reindex_embeddings(
+    doc_ids: list[str] | None = Body(default=None, embed=True),
+) -> dict:
+    """重新为文档生成 embedding（注入文件名信号）。
+    Re-embed documents with filename-enriched block text.
+    传入 doc_ids 只 reindex 指定文档，不传则全部 reindex.
+    """
+    import time
+    container = get_container()
+    embedding_svc = container.embedding_service
+    if embedding_svc is None or not embedding_svc.is_configured:
+        raise HTTPException(status_code=503, detail="Embedding service is not configured.")
+    repo = container.repository
+    if doc_ids:
+        documents = [repo.get_document(d) for d in doc_ids]
+        documents = [d for d in documents if d is not None]
+    else:
+        documents = repo.list_documents()
+    total_blocks = 0
+    doc_count = 0
+    for doc in documents:
+        if doc.status.value not in ("parsed", "completed"):
+            continue
+        blocks = repo.list_blocks(doc.doc_id)
+        if not blocks:
+            continue
+        count = embedding_svc.embed_blocks(blocks, file_name=doc.file_name)
+        total_blocks += count
+        doc_count += 1
+        # 每个文档之间略停以避免 API 频率限制
+        time.sleep(2)
+    return {"reindexed_documents": doc_count, "reindexed_blocks": total_blocks}

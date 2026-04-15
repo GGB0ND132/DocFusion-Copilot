@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from datetime import datetime, timezone
 from pathlib import Path
 from time import perf_counter
@@ -30,6 +31,7 @@ from app.utils.normalizers import (
     normalize_field_name,
     normalize_field_name_or_passthrough,
     parse_date_range_from_text,
+    parse_entity_filter_from_text,
     strip_header_adornments,
 )
 from app.utils.spreadsheet import CellWrite, SpreadsheetDocument, SpreadsheetSheet, apply_xlsx_updates, build_cell_ref, load_xlsx
@@ -81,6 +83,7 @@ class TemplateService:
         settings: Settings,
         openai_client: OpenAICompatibleClient,
         extraction_service: object | None = None,
+        embedding_service: object | None = None,
     ) -> None:
         """初始化模板回填与匹配流程所需依赖。
         Initialize dependencies used by template filling and matching workflows.
@@ -90,6 +93,7 @@ class TemplateService:
         self._settings = settings
         self._openai_client = openai_client
         self._extraction_service = extraction_service
+        self._embedding_service = embedding_service
 
     def suggest_documents(
         self,
@@ -245,6 +249,145 @@ class TemplateService:
                 user_requirement=user_requirement,
             )
 
+    # ── LLM 需求预分析 JSON schema ──
+    _FILL_ANALYSIS_SCHEMA: dict = {
+        "type": "object",
+        "properties": {
+            "strategy": {
+                "type": "string",
+                "enum": ["structured_filter", "llm_transform"],
+                "description": "structured_filter=源数据以结构化表格为主,直接筛选填充; llm_transform=源数据为非结构化文本或需要复杂转换,用LLM生成代码",
+            },
+            "per_table_filters": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "table_index": {"type": "integer"},
+                        "entity_filter": {"type": "string", "description": "该表需要的实体/城市名,如'德州市'"},
+                        "time_filter": {"type": "string", "description": "该表需要的时间条件,如'2025-11-25 09:00'"},
+                    },
+                },
+                "description": "每张表的筛选条件(仅模板有多表时填写)",
+            },
+            "date_range_from": {"type": "string", "description": "日期范围起始 YYYY-MM-DD,无则空"},
+            "date_range_to": {"type": "string", "description": "日期范围结束 YYYY-MM-DD,无则空"},
+            "needed_fields": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "模板需要的所有字段名",
+            },
+        },
+        "required": ["strategy", "per_table_filters", "needed_fields"],
+        "additionalProperties": False,
+    }
+
+    def _analyze_fill_requirements(
+        self,
+        *,
+        user_requirement: str,
+        template_path: Path,
+        document_ids: list[str],
+    ) -> dict | None:
+        """LLM 预分析: 根据用户需求+模板结构+源文档摘要,返回填充策略和筛选条件。"""
+        has_structured = False
+        has_text_only = False
+        try:
+            suffix = template_path.suffix.lower()
+            # Build template description with ALL tables
+            template_desc_parts: list[str] = []
+            if suffix == ".docx":
+                doc = load_docx_tables(template_path)
+                for ti, table in enumerate(doc.tables):
+                    if not table.rows:
+                        continue
+                    ctx = getattr(table, "context_text", "") or ""
+                    headers = [str(c.value or "").strip() for c in table.rows[0].cells] if hasattr(table.rows[0], "cells") else list(table.rows[0].values)
+                    template_desc_parts.append(
+                        f"表{ti}: 上下文=「{ctx[:200]}」, 列名={headers}"
+                    )
+            else:
+                wb = load_xlsx(template_path)
+                for si, sheet in enumerate(wb.sheets):
+                    if not sheet.rows:
+                        continue
+                    headers = [v.strip() for v in sheet.rows[0].values if v and v.strip()]
+                    template_desc_parts.append(f"Sheet '{sheet.name}': 列名={headers}")
+
+            # Source doc summaries
+            doc_summaries: list[str] = []
+            has_structured = False
+            has_text_only = False
+            for doc_id in document_ids[:5]:
+                doc_rec = self._repository.get_document(doc_id)
+                if doc_rec is None:
+                    continue
+                blocks = self._repository.list_blocks(doc_id)
+                n_structured = sum(1 for b in blocks if b.metadata and b.metadata.get("row_values"))
+                n_text = sum(1 for b in blocks if b.block_type in ("paragraph", "heading"))
+                dtype = doc_rec.doc_type or "unknown"
+                doc_summaries.append(
+                    f"- {doc_rec.file_name} (类型={dtype}, 结构化行={n_structured}, 文本块={n_text})"
+                )
+                if n_structured > 10:
+                    has_structured = True
+                if n_text > 10 and n_structured < 5:
+                    has_text_only = True
+
+            template_desc = "\n".join(template_desc_parts)
+            docs_desc = "\n".join(doc_summaries) if doc_summaries else "无源文档"
+
+            if not self._openai_client.is_configured:
+                return self._infer_strategy_from_sources(has_structured, has_text_only)
+
+            # Fast-path: skip LLM call when source type already determines strategy
+            if has_text_only and not has_structured:
+                self._logger.info("Fill requirements: text-only sources → llm_transform (skipped LLM analysis)")
+                return {"strategy": "llm_transform", "per_table_filters": [], "needed_fields": []}
+
+            raw_response = self._openai_client.create_text_completion(
+                system_prompt=(
+                    "你是智能填表系统的需求分析引擎。根据用户需求、模板结构和源文档信息，分析填充策略。\n"
+                    "规则：\n"
+                    "1. strategy='structured_filter': 源数据主要是xlsx等结构化表格,可直接按条件筛选行列后填充。\n"
+                    "2. strategy='llm_transform': 源数据是非结构化文本(如docx段落)或需要复杂数据转换。\n"
+                    "3. per_table_filters: 若用户需求或模板上下文指定了每张表的筛选条件(如城市、时间),逐表列出。\n"
+                    "4. needed_fields: 从模板列名中提取所有需要填充的字段。\n"
+                    "5. date_range_from/to: 若用户指定了日期范围则提取,格式YYYY-MM-DD。\n"
+                    "输出纯JSON,不要包含解释文字。"
+                ),
+                user_prompt=(
+                    f"## 用户需求\n{user_requirement or '智能填表'}\n\n"
+                    f"## 模板结构\n{template_desc}\n\n"
+                    f"## 源文档列表\n{docs_desc}\n\n"
+                    "输出JSON格式:\n"
+                    '{"strategy": "structured_filter或llm_transform", '
+                    '"per_table_filters": [{"table_index": 0, "entity_filter": "城市名", "time_filter": "时间条件"}], '
+                    '"needed_fields": ["字段1", "字段2"], '
+                    '"date_range_from": "", "date_range_to": ""}'
+                ),
+                temperature=0.0,
+            )
+            # Parse JSON from LLM response
+            import json as _json
+            json_match = re.search(r'\{.*\}', raw_response, re.DOTALL)
+            if json_match:
+                payload = _json.loads(json_match.group())
+                self._logger.info("Fill requirements analysis: %s", payload)
+                return payload
+            self._logger.warning("Fill requirements analysis: no JSON found in response")
+            return self._infer_strategy_from_sources(has_structured, has_text_only)
+        except Exception as exc:
+            self._logger.warning("Fill requirements analysis failed: %s", exc)
+            return self._infer_strategy_from_sources(has_structured, has_text_only)
+
+    @staticmethod
+    def _infer_strategy_from_sources(has_structured: bool, has_text_only: bool) -> dict:
+        """Fallback: infer strategy from source document types."""
+        if has_text_only and not has_structured:
+            return {"strategy": "llm_transform", "per_table_filters": [], "needed_fields": []}
+        return {"strategy": "structured_filter", "per_table_filters": [], "needed_fields": []}
+
     def _fill_template_once_inner(
         self,
         *,
@@ -267,7 +410,42 @@ class TemplateService:
         resolved_output_file_name = output_file_name or f"{task_id}_{safe_filename(template_name)}"
         output_path = self._settings.outputs_dir / resolved_output_file_name
 
-        # ── Primary path: LLM-driven data transformation ──
+        # ── Phase 0: LLM 需求预分析 (strategy routing) ──
+        fill_analysis = self._analyze_fill_requirements(
+            user_requirement=user_requirement,
+            template_path=template_path,
+            document_ids=document_ids,
+        )
+        strategy = (fill_analysis or {}).get("strategy", "structured_filter")
+        self._logger.info("Fill strategy: %s (analysis=%s)", strategy, "ok" if fill_analysis else "fallback")
+
+        # ── Strategy A: structured_filter — direct block-metadata search ──
+        if strategy == "structured_filter":
+            direct_result = self._try_direct_search(
+                template_path=template_path,
+                output_path=output_path,
+                document_ids=document_ids,
+                user_requirement=user_requirement,
+                fill_analysis=fill_analysis,
+            )
+            if direct_result is not None:
+                self._logger.info("Direct search succeeded with %d cells", len(direct_result))
+                result = TemplateResultRecord(
+                    task_id=task_id,
+                    template_name=template_name,
+                    output_path=str(output_path),
+                    output_file_name=resolved_output_file_name,
+                    created_at=datetime.now(timezone.utc),
+                    fill_mode=fill_mode,
+                    document_ids=document_ids,
+                    filled_cells=direct_result,
+                    warnings=[],
+                )
+                if persist_result:
+                    self._repository.save_template_result(result)
+                return result
+
+        # ── Strategy B / Fallback: LLM-driven data transformation ──
         try:
             from app.services.llm_transform import run_llm_transform_pipeline
             llm_result = run_llm_transform_pipeline(
@@ -297,29 +475,30 @@ class TemplateService:
         except Exception as exc:
             self._logger.error("LLM transform pipeline failed, falling back: %s", exc, exc_info=True)
 
-        # ── Fallback 1: direct block-metadata search (no fact extraction) ──
-        direct_result = self._try_direct_search(
-            template_path=template_path,
-            output_path=output_path,
-            document_ids=document_ids,
-            user_requirement=user_requirement,
-        )
-        if direct_result is not None:
-            self._logger.info("Direct search succeeded with %d cells", len(direct_result))
-            result = TemplateResultRecord(
-                task_id=task_id,
-                template_name=template_name,
-                output_path=str(output_path),
-                output_file_name=resolved_output_file_name,
-                created_at=datetime.now(timezone.utc),
-                fill_mode=fill_mode,
-                document_ids=document_ids,
-                filled_cells=direct_result,
-                warnings=[],
-            )
-            if persist_result:
-                self._repository.save_template_result(result)
-            return result
+        # ── Fallback C: intent-driven analysis → extraction → fill ──
+        if fill_mode in ("canonical", "intent_driven"):
+            try:
+                _INTENT_TIMEOUT = 75  # seconds — 给 intent pipeline 留 75s，总限 90s
+                with ThreadPoolExecutor(max_workers=1) as _pool:
+                    _fut = _pool.submit(
+                        self._run_intent_driven_pipeline,
+                        task_id=task_id,
+                        template_name=template_name,
+                        template_path=template_path,
+                        output_path=output_path,
+                        document_ids=document_ids,
+                        user_requirement=user_requirement,
+                        fill_mode=fill_mode,
+                        resolved_output_file_name=resolved_output_file_name,
+                        persist_result=persist_result,
+                    )
+                    intent_result = _fut.result(timeout=_INTENT_TIMEOUT)
+                if intent_result is not None:
+                    return intent_result
+            except FuturesTimeoutError:
+                self._logger.error("Intent-driven pipeline timed out after %ds, falling back", _INTENT_TIMEOUT)
+            except Exception as exc:
+                self._logger.error("Intent-driven pipeline failed, falling back: %s", exc, exc_info=True)
 
         # ── Slow path: fact-based extraction (fallback) ──
         # Detect template field names to enable targeted extraction
@@ -449,7 +628,7 @@ class TemplateService:
         date_from: str | None,
         date_to: str | None,
     ) -> list[dict]:
-        """按日期范围过滤结构化行数据。支持 YYYY-MM-DD 和 YYYY/M/D 等格式。
+        """按日期范围过滤结构化行数据。支持 YYYY-MM-DD、YYYY/M/D 和 Excel 序列号。
         Filter structured rows by date range on the given time column."""
         if not date_from and not date_to:
             return rows
@@ -461,13 +640,23 @@ class TemplateService:
                 continue
             # Normalise date: extract YYYY-MM-DD from various formats
             norm = re.sub(r"[/年月]", "-", raw).rstrip("-日").strip()
+            # Drop trailing time component (e.g. "2025-11-25 09:00:00.0")
+            norm = norm.split()[0] if " " in norm else norm
             parts = norm.split("-")
             try:
                 y = int(parts[0])
                 m = int(parts[1]) if len(parts) > 1 else 1
                 d = int(parts[2]) if len(parts) > 2 else 1
-                normalised = f"{y:04d}-{m:02d}-{d:02d}"
-            except (ValueError, IndexError):
+                # Detect Excel serial date numbers (> 2500 year is unreasonable)
+                if y > 2500 and len(parts) == 1:
+                    from datetime import datetime as _dt, timedelta
+                    serial = y  # the entire raw is a serial number
+                    base = _dt(1899, 12, 30)  # Excel epoch (with Lotus 1-2-3 bug)
+                    dt = base + timedelta(days=serial)
+                    normalised = dt.strftime("%Y-%m-%d")
+                else:
+                    normalised = f"{y:04d}-{m:02d}-{d:02d}"
+            except (ValueError, IndexError, OverflowError):
                 filtered.append(row)
                 continue
             if date_from and normalised < date_from:
@@ -567,13 +756,20 @@ class TemplateService:
         result["primary_entity"] = self._extract_primary_entity_regex(context_text, candidates)
 
         # ── Regex fallback: time ──
+        # Pattern 1: "时间：YYYY-MM-DD HH:..."
         m = re.search(
             r"(?:监测时间|时间|日期|采样时间|检测时间)[：:]\s*"
-            r"(\d{4})-(\d{2})-(\d{2})(?:\s+(\d{2})[:\d.]*)?",
+            r"(\d{4})-(\d{1,2})-(\d{1,2})(?:\s+(\d{2})[:\d.]*)?",
             context_text,
         )
+        if not m:
+            # Pattern 2: "YYYY年MM月DD日HH:MM" (no label prefix)
+            m = re.search(
+                r"(\d{4})年(\d{1,2})月(\d{1,2})日(?:\s*(\d{2})[:：]\d{2})?",
+                context_text,
+            )
         if m:
-            result["date"] = f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+            result["date"] = f"{int(m.group(1)):04d}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
             if m.group(4):
                 result["hour"] = m.group(4)
 
@@ -672,6 +868,7 @@ class TemplateService:
         output_path: Path,
         document_ids: list[str],
         user_requirement: str,
+        fill_analysis: dict | None = None,
     ) -> list[FilledCellRecord] | None:
         """尝试直接从 block metadata 中查找数据填充模板，跳过 fact 系统。
         Try to fill the template by directly querying structured block metadata,
@@ -700,15 +897,29 @@ class TemplateService:
         if not structured_blocks or not source_headers:
             return None  # No structured data available — fall back
 
-        # If not ALL requested documents contributed structured data, fall back
-        # to the slow path which can handle both structured and unstructured docs.
-        if docs_with_structured_data != set(document_ids[:5]):
+        # ── Source-type guard: only use direct search when xlsx sources dominate ──
+        xlsx_doc_count = 0
+        for doc_id in docs_with_structured_data:
+            doc = self._repository.get_document(doc_id)
+            if doc and doc.doc_type in ("xlsx", "xls", "csv"):
+                xlsx_doc_count += 1
+        total_docs = len(document_ids[:5])
+        xlsx_ratio = xlsx_doc_count / total_docs if total_docs else 0
+        if xlsx_ratio < 0.5:
             self._logger.info(
-                "Direct search skipped: only %d/%d docs have structured blocks (%s missing)",
-                len(docs_with_structured_data), len(document_ids[:5]),
-                sorted(set(document_ids[:5]) - docs_with_structured_data),
+                "Direct search skipped: only %d/%d source docs are spreadsheet (%.0f%%, below 50%% threshold)",
+                xlsx_doc_count, total_docs, xlsx_ratio * 100,
             )
             return None
+
+        # Log if some documents lack structured data (but proceed anyway)
+        missing_docs = set(document_ids[:5]) - docs_with_structured_data
+        if missing_docs:
+            self._logger.info(
+                "Direct search: %d/%d docs have structured blocks (%s missing, proceeding with available data)",
+                len(docs_with_structured_data), len(document_ids[:5]),
+                sorted(missing_docs),
+            )
 
         # Parse template tables
         if suffix == ".docx":
@@ -765,6 +976,51 @@ class TemplateService:
             time_col_name = col_map.get("__time_column__", "")
             constraints = self._parse_table_context(context_text, self._collect_unique_values(structured_blocks, entity_col_name))
 
+            # ── Enrich constraints from fill_analysis per-table filters (LLM pre-analysis) ──
+            table_idx = getattr(table, "table_index", None)
+            if table_idx is None:
+                # xlsx sheets: use enumeration order
+                try:
+                    table_idx = tables.index(table)
+                except (ValueError, AttributeError):
+                    table_idx = -1
+            if fill_analysis and fill_analysis.get("per_table_filters"):
+                for ptf in fill_analysis["per_table_filters"]:
+                    if ptf.get("table_index") == table_idx:
+                        if not constraints.get("primary_entity") and ptf.get("entity_filter"):
+                            entity_str = ptf["entity_filter"].rstrip("市县区")
+                            constraints["primary_entity"] = entity_str
+                        if not constraints.get("date") and ptf.get("time_filter"):
+                            # Extract date and hour from time_filter like "2025-11-25 09:00"
+                            tf = ptf["time_filter"]
+                            dm = re.match(r"(\d{4}-\d{1,2}-\d{1,2})", tf)
+                            if dm:
+                                constraints["date"] = dm.group(1)
+                            hm = re.search(r"(\d{2}):\d{2}", tf)
+                            if hm and not constraints.get("hour"):
+                                constraints["hour"] = hm.group(1)
+                        break
+
+            # Enrich from fill_analysis date_range if available
+            if fill_analysis and not constraints.get("date"):
+                ar_from = fill_analysis.get("date_range_from", "")
+                ar_to = fill_analysis.get("date_range_to", "")
+                if ar_from and ar_from == ar_to:
+                    constraints["date"] = ar_from
+
+            # Enrich constraints from user_requirement if table context lacks entity/date
+            if user_requirement:
+                if not constraints.get("primary_entity") and entity_col_name:
+                    ur_entities = parse_entity_filter_from_text(user_requirement)
+                    if ur_entities:
+                        # For multi-table templates, try to match table context to one entity
+                        if len(ur_entities) == 1:
+                            constraints["primary_entity"] = ur_entities[0]
+                if not constraints.get("date"):
+                    ur_date_from, ur_date_to = parse_date_range_from_text(user_requirement)
+                    if ur_date_from and ur_date_from == ur_date_to:
+                        constraints["date"] = ur_date_from
+
             # Filter blocks
             matching_rows = self._query_blocks(
                 structured_blocks,
@@ -788,8 +1044,9 @@ class TemplateService:
                     if str(r.get(entity_col_name, "")).strip() not in _AGGREGATE_ENTITY_NAMES
                 ]
 
-            # Sort by entity name
-            matching_rows.sort(key=lambda r: str(r.get(entity_col_name, "")))
+            # Preserve source order — no reordering.
+            # The fact store and block queries already return data in document order,
+            # which typically matches the reference file's expected row order.
 
             rows_after_header = [row for row in table.rows if row.row_index > header_row]
 
@@ -818,7 +1075,7 @@ class TemplateService:
                     if not source_col:
                         continue
                     raw_val = src_row.get(source_col, "")
-                    if not raw_val or str(raw_val).strip() in ("", "—", "-", "None"):
+                    if not raw_val or str(raw_val).strip() in ("", "None"):
                         continue
                     cell_value: str | float | int = raw_val
                     try:
@@ -865,6 +1122,12 @@ class TemplateService:
         # Fast path: exact / normalized match
         result: dict[str, str] = {}
         source_lower = {h.lower().strip(): h for h in source_headers}
+        # Build canonical-name lookup: normalize each source header and map back
+        source_canonical: dict[str, str] = {}
+        for h in source_headers:
+            canon = normalize_field_name(h)
+            if canon and canon not in source_canonical:
+                source_canonical[canon] = h
         unmatched: list[str] = []
         for th in template_headers:
             norm = normalize_field_name(th)
@@ -872,6 +1135,9 @@ class TemplateService:
                 result[th] = source_lower[norm]
             elif th.lower().strip() in source_lower:
                 result[th] = source_lower[th.lower().strip()]
+            elif norm and norm in source_canonical:
+                # Match via canonical field name (e.g., AQI → 空气质量指数)
+                result[th] = source_canonical[norm]
             else:
                 unmatched.append(th)
 
@@ -901,7 +1167,7 @@ class TemplateService:
 
         if "__entity_column__" not in result:
             # Guess entity column from common names
-            for candidate in ("城市", "city", "地区", "区域", "实体"):
+            for candidate in ("城市", "city", "国家/地区", "country/region", "地区", "区域", "实体", "国家"):
                 if candidate in source_lower:
                     result["__entity_column__"] = source_lower[candidate]
                     break
@@ -910,6 +1176,14 @@ class TemplateService:
                 if candidate in source_lower:
                     result["__time_column__"] = source_lower[candidate]
                     break
+
+        self._logger.info(
+            "Column mapping result: template=%s → mapping=%s (entity=%s, time=%s)",
+            template_headers,
+            {k: v for k, v in result.items() if not k.startswith("__")},
+            result.get("__entity_column__", "?"),
+            result.get("__time_column__", "?"),
+        )
 
         return result
 
@@ -1164,6 +1438,139 @@ class TemplateService:
             "sample_texts": sample_texts,
         }
 
+    def _build_template_intent(
+        self,
+        template_path: Path,
+        user_requirement: str = "",
+    ) -> "TemplateIntent":
+        """用 LLM 深度分析模板意图（带缓存），用于 intent_driven 模式。
+        Deeply analyze the template intent with LLM (cached) for intent-driven mode.
+        """
+        from app.services.template_analyzer import analyze_template
+        return analyze_template(
+            template_path,
+            self._openai_client,
+            user_requirement=user_requirement,
+        )
+
+    def _run_intent_driven_pipeline(
+        self,
+        *,
+        task_id: str,
+        template_name: str,
+        template_path: Path,
+        output_path: Path,
+        document_ids: list[str],
+        user_requirement: str,
+        fill_mode: str,
+        resolved_output_file_name: str,
+        persist_result: bool,
+    ) -> TemplateResultRecord | None:
+        """Intent-driven 三阶段 pipeline:
+        Phase 1 → 模板意图分析
+        Phase 2 → 基于意图的针对性抽取
+        Phase 3 → 转换回填 + 校验
+        """
+        from app.services.template_filler import fill_by_intent
+
+        # Phase 1: 模板意图分析
+        intent = self._build_template_intent(template_path, user_requirement)
+        if not intent.required_fields:
+            self._logger.info("Intent-driven: no required fields detected, skipping")
+            return None
+
+        self._logger.info(
+            "Intent-driven Phase 1: %d fields, entity_dim=%s",
+            len(intent.required_fields),
+            intent.entity_dimension,
+        )
+
+        # Phase 2: 基于意图的针对性抽取
+        documents: list[DocumentRecord] = []
+        blocks_by_doc: dict[str, list] = {}
+        for doc_id in document_ids[:5]:
+            doc = self._repository.get_document(doc_id)
+            if doc is None:
+                continue
+            documents.append(doc)
+            blocks_by_doc[doc_id] = self._repository.list_blocks(doc_id)
+
+        if not documents:
+            self._logger.warning("Intent-driven: no documents available")
+            return None
+
+        # ── Block 级预筛选: 按 entity_filter 缩减 blocks ──
+        if intent.entity_filter:
+            _entity_kw = intent.entity_filter  # e.g. ['济南', '青岛']
+            total_before = sum(len(bs) for bs in blocks_by_doc.values())
+            for doc_id in list(blocks_by_doc):
+                blocks_by_doc[doc_id] = [
+                    b for b in blocks_by_doc[doc_id]
+                    if any(kw in (b.text or "") for kw in _entity_kw)
+                    or b.block_type == "heading"  # 保留标题行供上下文
+                ]
+            total_after = sum(len(bs) for bs in blocks_by_doc.values())
+            self._logger.info(
+                "Block pre-filter by entity %s: %d → %d blocks",
+                _entity_kw, total_before, total_after,
+            )
+
+        # FC-2: 选择抽取策略 — 大表格/少量文档 → 拼接模式
+        total_blocks = sum(len(bs) for bs in blocks_by_doc.values())
+        concat_mode = len(documents) <= 2 and total_blocks < 500
+
+        if self._extraction_service is not None and hasattr(self._extraction_service, "extract_by_intent"):
+            facts = self._extraction_service.extract_by_intent(
+                intent,
+                documents,
+                blocks_by_doc,
+                concat_mode=concat_mode,
+            )
+        else:
+            self._logger.warning("Intent-driven: extraction_service unavailable, skipping")
+            return None
+
+        self._logger.info("Intent-driven Phase 2: extracted %d facts", len(facts))
+
+        if not facts:
+            return None
+
+        # Phase 3: 回填 + 校验
+        filled_cells, warnings = fill_by_intent(
+            intent=intent,
+            facts=facts,
+            template_path=template_path,
+            output_path=output_path,
+            extraction_service=self._extraction_service,
+            documents=documents,
+            blocks_by_doc=blocks_by_doc,
+        )
+
+        if not filled_cells:
+            self._logger.info("Intent-driven: fill produced 0 cells, falling back")
+            return None
+
+        self._logger.info(
+            "Intent-driven Phase 3: %d cells filled, %d warnings",
+            len(filled_cells),
+            len(warnings),
+        )
+
+        result = TemplateResultRecord(
+            task_id=task_id,
+            template_name=template_name,
+            output_path=str(output_path),
+            output_file_name=resolved_output_file_name,
+            created_at=datetime.now(timezone.utc),
+            fill_mode="intent_driven",
+            document_ids=document_ids,
+            filled_cells=filled_cells,
+            warnings=warnings,
+        )
+        if persist_result:
+            self._repository.save_template_result(result)
+        return result
+
     def _match_documents(
         self,
         profile: dict[str, object],
@@ -1171,10 +1578,32 @@ class TemplateService:
     ) -> tuple[list[str], str, str, list[dict[str, object]]]:
         """根据模板画像和候选文档摘要选择最相关的文档。
         Select the most relevant documents from candidate summaries using the template profile.
+
+        优先使用向量检索匹配；若向量不可用则回退到 LLM / 规则匹配。
         """
         if len(candidates) == 1:
             doc_id = str(candidates[0]["doc_id"])
             return [doc_id], "single_candidate", "Only one parsed document is available.", candidates
+
+        # ── Step 1: 文件名模糊预过滤 ──
+        candidate_id_set = {str(c["doc_id"]) for c in candidates}
+        filename_filtered = self._prefilter_by_filename(profile, candidates)
+        narrow_ids = filename_filtered if filename_filtered else candidate_id_set
+
+        # ── Step 2: 向量检索匹配（在预过滤后的候选集上） ──
+        try:
+            vector_result = self._match_documents_with_vector(profile, narrow_ids)
+            if vector_result is not None:
+                mode = "filename+vector" if filename_filtered else "vector"
+                return vector_result[0], mode, vector_result[2], candidates
+        except Exception as exc:
+            self._logger.debug("Vector matching unavailable: %s", exc)
+
+        # 若文件名预过滤有结果但向量无结果，直接使用文件名结果
+        if filename_filtered:
+            reason = f"文件名模糊匹配 {len(filename_filtered)} 个文档"
+            self._logger.info("Filename pre-filter match: %s", reason)
+            return list(filename_filtered), "filename", reason, candidates
 
         if self._openai_client.is_configured:
             try:
@@ -1182,6 +1611,131 @@ class TemplateService:
             except OpenAIClientError:
                 pass
         return self._match_documents_with_rules(profile, candidates)
+
+    def _prefilter_by_filename(
+        self,
+        profile: dict[str, object],
+        candidates: list[dict[str, object]],
+    ) -> set[str] | None:
+        """基于模板名称与文档文件名的关键词重叠进行预过滤。
+        Pre-filter candidates by keyword overlap between template name and document filenames.
+
+        Returns a set of matching doc_ids, or None if no filename match found.
+        """
+        import re
+        template_name = str(profile.get("template_name", ""))
+        if not template_name:
+            return None
+
+        # 从模板名提取有意义的关键词（去除扩展名、'模板'等通用词）
+        from pathlib import PurePosixPath
+        stem = PurePosixPath(template_name).stem if "." in template_name else template_name
+        # 拆分为 token：按非字母数字中文字符分割
+        tokens = re.findall(r'[\u4e00-\u9fff]+|[a-zA-Z][\w-]*\d*|[\d]+', stem)
+        # 过滤通用词和纯数字（年份等）
+        stop_words = {"模板", "数据", "表", "汇总", "报告", "信息", "文件", "sheet", "table"}
+        keywords = [t for t in tokens if t.lower() not in stop_words and len(t) >= 2 and not t.isdigit()]
+        if not keywords:
+            return None
+
+        self._logger.info("Filename pre-filter keywords from template '%s': %s", stem, keywords)
+
+        matched: set[str] = set()
+        for c in candidates:
+            doc_file = str(c.get("file_name", ""))
+            if not doc_file:
+                continue
+            for kw in keywords:
+                if kw.lower() in doc_file.lower():
+                    matched.add(str(c["doc_id"]))
+                    break
+
+        if matched:
+            self._logger.info("Filename pre-filter: %d/%d candidates matched keywords %s",
+                              len(matched), len(candidates), keywords)
+            return matched
+        return None
+
+    def _match_documents_with_vector(
+        self,
+        profile: dict[str, object],
+        candidate_ids: set[str],
+    ) -> tuple[list[str], str, str] | None:
+        """使用 Embedding 向量检索找到与模板最相关的源文档。
+        Use embedding vector search to find the most relevant source documents for the template.
+
+        Returns (matched_ids, mode, reason) or None if vector search unavailable.
+        """
+        if self._embedding_service is None or not getattr(self._embedding_service, "is_configured", False):
+            return None
+
+        # 构造查询文本：模板名称(3x 权重) + 字段名 + 实体名 + 关键词
+        query_parts: list[str] = []
+        template_name = str(profile.get("template_name", ""))
+        if template_name:
+            # 文件名信号已注入 block 嵌入，查询端也提高模板名称权重
+            from pathlib import PurePosixPath
+            stem = PurePosixPath(template_name).stem if "." in template_name else template_name
+            query_parts.extend([stem, stem, stem])
+        for field_name in profile.get("field_names", [])[:5]:
+            query_parts.append(str(field_name))
+        for entity_name in profile.get("entity_names", [])[:10]:
+            query_parts.append(str(entity_name))
+        for keyword in profile.get("keywords", [])[:10]:
+            query_parts.append(str(keyword))
+        if not query_parts:
+            return None
+
+        query_text = " ".join(query_parts)
+        self._logger.info("Vector match query: %s", query_text[:200])
+
+        try:
+            query_embedding = self._embedding_service.embed_query(query_text)
+        except Exception as exc:
+            self._logger.warning("Embedding query failed: %s", exc)
+            return None
+
+        # 按文档独立检索: 每个候选文档单独 top-k，避免大文档挤占小文档配额
+        doc_scores: dict[str, float] = {}  # doc_id -> 平均相似度
+        per_doc_k = 5
+        min_score = 0.35  # 最低余弦相似度阈值
+
+        for doc_id in candidate_ids:
+            results = self._repository.vector_search_blocks(
+                query_embedding,
+                top_k=per_doc_k,
+                document_ids={doc_id},
+                min_score=min_score,
+            )
+            if results:
+                scores = [score for _, score in results]
+                avg_score = sum(scores) / len(scores)
+                doc_scores[doc_id] = avg_score
+                self._logger.debug("Vector per-doc: %s → %d hits, avg=%.3f, scores=%s",
+                                   doc_id[:12], len(results), avg_score,
+                                   [round(s, 3) for s in scores])
+            else:
+                self._logger.debug("Vector per-doc: %s → 0 hits above min_score=%.2f", doc_id[:12], min_score)
+
+        if not doc_scores:
+            return None
+
+        # 按平均得分排序，取前 5 个且得分 >= 0.45 的文档
+        score_threshold = 0.45
+        sorted_docs = sorted(doc_scores.items(), key=lambda x: x[1], reverse=True)
+        matched_ids = [
+            doc_id for doc_id, avg in sorted_docs[:5]
+            if avg >= score_threshold
+        ]
+        # 仅保留在候选集中的文档
+        matched_ids = [doc_id for doc_id in matched_ids if doc_id in candidate_ids]
+
+        if not matched_ids:
+            return None
+
+        reason = f"向量检索匹配 {len(matched_ids)} 个文档（per-doc top-{per_doc_k}, min_score≥{min_score}, avg_threshold≥{score_threshold}, query={query_text[:60]}…）"
+        self._logger.info("Vector match: %s, scores=%s", reason, {k[:12]: round(v, 3) for k, v in sorted_docs[:8]})
+        return matched_ids, "vector", reason
 
     def _match_documents_with_openai(
         self,
@@ -1730,8 +2284,8 @@ class TemplateService:
                     evidence_text=fact.source_span[:200] if fact.source_span else "",
                 ))
 
-        # Sort entities alphabetically by name (first column)
-        unique_entities = sorted(unique_entities)
+        # Preserve original entity order from fact extraction (e.g. ranked by GDP)
+        # instead of alphabetical sort, so filled rows match source document ordering.
 
         # Use row_groups when template data area is empty or has only blank placeholder rows
         all_rows_empty = rows_after_header and all(
@@ -1748,7 +2302,6 @@ class TemplateService:
                 and (not entity_set or normalize_entity_name(
                     getattr(g.get("__entity__"), "entity_name", "")) in entity_set)
             ]
-            filtered_groups.sort(key=lambda g: getattr(g.get("__entity__"), "entity_name", ""))
             row_idx = 0
             for group in filtered_groups:
                 entity_holder = group.get("__entity__")
@@ -1831,8 +2384,7 @@ class TemplateService:
                     evidence_text=fact.source_span[:200] if fact.source_span else "",
                 ))
 
-        # Sort entities alphabetically by name (first column)
-        unique_entities = sorted(unique_entities)
+        # Preserve original entity order from fact extraction
 
         # Use row_groups when template data area is empty or has only blank placeholder rows
         all_rows_empty = rows_after_header and all(
@@ -1849,7 +2401,6 @@ class TemplateService:
                 and (not entity_set or normalize_entity_name(
                     getattr(g.get("__entity__"), "entity_name", "")) in entity_set)
             ]
-            filtered_groups.sort(key=lambda g: getattr(g.get("__entity__"), "entity_name", ""))
             row_idx = 0
             for group in filtered_groups:
                 entity_holder = group.get("__entity__")

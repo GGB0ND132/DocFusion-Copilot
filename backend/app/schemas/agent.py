@@ -84,13 +84,6 @@ class AgentExecuteResponse(APIModel):
 # ── Conversation schemas ──
 
 
-class ConversationMessagePayload(APIModel):
-    """对话消息体。"""
-
-    role: str
-    content: str
-
-
 class ConversationResponse(APIModel):
     """对话记录返回体。"""
 

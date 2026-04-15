@@ -68,7 +68,7 @@ class Settings:
     openai_base_url: str = field(default_factory=lambda: os.getenv("DOCFUSION_OPENAI_BASE_URL", ""))
     openai_model: str = field(default_factory=lambda: os.getenv("DOCFUSION_OPENAI_MODEL", ""))
     openai_timeout_seconds: float = field(
-        default_factory=lambda: float(os.getenv("DOCFUSION_OPENAI_TIMEOUT_SECONDS", "90"))
+        default_factory=lambda: float(os.getenv("DOCFUSION_OPENAI_TIMEOUT_SECONDS", "180"))
     )
     llm_block_text_max_chars: int = field(
         default_factory=lambda: int(os.getenv("DOCFUSION_LLM_BLOCK_TEXT_MAX_CHARS", "12000"))

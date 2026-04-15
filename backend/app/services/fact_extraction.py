@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from collections import OrderedDict
 from dataclasses import replace
+from typing import TYPE_CHECKING
 
 from app.core.catalog import FIELD_ALIASES, FIELD_CANONICAL_UNITS, FIELD_ENTITY_TYPES
 from app.core.logging import ErrorCode, get_logger, log_operation
@@ -20,6 +21,9 @@ from app.utils.normalizers import (
     normalize_field_name_or_passthrough,
     parse_date_value,
 )
+
+if TYPE_CHECKING:
+    from app.schemas.templates import TemplateIntent
 
 _BRACKET_UNIT_RE = re.compile(r"[（(](.*?)[)）]")
 _GENERIC_NUMBER_RE = re.compile(r"(?P<value>-?\d[\d,]*(?:\.\d+)?)\s*(?P<unit>万亿元|亿元|万元|元|万人|人|万|%)?")
@@ -704,3 +708,392 @@ class FactExtractionService:
             extra={"doc_id": document.doc_id},
         )
         return results
+
+    # ------------------------------------------------------------------
+    # Phase 2: Intent-driven extraction  (模板驱动的意图抽取)
+    # ------------------------------------------------------------------
+
+    def extract_by_intent(
+        self,
+        intent: "TemplateIntent",
+        documents: list[DocumentRecord],
+        blocks_by_doc: dict[str, list[DocumentBlock]],
+        *,
+        concat_mode: bool = False,
+    ) -> list[FactRecord]:
+        """基于 TemplateIntent 对源文档做针对性抽取。
+
+        Phase 2 核心函数，区别于旧版 ``extract()`` 的两个关键改进：
+        1. prompt 中包含完整的字段语义描述（名称+描述+类型+单位+示例），
+           而非仅仅传字段名。
+        2. FC-2: 支持两种多文档抽取策略：
+           - ``concat_mode=False`` (默认) → 逐文档抽取，控制上下文长度。
+           - ``concat_mode=True``         → 拼接所有文档后一次抽取，
+             适用于大表格/少量文档场景。
+
+        Parameters
+        ----------
+        intent : TemplateIntent
+            Phase 1 分析得到的模板意图。
+        documents : list[DocumentRecord]
+            源文档列表。
+        blocks_by_doc : dict[str, list[DocumentBlock]]
+            按 doc_id 索引的文档块。
+        concat_mode : bool
+            FC-2: 是否使用拼接模式。
+
+        Returns
+        -------
+        list[FactRecord]
+            抽取到的事实列表（带 evidence metadata）。
+        """
+        from app.schemas.templates import TemplateIntent  # noqa: F811
+
+        if not intent.required_fields:
+            return []
+
+        # Step A: 规则先行 — 仅对结构化块做快速规则抽取（不触发 LLM fallback）
+        rule_facts: list[FactRecord] = []
+        for doc in documents:
+            blocks = blocks_by_doc.get(doc.doc_id, [])
+            for block in blocks:
+                if block.block_type == "table_row":
+                    rule_facts.extend(self._extract_from_table_row(doc, block))
+                else:
+                    rule_facts.extend(self._extract_from_text(doc, block))
+        rule_facts = list(self._deduplicate(rule_facts).values())
+
+        # ── Fact 级过滤: 根据 intent 的 date_filter / entity_filter 缩减数据 ──
+        pre_filter_count = len(rule_facts)
+        rule_facts = self._apply_intent_filters(rule_facts, intent)
+        if len(rule_facts) != pre_filter_count:
+            self._logger.info(
+                "Intent filter: %d → %d facts (date=%s, entities=%s)",
+                pre_filter_count, len(rule_facts),
+                intent.date_filter, intent.entity_filter,
+            )
+
+        # 已抽取到的字段集合
+        extracted_fields = {f.field_name for f in rule_facts}
+        # 计算仍缺失的字段
+        missing_fields = [
+            fr for fr in intent.required_fields
+            if fr.name not in extracted_fields and not fr.is_computed
+        ]
+
+        if not missing_fields:
+            # 所有字段都已被规则抽取命中
+            return self._enrich_evidence(rule_facts, "rule")
+
+        # Step B: LLM 定向抽取缺失字段
+        if not self._openai_client or not getattr(self._openai_client, "is_configured", False):
+            return self._enrich_evidence(rule_facts, "rule")
+
+        llm_facts: list[FactRecord] = []
+        if concat_mode:
+            # FC-2: 拼接模式 — 所有文档合并为一个大上下文
+            llm_facts.extend(self._intent_extract_concat(intent, missing_fields, documents, blocks_by_doc))
+        else:
+            # FC-2: 逐文档模式（默认）
+            for doc in documents[:5]:
+                blocks = blocks_by_doc.get(doc.doc_id, [])
+                if not blocks:
+                    continue
+                doc_facts = self._intent_extract_single(intent, missing_fields, doc, blocks)
+                llm_facts.extend(doc_facts)
+                # 更新缺失字段
+                extracted_fields.update(f.field_name for f in doc_facts)
+                missing_fields = [
+                    fr for fr in missing_fields
+                    if fr.name not in extracted_fields
+                ]
+                if not missing_fields:
+                    break
+
+        all_facts = rule_facts + llm_facts
+        return list(self._deduplicate(all_facts).values())
+
+    @staticmethod
+    def _apply_intent_filters(
+        facts: list[FactRecord],
+        intent: "TemplateIntent",
+    ) -> list[FactRecord]:
+        """按 intent 的 date_filter 和 entity_filter 过滤 facts。
+
+        - date_filter: 检查 fact.metadata['date'] 或 fact.year
+        - entity_filter: 检查 fact.entity_name 是否包含任一目标实体
+        无约束或无相关 metadata 的 fact 保留（宁可多不可漏）。
+        """
+        from app.schemas.templates import TemplateIntent  # noqa: F811
+
+        date_from, date_to = intent.date_filter if intent.date_filter else (None, None)
+        entity_targets = intent.entity_filter or []
+
+        if not date_from and not date_to and not entity_targets:
+            return facts
+
+        filtered: list[FactRecord] = []
+        entity_set = {e.lower() for e in entity_targets}
+
+        for fact in facts:
+            # ── Date check ──
+            if date_from or date_to:
+                fact_date = (fact.metadata.get("date") if fact.metadata else None)
+                fact_year = fact.year
+                if fact_date:
+                    date_str = str(fact_date)
+                    if date_from and date_str < date_from:
+                        continue
+                    if date_to and date_str > date_to:
+                        continue
+                elif fact_year is not None:
+                    if date_from and fact_year < int(date_from[:4]):
+                        continue
+                    if date_to and fact_year > int(date_to[:4]):
+                        continue
+                # 无日期信息 → 保留
+
+            # ── Entity check ──
+            if entity_targets:
+                raw_entity = (fact.entity_name or "").lower()
+                # Safe suffix stripping: only remove trailing 市/县/区/省 if result >= 2 chars
+                entity_name = raw_entity
+                if len(entity_name) >= 3 and entity_name[-1] in "市县区省":
+                    entity_name = entity_name[:-1]
+                if entity_name and entity_name not in entity_set:
+                    # 部分匹配兜底 (如 "济南高新区" 包含 "济南")
+                    if not any(t in entity_name or entity_name in t for t in entity_set):
+                        continue
+
+            filtered.append(fact)
+        return filtered
+
+    def _intent_extract_single(
+        self,
+        intent: "TemplateIntent",
+        missing_fields: list,
+        document: DocumentRecord,
+        blocks: list[DocumentBlock],
+    ) -> list[FactRecord]:
+        """对单个文档做基于 intent 的 LLM 定向抽取。"""
+        preview = self._build_intent_preview(blocks, intent)
+        year = infer_year(preview) or infer_year(document.file_name)
+        return self._run_intent_llm(
+            missing_fields=missing_fields,
+            intent=intent,
+            preview=preview,
+            year=year,
+            document=document,
+            first_block_id=blocks[0].block_id if blocks else "",
+        )
+
+    def _intent_extract_concat(
+        self,
+        intent: "TemplateIntent",
+        missing_fields: list,
+        documents: list[DocumentRecord],
+        blocks_by_doc: dict[str, list[DocumentBlock]],
+    ) -> list[FactRecord]:
+        """FC-2 拼接模式: 合并多文档上下文后一次 LLM 调用。"""
+        all_text_parts: list[str] = []
+        first_block_id = ""
+        first_doc = documents[0] if documents else None
+        for doc in documents[:5]:
+            blocks = blocks_by_doc.get(doc.doc_id, [])
+            if not blocks:
+                continue
+            if not first_block_id and blocks:
+                first_block_id = blocks[0].block_id
+            doc_preview = self._build_intent_preview(blocks, intent)
+            all_text_parts.append(f"=== 文档: {doc.file_name} ===\n{doc_preview}")
+        combined = "\n\n".join(all_text_parts)[:12000]
+        year = None
+        if first_doc:
+            year = infer_year(combined) or infer_year(first_doc.file_name)
+        return self._run_intent_llm(
+            missing_fields=missing_fields,
+            intent=intent,
+            preview=combined,
+            year=year,
+            document=first_doc,
+            first_block_id=first_block_id,
+        )
+
+    def _build_intent_preview(
+        self,
+        blocks: list[DocumentBlock],
+        intent: "TemplateIntent",
+    ) -> str:
+        """Phase 2 Step 5: 针对 intent 的实体维度做智能分段预览，
+        而非盲目截断前 N 字符。
+        """
+        entity_dim = (intent.entity_dimension or "").lower()
+        # 对结构化块（表格行），优先包含
+        table_blocks = [b for b in blocks if b.block_type == "table_row"]
+        text_blocks = [b for b in blocks if b.block_type in {"paragraph", "heading", "page"}]
+
+        parts: list[str] = []
+        # 先放表头区域（含实体维度关键词的块优先）
+        for b in table_blocks[:200]:
+            parts.append(b.text[:500])
+        # 再放文本块，优先包含实体维度关键词的段落
+        if entity_dim:
+            prioritized = sorted(
+                text_blocks,
+                key=lambda b: (entity_dim not in b.text.lower(), b.page_or_index or 0),
+            )
+        else:
+            prioritized = text_blocks
+        for b in prioritized[:30]:
+            parts.append(b.text[:500])
+
+        return "\n".join(parts)[:10000]
+
+    def _run_intent_llm(
+        self,
+        *,
+        missing_fields: list,
+        intent: "TemplateIntent",
+        preview: str,
+        year: int | None,
+        document: "DocumentRecord | None",
+        first_block_id: str,
+    ) -> list[FactRecord]:
+        """发送带有完整 FieldRequirement 语义信息的 LLM 定向抽取请求。"""
+        # 构建带语义描述的字段列表
+        field_lines: list[str] = []
+        for fr in missing_fields[:60]:
+            line = f"  - {fr.name}"
+            if fr.description:
+                line += f"（含义: {fr.description}）"
+            if fr.unit:
+                line += f"（标准单位: {fr.unit}）"
+            if fr.data_type:
+                line += f"（类型: {fr.data_type}）"
+            if fr.example_value:
+                line += f"（示例: {fr.example_value}）"
+            field_lines.append(line)
+        fields_description = "\n".join(field_lines)
+
+        entity_hint = ""
+        if intent.entity_dimension:
+            entity_hint = f"\n行维度: {intent.entity_dimension}（即每行对应一个{intent.entity_dimension}）"
+
+        doc_name = document.file_name if document else "unknown"
+        doc_id = document.doc_id if document else ""
+
+        try:
+            payload = self._openai_client.create_json_completion(
+                system_prompt=(
+                    "你是高精度结构化信息定向抽取引擎。\n"
+                    "严格规则：\n"
+                    "1. 从文本中精确查找用户指定的目标字段对应的数值。\n"
+                    "2. value 必须填写文本中原始出现的数值（保留原文精度），不要换算单位。\n"
+                    "3. unit 必须填写文本中该数值紧跟的原始单位。\n"
+                    "4. entity_name 应使用文本中的实体简称（如城市名不带'市'后缀）。\n"
+                    "5. field_name 必须严格使用下方目标字段列表中给出的名称，不要自创。\n"
+                    "6. 注意每个字段旁标注的含义描述、标准单位和数据类型，它们帮你区分相似指标。\n"
+                    "7. 只输出文本中明确给出的数据，绝不编造。为每个实体尽可能提取所有目标字段。\n"
+                    "8. evidence 字段请填写包含该数据的原文片段（20~80字），用于溯源。\n"
+                ),
+                user_prompt=(
+                    f"文档名: {doc_name}\n"
+                    f"目标字段:\n{fields_description}"
+                    f"{entity_hint}\n\n"
+                    f"文本内容:\n{preview}"
+                ),
+                json_schema={
+                    "type": "object",
+                    "properties": {
+                        "facts": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "entity_name": {"type": "string"},
+                                    "field_name": {"type": "string"},
+                                    "value": {"type": "string"},
+                                    "unit": {"type": "string"},
+                                    "evidence": {"type": "string"},
+                                },
+                                "required": ["entity_name", "field_name", "value"],
+                            },
+                        },
+                    },
+                    "required": ["facts"],
+                    "additionalProperties": False,
+                },
+            )
+        except Exception:
+            self._logger.debug("Intent-driven LLM extraction failed", exc_info=True)
+            return []
+
+        raw_facts = payload.get("facts", [])
+        if not isinstance(raw_facts, list):
+            return []
+
+        target_set_lower = {fr.name.lower() for fr in missing_fields}
+        results: list[FactRecord] = []
+        for item in raw_facts:
+            if not isinstance(item, dict):
+                continue
+            entity = str(item.get("entity_name", "")).strip()
+            field = str(item.get("field_name", "")).strip()
+            raw_value = str(item.get("value", "")).strip()
+            unit = str(item.get("unit", "")).strip() or None
+            evidence = str(item.get("evidence", "")).strip()
+            if not entity or not field or not raw_value:
+                continue
+            if field.lower() not in target_set_lower:
+                continue
+
+            value_num, detected_unit = extract_numeric_with_unit(raw_value)
+            canonical_field = normalize_field_name(field)
+            resolved_field = canonical_field or field
+            if resolved_field.lower() not in target_set_lower:
+                resolved_field = field
+            final_unit = detected_unit or unit
+            if value_num is not None and canonical_field:
+                value_num, final_unit = convert_to_canonical_unit(canonical_field, value_num, final_unit)
+            entity = normalize_entity_name(entity) or entity
+
+            results.append(
+                FactRecord(
+                    fact_id=new_id("fact"),
+                    entity_type=FIELD_ENTITY_TYPES.get(resolved_field, "generic"),
+                    entity_name=entity,
+                    field_name=resolved_field,
+                    value_num=value_num,
+                    value_text=raw_value,
+                    unit=final_unit if value_num is not None else None,
+                    year=year,
+                    source_doc_id=doc_id,
+                    source_block_id=first_block_id,
+                    source_span=preview[:200],
+                    confidence=0.92,
+                    status="confirmed",
+                    metadata={
+                        "extraction_method": "llm_intent_driven",
+                        "evidence_text": evidence[:200] if evidence else "",
+                    },
+                )
+            )
+
+        self._logger.info(
+            "Intent-driven LLM extracted %d facts for %d missing fields",
+            len(results),
+            len(missing_fields),
+        )
+        return results
+
+    @staticmethod
+    def _enrich_evidence(facts: list[FactRecord], method: str) -> list[FactRecord]:
+        """Step 6: 为已有事实补充 extraction_method metadata。"""
+        for fact in facts:
+            if not fact.metadata:
+                fact.metadata = {}
+            if "extraction_method" not in fact.metadata:
+                fact.metadata["extraction_method"] = method
+            if "evidence_text" not in fact.metadata:
+                fact.metadata["evidence_text"] = fact.source_span[:200] if fact.source_span else ""
+        return facts
