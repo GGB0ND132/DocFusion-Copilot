@@ -29,13 +29,15 @@ def _filename_prefix(file_name: str) -> str:
 class EmbeddingService:
     """为文档块生成 embedding 向量并存入仓储。"""
 
-    def __init__(self, embedding_model: OpenAIEmbeddings, repository: Repository) -> None:
+    def __init__(self, embedding_model: OpenAIEmbeddings | None, repository: Repository) -> None:
         self._model = embedding_model
         self._repository = repository
 
     @property
     def is_configured(self) -> bool:
         """Embedding API 是否已配置。"""
+        if self._model is None:
+            return False
         return bool(getattr(self._model, "openai_api_key", None)) and self._model.openai_api_key != "sk-placeholder"
 
     def embed_blocks(self, blocks: list[DocumentBlock], *, file_name: str = "") -> int:

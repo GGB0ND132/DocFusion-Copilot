@@ -45,7 +45,6 @@ import {
   createConversation,
   getConversation,
   deleteConversation,
-  suggestDocuments,
   type AgentExecuteResponse,
   type ConversationResponse,
   type DocumentResponse,
@@ -71,9 +70,8 @@ export default function AgentPage() {
   const [thinkingStartTime, setThinkingStartTime] = useState<number | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
   const [templateFile, setTemplateFile] = useState<File | null>(null);
-  const [fillTaskId, setFillTaskId] = useState<string | null>(null);
-  const [fillTask, setFillTask] = useState<TaskResponse | null>(null);
-  const [traceInput, setTraceInput] = useState('');
+  const [fillTaskIds, setFillTaskIds] = useState<string[]>([]);
+  const [fillTasks, setFillTasks] = useState<Record<string, TaskResponse>>({});
   const [availableDocuments, setAvailableDocuments] = useState<DocumentResponse[]>([]);
   const [documentsHydrated, setDocumentsHydrated] = useState(false);
 
@@ -90,7 +88,6 @@ export default function AgentPage() {
   const currentDocumentSetId = useUiStore((s) => s.currentDocumentSetId);
   const upsertTaskSnapshot = useUiStore((s) => s.upsertTaskSnapshot);
   const openTraceByFactId = useUiStore((s) => s.openTraceByFactId);
-  const tracePanel = useUiStore((s) => s.tracePanel);
   const conversationList = useUiStore((s) => s.conversationList);
   const setConversationList = useUiStore((s) => s.setConversationList);
   const switchConversation = useUiStore((s) => s.switchConversation);
@@ -191,9 +188,9 @@ export default function AgentPage() {
       if (!resp.task_id) {
         throw new Error('未返回模板回填任务 ID');
       }
-      setFillTaskId(resp.task_id);
+      setFillTaskIds(prev => [...prev, resp.task_id]);
       const task = await getTaskStatus(resp.task_id);
-      setFillTask(task);
+      setFillTasks(prev => ({ ...prev, [resp.task_id]: task }));
       upsertTaskSnapshot(task);
       addAgentMessage({
         role: 'assistant',
@@ -224,14 +221,10 @@ export default function AgentPage() {
 
   const handleNewConversation = useCallback(() => {
     startNewConversation();
-    setFillTaskId(null);
-    setFillTask(null);
   }, [startNewConversation]);
 
   const handleSwitchConversation = useCallback(async (conv: ConversationResponse) => {
     switchConversation(conv);
-    setFillTaskId(null);
-    setFillTask(null);
     try {
       const fullConversation = await getConversation(conv.conversation_id);
       switchConversation(fullConversation);
@@ -251,8 +244,6 @@ export default function AgentPage() {
       removeConversationFromList(convId);
       if (agentContextId === convId) {
         startNewConversation();
-        setFillTaskId(null);
-        setFillTask(null);
       }
       toast.info('对话已删除');
     } catch {
@@ -278,8 +269,6 @@ export default function AgentPage() {
         removeConversationFromList(id);
         if (agentContextId === id) {
           startNewConversation();
-          setFillTaskId(null);
-          setFillTask(null);
         }
         deleted++;
       } catch { /* continue */ }
@@ -302,24 +291,24 @@ export default function AgentPage() {
     setSelectedConvIds(new Set());
   }, []);
 
-  // Poll fill task status
+  // Poll fill task status for all pending tasks
   useEffect(() => {
-    if (!fillTaskId) return;
-    if (fillTask && ['succeeded', 'completed', 'success', 'failed'].includes(fillTask.status)) return;
+    const pendingIds = fillTaskIds.filter(id => {
+      const t = fillTasks[id];
+      return !t || !['succeeded', 'completed', 'success', 'failed'].includes(t.status);
+    });
+    if (pendingIds.length === 0) return;
     const timer = window.setInterval(async () => {
-      try {
-        const t = await getTaskStatus(fillTaskId);
-        setFillTask(t);
-        upsertTaskSnapshot(t);
-        if (['succeeded', 'completed', 'success', 'failed'].includes(t.status)) {
-          window.clearInterval(timer);
-        }
-      } catch {
-        window.clearInterval(timer);
+      for (const id of pendingIds) {
+        try {
+          const t = await getTaskStatus(id);
+          setFillTasks(prev => ({ ...prev, [id]: t }));
+          upsertTaskSnapshot(t);
+        } catch { /* ignore */ }
       }
     }, 3000);
     return () => window.clearInterval(timer);
-  }, [fillTaskId, fillTask, upsertTaskSnapshot]);
+  }, [fillTaskIds, fillTasks, upsertTaskSnapshot]);
 
   useEffect(() => {
     if (!templateFile || !documentsHydrated || parsedScopedDocIds.length > 0) return;
@@ -385,6 +374,60 @@ export default function AgentPage() {
     abortControllerRef.current = ac;
     setIsExecuting(true);
     setThinkingStartTime(Date.now());
+
+    // ── 模板回填快捷路径：跳过 agent 推理和 embedding 搜索，直接弹出文档选择 ──
+    if (templateFile) {
+      // 构造候选列表：全部已解析源文档（不限 scope），按模板名模糊匹配排序
+      const allKnown = mergeKnownDocuments(
+        await refreshAvailableDocuments().catch(() => availableDocuments),
+        uploadedDocuments,
+      );
+      const allParsedSrc = allKnown
+        .filter(isSourceDocument)
+        .filter((doc) => doc.status === 'parsed');
+
+      const tplBase = templateFile.name.replace(/\.[^.]+$/, '').toLowerCase();
+      const tplTokens = tplBase.split(/[\s_\-—·()（）【】\[\]]+/).filter(Boolean);
+
+      const scored = allParsedSrc.map((doc) => {
+        const fn = doc.file_name.toLowerCase();
+        const hits = tplTokens.filter((tok) => fn.includes(tok)).length;
+        return { doc, hits };
+      });
+      scored.sort((a, b) => b.hits - a.hits);
+
+      const latestParsedDocs: SuggestDocumentCandidate[] = scored.map(({ doc }) => ({
+        doc_id: doc.doc_id,
+        file_name: doc.file_name,
+        score: 0,
+        field_hits: [] as string[],
+        entity_hits: [] as string[],
+        keyword_hits: [] as string[],
+        recommended: false,
+      }));
+
+      if (latestParsedDocs.length === 0) {
+        addAgentMessage({
+          role: 'assistant',
+          text: '没有找到可用于回填的已解析源文档。请先上传源文档并完成解析。',
+          timestamp: Date.now(),
+        });
+      } else {
+        setPendingFillText(text);
+        setPendingFillContextId(activeContextId);
+        setPendingFillDocSetId(runtimeDocumentSetId);
+        setDocSelectCandidates(latestParsedDocs);
+        setDocSelectTemplateName(templateFile.name);
+        setDocSelectFieldNames([]);
+        setDocSelectOpen(true);
+      }
+      abortControllerRef.current = null;
+      setIsExecuting(false);
+      setThinkingStartTime(null);
+      return;
+    }
+
+    // ── 非模板路径：走 agent LLM 推理 ──
     try {
       const r = await runAgentExecute({
         message: text,
@@ -392,41 +435,27 @@ export default function AgentPage() {
         documentSetId: runtimeDocumentSetId ?? undefined,
         documentIds: runtimeParsedDocIds,
         autoMatch: true,
-        ...(templateFile ? { templateFile, userRequirement: text } : {}),
       }, { signal: ac.signal });
       if (r.context_id && r.context_id !== agentContextId) {
         setAgentContextId(r.context_id);
       }
-      if (r.task_id) {
-        // 模板回填任务已提交
-        setFillTaskId(r.task_id);
-        try {
-          const task = await getTaskStatus(r.task_id);
-          setFillTask(task);
-          upsertTaskSnapshot(task);
-        } catch { /* polling will pick it up */ }
-        addAgentMessage({
-          role: 'assistant',
-          text: `模板回填任务已提交。\n模板：${r.template_name ?? templateFile?.name}\n任务 ID：${r.task_id}\n状态：${r.task_status ?? 'queued'}`,
-          timestamp: Date.now(),
-          taskId: r.task_id,
-        });
-        setTemplateFile(null);
-      } else {
-        const summary = formatAgentReply(r);
-        addAgentMessage({
-          role: 'assistant',
-          text: summary,
-          timestamp: Date.now(),
-          data: shouldRenderOperationCard(r) ? r : undefined,
-        });
-      }
+
+      // Normal response for non-fill intents
+      const elapsed = thinkingStartTime ? ((Date.now() - thinkingStartTime) / 1000).toFixed(1) : null;
+      const summary = formatAgentReply(r);
+      const timeTag = elapsed ? `\n\n> ⏱️ 思考耗时 ${elapsed}s` : '';
+      addAgentMessage({
+        role: 'assistant',
+        text: summary + timeTag,
+        timestamp: Date.now(),
+        data: shouldRenderOperationCard(r) ? r : undefined,
+      });
       refreshConversations();
     } catch (err) {
       if (err instanceof DOMException && err.name === 'AbortError') {
         addAgentMessage({ role: 'assistant', text: '已中止回答。', timestamp: Date.now() });
       } else {
-        const msg = err instanceof Error ? err.message : templateFile ? '模板回填失败' : 'Agent 执行失败';
+        const msg = err instanceof Error ? err.message : 'Agent 执行失败';
         addAgentMessage({ role: 'assistant', text: `错误：${msg}`, timestamp: Date.now() });
         toast.error(msg);
       }
@@ -435,7 +464,7 @@ export default function AgentPage() {
       setIsExecuting(false);
       setThinkingStartTime(null);
     }
-  }, [inputText, isExecuting, templateFile, parsedScopedDocIds, effectiveDocumentSetId, refreshAvailableDocuments, uploadedDocuments, currentDocumentSetId, upsertTaskSnapshot, addAgentMessage, agentContextId, setAgentContextId, refreshConversations, thinkingStartTime]);
+  }, [inputText, isExecuting, templateFile, parsedScopedDocIds, knownDocuments, effectiveDocumentSetId, refreshAvailableDocuments, uploadedDocuments, currentDocumentSetId, upsertTaskSnapshot, addAgentMessage, agentContextId, setAgentContextId, refreshConversations, thinkingStartTime]);
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
@@ -447,10 +476,9 @@ export default function AgentPage() {
     [handleSend],
   );
 
-  const handleDownloadResult = useCallback(async () => {
-    if (!fillTaskId) return;
+  const handleDownloadResult = useCallback(async (taskId: string) => {
     try {
-      const file = await downloadTemplateResult(fillTaskId);
+      const file = await downloadTemplateResult(taskId);
       const url = window.URL.createObjectURL(file.blob);
       const a = document.createElement('a');
       a.href = url;
@@ -461,7 +489,7 @@ export default function AgentPage() {
     } catch (err) {
       toast.error(err instanceof Error ? err.message : '下载失败');
     }
-  }, [fillTaskId]);
+  }, []);
 
   const handleDownloadArtifact = useCallback(async (fileName: string) => {
     try {
@@ -478,20 +506,11 @@ export default function AgentPage() {
     }
   }, []);
 
-  const handleTraceLookup = useCallback(async () => {
-    const id = traceInput.trim();
-    if (!id) return;
-    await openTraceByFactId(id, null);
-    setTraceInput('');
-  }, [traceInput, openTraceByFactId]);
-
   const handleClearConversation = useCallback(async () => {
     if (agentContextId) {
       clearAgentConversation(agentContextId).catch(() => {});
     }
     clearConversation();
-    setFillTaskId(null);
-    setFillTask(null);
     refreshConversations();
     toast.info('对话已清空');
   }, [agentContextId, clearConversation, refreshConversations]);
@@ -503,12 +522,14 @@ export default function AgentPage() {
     el.style.height = `${Math.min(el.scrollHeight, 200)}px`;
   }, []);
 
-  const filledCells = useMemo<FilledCellResponse[]>(() => {
-    if (!fillTask?.result) return [];
-    return Array.isArray(fillTask.result.filled_cells) ? (fillTask.result.filled_cells as FilledCellResponse[]) : [];
-  }, [fillTask]);
+  // Use the latest task for filled cells display
+  const latestTaskId = fillTaskIds.length > 0 ? fillTaskIds[fillTaskIds.length - 1] : null;
+  const latestTask = latestTaskId ? fillTasks[latestTaskId] ?? null : null;
 
-  const fillTaskDone = fillTask && ['succeeded', 'completed', 'success'].includes(fillTask.status);
+  const filledCells = useMemo<FilledCellResponse[]>(() => {
+    if (!latestTask?.result) return [];
+    return Array.isArray(latestTask.result.filled_cells) ? (latestTask.result.filled_cells as FilledCellResponse[]) : [];
+  }, [latestTask]);
 
   return (
     <>
@@ -762,7 +783,7 @@ export default function AgentPage() {
             <TabsList className="h-9 w-full grid grid-cols-3">
               <TabsTrigger value="result" className="text-xs">回填结果</TabsTrigger>
               <TabsTrigger value="context" className="text-xs">上下文</TabsTrigger>
-              <TabsTrigger value="trace" className="text-xs">追溯</TabsTrigger>
+              <TabsTrigger value="tasks" className="text-xs">任务</TabsTrigger>
             </TabsList>
           </div>
 
@@ -770,33 +791,6 @@ export default function AgentPage() {
           <TabsContent value="result" className="flex-1 overflow-hidden m-0">
             <ScrollArea className="h-full">
               <div className="p-3 space-y-3">
-                {/* Fill task status */}
-                {fillTask && (
-                  <Card className="p-0 shadow-none">
-                    <CardContent className="p-3 space-y-2">
-                      <div className="flex items-center justify-between">
-                        <span className="text-xs font-medium">模板回填任务</span>
-                        <TaskStatusBadge status={fillTask.status} />
-                      </div>
-                      <div className="flex items-center justify-between text-[10px] text-muted-foreground">
-                        <span className="truncate">{fillTaskId}</span>
-                        <TaskElapsed task={fillTask} />
-                      </div>
-                      <div className="h-1.5 w-full rounded-full bg-muted">
-                        <div
-                          className="h-1.5 rounded-full bg-primary transition-all"
-                          style={{ width: `${Math.round(fillTask.progress * 100)}%` }}
-                        />
-                      </div>
-                      {fillTaskDone && (
-                        <Button variant="outline" size="sm" className="w-full h-7 text-xs gap-1" onClick={handleDownloadResult}>
-                          <Download className="h-3 w-3" /> 下载结果文件
-                        </Button>
-                      )}
-                    </CardContent>
-                  </Card>
-                )}
-
                 {/* Filled cells */}
                 {filledCells.length > 0 && (
                   <>
@@ -845,7 +839,7 @@ export default function AgentPage() {
                   </>
                 )}
 
-                {!fillTask && filledCells.length === 0 && (
+                {!latestTask && filledCells.length === 0 && (
                   <p className="text-xs text-muted-foreground py-4 text-center">上传模板并发送需求后，回填结果将显示在这里。</p>
                 )}
               </div>
@@ -884,148 +878,44 @@ export default function AgentPage() {
             </ScrollArea>
           </TabsContent>
 
-          {/* ── Trace tab ── */}
-          <TabsContent value="trace" className="flex-1 overflow-hidden m-0">
+          {/* ── Tasks tab ── */}
+          <TabsContent value="tasks" className="flex-1 overflow-hidden m-0">
             <ScrollArea className="h-full">
-            <div className="p-3 space-y-3">
-              <div className="flex gap-1">
-                <Input
-                  value={traceInput}
-                  onChange={(e) => setTraceInput(e.target.value)}
-                  placeholder="输入 fact_id"
-                  className="h-8 text-xs"
-                />
-                <Button variant="outline" size="icon" className="h-8 w-8 shrink-0" onClick={handleTraceLookup}>
-                  <Search className="h-3.5 w-3.5" />
-                </Button>
-              </div>
-
-              {/* Trace loading */}
-              {tracePanel.loading && (
-                <div className="flex items-center gap-2 text-xs text-muted-foreground py-4 justify-center">
-                  <Loader2 className="h-3.5 w-3.5 animate-spin" /> 正在查询追溯信息…
-                </div>
-              )}
-
-              {/* Trace error */}
-              {tracePanel.error && (
-                <div className="text-xs text-destructive bg-destructive/10 rounded p-2">
-                  {tracePanel.error}
-                </div>
-              )}
-
-              {/* Trace results */}
-              {tracePanel.data && !tracePanel.loading && (
-                <div className="space-y-3">
-                  {tracePanel.cellLabel && (
-                    <div className="text-[10px] text-muted-foreground">
-                      单元格：<span className="font-medium text-foreground">{tracePanel.cellLabel}</span>
-                    </div>
-                  )}
-
-                  {/* Fact info card */}
-                  <Card className="p-0 shadow-none">
-                    <CardContent className="p-2.5 space-y-1.5">
-                      <div className="text-[10px] font-medium text-primary">事实详情</div>
-                      <div className="grid grid-cols-2 gap-x-3 gap-y-1 text-[10px]">
-                        <div>
-                          <span className="text-muted-foreground">实体：</span>
-                          <span className="font-medium">{tracePanel.data.fact.entity_name}</span>
+              <div className="p-3 space-y-3">
+                {fillTaskIds.length === 0 && (
+                  <p className="text-[10px] text-muted-foreground">暂无回填任务。选择模板并提交后，任务会显示在这里。</p>
+                )}
+                {[...fillTaskIds].reverse().map((taskId) => {
+                  const task = fillTasks[taskId];
+                  if (!task) return null;
+                  const done = ['succeeded', 'completed', 'success'].includes(task.status);
+                  return (
+                    <Card key={taskId} className="p-0 shadow-none">
+                      <CardContent className="p-3 space-y-2">
+                        <div className="flex items-center justify-between">
+                          <span className="text-xs font-medium">模板回填任务</span>
+                          <TaskStatusBadge status={task.status} />
                         </div>
-                        <div>
-                          <span className="text-muted-foreground">字段：</span>
-                          <span className="font-medium">{tracePanel.data.fact.field_name}</span>
+                        <div className="flex items-center justify-between text-[10px] text-muted-foreground">
+                          <span className="truncate">{taskId}</span>
+                          <TaskElapsed task={task} />
                         </div>
-                        <div>
-                          <span className="text-muted-foreground">值：</span>
-                          <span className="font-medium">
-                            {tracePanel.data.fact.value_num ?? tracePanel.data.fact.value_text}
-                            {tracePanel.data.fact.unit ? ` ${tracePanel.data.fact.unit}` : ''}
-                          </span>
+                        <div className="h-1.5 w-full rounded-full bg-muted">
+                          <div
+                            className="h-1.5 rounded-full bg-primary transition-all"
+                            style={{ width: `${Math.round(task.progress * 100)}%` }}
+                          />
                         </div>
-                        <div>
-                          <span className="text-muted-foreground">年份：</span>
-                          <span className="font-medium">{tracePanel.data.fact.year ?? '—'}</span>
-                        </div>
-                        <div className="col-span-2">
-                          <span className="text-muted-foreground">置信度：</span>
-                          <Badge
-                            variant={tracePanel.data.fact.confidence < 0.7 ? 'destructive' : 'outline'}
-                            className="text-[9px] h-4 ml-1"
-                          >
-                            {(tracePanel.data.fact.confidence * 100).toFixed(0)}%
-                          </Badge>
-                        </div>
-                      </div>
-                      <div className="text-[9px] font-mono text-muted-foreground/60 break-all">
-                        ID: {tracePanel.data.fact.fact_id}
-                      </div>
-                    </CardContent>
-                  </Card>
-
-                  {/* Source document card */}
-                  {tracePanel.data.document && (
-                    <Card className="p-0 shadow-none">
-                      <CardContent className="p-2.5 space-y-1">
-                        <div className="text-[10px] font-medium text-primary">源文档</div>
-                        <div className="text-[10px]">
-                          <span className="text-muted-foreground">文件名：</span>
-                          <span className="font-medium">{tracePanel.data.document.file_name}</span>
-                        </div>
-                        <div className="text-[10px]">
-                          <span className="text-muted-foreground">类型：</span>
-                          <span>{tracePanel.data.document.doc_type}</span>
-                        </div>
-                        <div className="text-[9px] font-mono text-muted-foreground/60 break-all">
-                          doc_id: {tracePanel.data.document.doc_id}
-                        </div>
-                      </CardContent>
-                    </Card>
-                  )}
-
-                  {/* Source block card */}
-                  {tracePanel.data.block && (
-                    <Card className="p-0 shadow-none border-blue-200 dark:border-blue-900">
-                      <CardContent className="p-2.5 space-y-1">
-                        <div className="text-[10px] font-medium text-primary">源文档块</div>
-                        <div className="text-[10px]">
-                          <span className="text-muted-foreground">类型：</span>
-                          <span>{tracePanel.data.block.block_type}</span>
-                        </div>
-                        {tracePanel.data.block.section_path?.length > 0 && (
-                          <div className="text-[10px]">
-                            <span className="text-muted-foreground">章节路径：</span>
-                            <span>{tracePanel.data.block.section_path.join(' > ')}</span>
-                          </div>
+                        {done && (
+                          <Button variant="outline" size="sm" className="w-full h-7 text-xs gap-1" onClick={() => handleDownloadResult(taskId)}>
+                            <Download className="h-3 w-3" /> 下载结果文件
+                          </Button>
                         )}
-                        <div className="text-[10px] bg-muted/50 rounded p-1.5 mt-1 max-h-32 overflow-y-auto whitespace-pre-wrap break-words">
-                          {tracePanel.data.block.text}
-                        </div>
-                        <div className="text-[9px] font-mono text-muted-foreground/60 break-all">
-                          block_id: {tracePanel.data.block.block_id}
-                        </div>
                       </CardContent>
                     </Card>
-                  )}
-
-                  {/* Evidence text */}
-                  {tracePanel.data.fact.source_span && (
-                    <Card className="p-0 shadow-none border-amber-200 dark:border-amber-900">
-                      <CardContent className="p-2.5 space-y-1">
-                        <div className="text-[10px] font-medium text-amber-600 dark:text-amber-400">证据文本</div>
-                        <div className="text-[10px] italic">
-                          {tracePanel.data.fact.source_span}
-                        </div>
-                      </CardContent>
-                    </Card>
-                  )}
-                </div>
-              )}
-
-              {!tracePanel.data && !tracePanel.loading && !tracePanel.error && (
-                <p className="text-[10px] text-muted-foreground">输入事实 ID 或点击回填结果的"追溯来源"按钮查看完整追溯链。</p>
-              )}
-            </div>
+                  );
+                })}
+              </div>
             </ScrollArea>
           </TabsContent>
         </Tabs>
@@ -1066,9 +956,7 @@ function TaskElapsed({ task }: { task: TaskResponse }) {
   const start = new Date(task.created_at).getTime();
   const end = done ? new Date(task.updated_at).getTime() : now;
   const sec = Math.max(0, Math.round((end - start) / 1000));
-  const m = Math.floor(sec / 60);
-  const s = sec % 60;
-  const label = m > 0 ? `${m}分${s}秒` : `${s}秒`;
+  const label = `${sec}s`;
   return <span className="shrink-0 tabular-nums">{done ? `耗时 ${label}` : `已用 ${label}`}</span>;
 }
 

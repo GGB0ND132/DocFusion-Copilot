@@ -257,7 +257,7 @@ async def execute(request: Request) -> AgentExecuteResponse:
     task_id = None
 
     if template_name and template_content:
-        # 直接走模板回填服务
+        # 直接走模板回填服务，跳过 agent LLM 推理
         try:
             container = get_container()
             task = container.template_service.submit_fill_task(
@@ -269,23 +269,39 @@ async def execute(request: Request) -> AgentExecuteResponse:
                 user_requirement=str(payload.get("user_requirement", "")),
             )
             task_id = task.task_id
-            result = _invoke_agent(
-                f"用户上传了模板 {template_name} 并要求回填。任务ID={task_id}，请告知用户任务已提交。",
-                context_id,
-            )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-    else:
-        # 附加文档上下文信息到消息中
-        enriched_message = message
-        if document_ids:
-            enriched_message += f"\n[当前选中的文档IDs: {document_ids}]"
-        result = _invoke_agent(enriched_message, context_id)
 
-        # 如果 agent 调用了 fill_template 工具，尝试从已上传文档中定位模板并提交真实任务
-        action = result.get("fill_template_action")
-        if action and not task_id:
-            task_id, template_name = _try_submit_fill_from_action(action, document_ids)
+        return AgentExecuteResponse(
+            intent="extract_and_fill_template",
+            entities=[],
+            fields=[],
+            target="agent",
+            need_db_store=False,
+            context_id=context_id,
+            preview=[],
+            edits=[],
+            planner="direct",
+            execution_type="template_fill_task",
+            summary=f"模板回填任务已提交（{template_name}）",
+            facts=[],
+            artifacts=[],
+            document_ids=document_ids,
+            task_id=task_id,
+            task_status="queued",
+            template_name=template_name,
+        )
+
+    # 非模板回填：走 agent LLM 推理
+    enriched_message = message
+    if document_ids:
+        enriched_message += f"\n[当前选中的文档IDs: {document_ids}]"
+    result = _invoke_agent(enriched_message, context_id)
+
+    # 如果 agent 调用了 fill_template 工具，尝试从已上传文档中定位模板并提交真实任务
+    action = result.get("fill_template_action")
+    if action and not task_id:
+        task_id, template_name = _try_submit_fill_from_action(action, document_ids)
 
     return AgentExecuteResponse(
         intent=result["intent"],

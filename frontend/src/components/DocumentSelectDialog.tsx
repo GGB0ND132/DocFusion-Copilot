@@ -1,8 +1,9 @@
-import { useCallback, useEffect, useState } from 'react';
-import { FileSpreadsheet, Star } from 'lucide-react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import { FileSpreadsheet, Search } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Checkbox } from '@/components/ui/checkbox';
 import { Badge } from '@/components/ui/badge';
+import { Input } from '@/components/ui/input';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import {
   Dialog,
@@ -32,16 +33,36 @@ export default function DocumentSelectDialog({
   onCancel,
 }: DocumentSelectDialogProps) {
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [searchQuery, setSearchQuery] = useState('');
 
-  // Auto-select recommended candidates on open
+  // Reset state when dialog opens
   useEffect(() => {
-    if (open && candidates.length > 0) {
-      const recommended = new Set(
-        candidates.filter((c) => c.recommended).map((c) => c.doc_id),
-      );
-      setSelectedIds(recommended.size > 0 ? recommended : new Set());
+    if (open) {
+      setSelectedIds(new Set());
+      setSearchQuery('');
     }
-  }, [open, candidates]);
+  }, [open]);
+
+  const filteredCandidates = useMemo(() => {
+    const q = searchQuery.trim().toLowerCase();
+    if (!q) return candidates;
+    return candidates.filter((c) => c.file_name.toLowerCase().includes(q));
+  }, [candidates, searchQuery]);
+
+  const allFilteredSelected = filteredCandidates.length > 0 &&
+    filteredCandidates.every((c) => selectedIds.has(c.doc_id));
+
+  const toggleSelectAll = useCallback(() => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (allFilteredSelected) {
+        for (const c of filteredCandidates) next.delete(c.doc_id);
+      } else {
+        for (const c of filteredCandidates) next.add(c.doc_id);
+      }
+      return next;
+    });
+  }, [filteredCandidates, allFilteredSelected]);
 
   const toggle = useCallback((docId: string) => {
     setSelectedIds((prev) => {
@@ -79,6 +100,16 @@ export default function DocumentSelectDialog({
           )}
         </DialogHeader>
 
+        <div className="relative -mx-6 px-6 py-2">
+          <Search className="absolute left-8 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-muted-foreground" />
+          <Input
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+            placeholder="搜索文档名称…"
+            className="h-8 pl-8 text-xs"
+          />
+        </div>
+
         <ScrollArea className="flex-1 min-h-0 -mx-6 px-6">
           <div className="space-y-2 py-2">
             {candidates.length === 0 && (
@@ -86,7 +117,20 @@ export default function DocumentSelectDialog({
                 没有找到可用的已解析源文档。请先上传并完成解析。
               </p>
             )}
-            {candidates.map((c) => (
+            {candidates.length > 0 && (
+              <label className="flex items-center gap-3 rounded-lg border border-dashed p-2.5 cursor-pointer hover:bg-muted/50 transition-colors">
+                <Checkbox
+                  checked={allFilteredSelected}
+                  onCheckedChange={toggleSelectAll}
+                  className="mt-0"
+                />
+                <span className="text-xs text-muted-foreground">
+                  {allFilteredSelected ? '取消全选' : '全选'}
+                  {searchQuery.trim() ? ` (过滤后 ${filteredCandidates.length} 项)` : ` (共 ${candidates.length} 项)`}
+                </span>
+              </label>
+            )}
+            {filteredCandidates.map((c) => (
               <label
                 key={c.doc_id}
                 className={`flex items-start gap-3 rounded-lg border p-3 cursor-pointer transition-colors ${
@@ -103,34 +147,15 @@ export default function DocumentSelectDialog({
                 <div className="flex-1 min-w-0 space-y-1">
                   <div className="flex items-center gap-2">
                     <span className="text-sm font-medium truncate">{c.file_name}</span>
-                    {c.recommended && (
-                      <Badge variant="default" className="text-[9px] h-4 gap-0.5 shrink-0">
-                        <Star className="h-2.5 w-2.5" /> 推荐
-                      </Badge>
-                    )}
-                    <span className="text-[10px] text-muted-foreground ml-auto shrink-0">
-                      匹配度 {Math.round(c.score * 100)}%
-                    </span>
                   </div>
-                  <div className="flex flex-wrap gap-1">
-                    {c.field_hits.length > 0 && (
-                      <span className="text-[10px] text-muted-foreground">
-                        字段命中: {c.field_hits.slice(0, 5).join('、')}
-                        {c.field_hits.length > 5 ? ` +${c.field_hits.length - 5}` : ''}
-                      </span>
-                    )}
-                  </div>
-                  {c.entity_hits.length > 0 && (
-                    <div className="flex flex-wrap gap-1">
-                      <span className="text-[10px] text-muted-foreground">
-                        实体命中: {c.entity_hits.slice(0, 5).join('、')}
-                        {c.entity_hits.length > 5 ? ` +${c.entity_hits.length - 5}` : ''}
-                      </span>
-                    </div>
-                  )}
                 </div>
               </label>
             ))}
+            {candidates.length > 0 && filteredCandidates.length === 0 && (
+              <p className="text-sm text-muted-foreground py-4 text-center">
+                没有匹配的文档，请调整搜索关键词。
+              </p>
+            )}
           </div>
         </ScrollArea>
 

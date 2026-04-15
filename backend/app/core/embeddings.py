@@ -11,12 +11,12 @@ from app.core.config import Settings
 logger = logging.getLogger(__name__)
 
 
-def build_embedding_model(settings: Settings) -> OpenAIEmbeddings:
-    """基于项目 Settings 构建 OpenAIEmbeddings 实例（指向硅基流动 bge-m3）。"""
+def build_embedding_model(settings: Settings) -> OpenAIEmbeddings | None:
+    """基于项目 Settings 构建 OpenAIEmbeddings 实例。未配置时返回 None。"""
     if not settings.embedding_api_key:
-        logger.warning("DOCFUSION_EMBEDDING_API_KEY 未设置，向量检索不可用")
+        return None
     return OpenAIEmbeddings(
-        api_key=settings.embedding_api_key or "sk-placeholder",
+        api_key=settings.embedding_api_key,
         base_url=settings.embedding_base_url,
         model=settings.embedding_model,
     )

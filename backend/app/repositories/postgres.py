@@ -55,34 +55,11 @@ class PostgresRepository:
         import logging
         _log = logging.getLogger("postgres")
 
-        # 尝试启用 pgvector 扩展；如果服务器未安装则跳过（向量搜索不可用）
+        # 向量搜索已禁用，跳过 pgvector 扩展
         self._vector_available = False
-        try:
-            with self._engine.begin() as connection:
-                connection.exec_driver_sql("CREATE EXTENSION IF NOT EXISTS vector")
-            self._vector_available = True
-            _log.info("pgvector 扩展已就绪")
-        except Exception as exc:
-            _log.warning(
-                "pgvector 扩展不可用，向量搜索功能将被禁用: %s"
-                "\n安装方法: https://github.com/pgvector/pgvector#installation",
-                exc,
-            )
 
-        # 创建表；如果 vector 列导致失败，去掉该列重试
-        try:
-            Base.metadata.create_all(self._engine)
-        except Exception:
-            if not self._vector_available:
-                _log.info("去掉 embedding 列后重新建表")
-                from app.repositories.sqlalchemy_models import DocumentBlockRow
-                # 临时移除 embedding 列定义再建表
-                embedding_col = DocumentBlockRow.__table__.columns.get("embedding")
-                if embedding_col is not None:
-                    DocumentBlockRow.__table__.columns.remove(embedding_col)
-                Base.metadata.create_all(self._engine)
-            else:
-                raise
+        # 创建表
+        Base.metadata.create_all(self._engine)
         self._ensure_indexes()
 
     @contextmanager

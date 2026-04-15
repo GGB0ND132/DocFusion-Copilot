@@ -9,8 +9,11 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 try:
     from pgvector.sqlalchemy import Vector
-except ImportError:  # pgvector not installed – fall back to no-op for memory-only mode
+except ImportError:  # pgvector not installed
     Vector = None
+
+# 向量搜索已禁用 — 即使 pgvector 包可导入，也不创建 embedding 列
+Vector = None
 
 
 class Base(DeclarativeBase):
