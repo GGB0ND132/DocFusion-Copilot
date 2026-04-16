@@ -38,6 +38,10 @@ backend/storage/
 测试集/word/
 测试集/包含模板文件/
 承诺书/
+回填数据/
+
+.gitignore
+.github/
 
 # Logs
 *.log

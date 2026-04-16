@@ -288,105 +288,40 @@ class TemplateService:
         user_requirement: str,
         template_path: Path,
         document_ids: list[str],
-    ) -> dict | None:
-        """LLM 预分析: 根据用户需求+模板结构+源文档摘要,返回填充策略和筛选条件。"""
-        has_structured = False
-        has_text_only = False
+    ) -> dict:
+        """纯规则预分析: 从模板结构提取 needed_fields，不调用 LLM。
+
+        所有语义理解（日期范围、筛选条件、列映射）留给 code gen 一次性处理。
+        """
+        needed_fields: list[str] = []
         try:
             suffix = template_path.suffix.lower()
-            # Build template description with ALL tables
-            template_desc_parts: list[str] = []
             if suffix == ".docx":
                 doc = load_docx_tables(template_path)
-                for ti, table in enumerate(doc.tables):
+                for table in doc.tables:
                     if not table.rows:
                         continue
-                    ctx = getattr(table, "context_text", "") or ""
-                    headers = [str(c.value or "").strip() for c in table.rows[0].cells] if hasattr(table.rows[0], "cells") else list(table.rows[0].values)
-                    template_desc_parts.append(
-                        f"表{ti}: 上下文=「{ctx[:200]}」, 列名={headers}"
+                    headers = (
+                        [str(c.value or "").strip() for c in table.rows[0].cells]
+                        if hasattr(table.rows[0], "cells")
+                        else list(table.rows[0].values)
                     )
+                    needed_fields.extend(h for h in headers if h and h not in needed_fields)
             else:
                 wb = load_xlsx(template_path)
-                for si, sheet in enumerate(wb.sheets):
+                for sheet in wb.sheets:
                     if not sheet.rows:
                         continue
                     headers = [v.strip() for v in sheet.rows[0].values if v and v.strip()]
-                    template_desc_parts.append(f"Sheet '{sheet.name}': 列名={headers}")
-
-            # Source doc summaries
-            doc_summaries: list[str] = []
-            has_structured = False
-            has_text_only = False
-            for doc_id in document_ids[:5]:
-                doc_rec = self._repository.get_document(doc_id)
-                if doc_rec is None:
-                    continue
-                blocks = self._repository.list_blocks(doc_id)
-                n_structured = sum(1 for b in blocks if b.metadata and b.metadata.get("row_values"))
-                n_text = sum(1 for b in blocks if b.block_type in ("paragraph", "heading"))
-                dtype = doc_rec.doc_type or "unknown"
-                doc_summaries.append(
-                    f"- {doc_rec.file_name} (类型={dtype}, 结构化行={n_structured}, 文本块={n_text})"
-                )
-                if n_structured > 10:
-                    has_structured = True
-                if n_text > 10 and n_structured < 5:
-                    has_text_only = True
-
-            template_desc = "\n".join(template_desc_parts)
-            docs_desc = "\n".join(doc_summaries) if doc_summaries else "无源文档"
-
-            if not self._openai_client.is_configured:
-                return self._infer_strategy_from_sources(has_structured, has_text_only)
-
-            # Fast-path: skip LLM call when source type already determines strategy
-            if has_text_only and not has_structured:
-                self._logger.info("Fill requirements: text-only sources → llm_transform (skipped LLM analysis)")
-                return {"strategy": "llm_transform", "per_table_filters": [], "needed_fields": []}
-
-            raw_response = self._openai_client.create_text_completion(
-                system_prompt=(
-                    "你是智能填表系统的需求分析引擎。根据用户需求、模板结构和源文档信息，分析填充策略。\n"
-                    "规则：\n"
-                    "1. strategy='structured_filter': 源数据主要是xlsx等结构化表格,可直接按条件筛选行列后填充。\n"
-                    "2. strategy='llm_transform': 源数据是非结构化文本(如docx段落)或需要复杂数据转换。\n"
-                    "3. per_table_filters: 若用户需求或模板上下文指定了每张表的筛选条件(如城市、时间),逐表列出。\n"
-                    "4. needed_fields: 从模板列名中提取所有需要填充的字段。\n"
-                    "5. date_range_from/to: 若用户指定了日期范围则提取,格式YYYY-MM-DD。\n"
-                    "输出纯JSON,不要包含解释文字。"
-                ),
-                user_prompt=(
-                    f"## 用户需求\n{user_requirement or '智能填表'}\n\n"
-                    f"## 模板结构\n{template_desc}\n\n"
-                    f"## 源文档列表\n{docs_desc}\n\n"
-                    "输出JSON格式:\n"
-                    '{"strategy": "structured_filter或llm_transform", '
-                    '"per_table_filters": [{"table_index": 0, "entity_filter": "城市名", "time_filter": "时间条件"}], '
-                    '"needed_fields": ["字段1", "字段2"], '
-                    '"date_range_from": "", "date_range_to": ""}'
-                ),
-                temperature=0.0,
-            )
-            # Parse JSON from LLM response
-            import json as _json
-            json_match = re.search(r'\{.*\}', raw_response, re.DOTALL)
-            if json_match:
-                payload = _json.loads(json_match.group())
-                self._logger.info("Fill requirements analysis: %s", payload)
-                return payload
-            self._logger.warning("Fill requirements analysis: no JSON found in response")
-            return self._infer_strategy_from_sources(has_structured, has_text_only)
+                    needed_fields.extend(h for h in headers if h and h not in needed_fields)
         except Exception as exc:
-            self._logger.warning("Fill requirements analysis failed: %s", exc)
-            return self._infer_strategy_from_sources(has_structured, has_text_only)
+            self._logger.warning("_analyze_fill_requirements: failed to read template: %s", exc)
 
-    @staticmethod
-    def _infer_strategy_from_sources(has_structured: bool, has_text_only: bool) -> dict:
-        """Fallback: infer strategy from source document types."""
-        if has_text_only and not has_structured:
-            return {"strategy": "llm_transform", "per_table_filters": [], "needed_fields": []}
-        return {"strategy": "structured_filter", "per_table_filters": [], "needed_fields": []}
+        return {
+            "strategy": "llm_transform",
+            "per_table_filters": [],
+            "needed_fields": needed_fields,
+        }
 
     def _fill_template_once_inner(
         self,
@@ -410,42 +345,29 @@ class TemplateService:
         resolved_output_file_name = output_file_name or f"{task_id}_{safe_filename(template_name)}"
         output_path = self._settings.outputs_dir / resolved_output_file_name
 
-        # ── Phase 0: LLM 需求预分析 (strategy routing) ──
+        # ── Audit: log source document details ──
+        for doc_id in document_ids[:5]:
+            doc = self._repository.get_document(doc_id)
+            if doc is None:
+                self._logger.warning("Fill audit: doc_id=%s not found", doc_id)
+                continue
+            blocks = self._repository.list_blocks(doc_id)
+            n_structured = sum(1 for b in blocks if b.metadata and b.metadata.get("row_values"))
+            n_text = sum(1 for b in blocks if b.block_type in ("paragraph", "heading"))
+            self._logger.info(
+                "Fill audit: doc_id=%s type=%s file=%s blocks=%d structured=%d text=%d",
+                doc_id, doc.doc_type, doc.file_name, len(blocks), n_structured, n_text,
+            )
+
+        # ── Phase 0: 规则预分析 (extract template fields) ──
         fill_analysis = self._analyze_fill_requirements(
             user_requirement=user_requirement,
             template_path=template_path,
             document_ids=document_ids,
         )
-        strategy = (fill_analysis or {}).get("strategy", "structured_filter")
-        self._logger.info("Fill strategy: %s (analysis=%s)", strategy, "ok" if fill_analysis else "fallback")
+        self._logger.info("Fill analysis: %s", fill_analysis)
 
-        # ── Strategy A: structured_filter — direct block-metadata search ──
-        if strategy == "structured_filter":
-            direct_result = self._try_direct_search(
-                template_path=template_path,
-                output_path=output_path,
-                document_ids=document_ids,
-                user_requirement=user_requirement,
-                fill_analysis=fill_analysis,
-            )
-            if direct_result is not None:
-                self._logger.info("Direct search succeeded with %d cells", len(direct_result))
-                result = TemplateResultRecord(
-                    task_id=task_id,
-                    template_name=template_name,
-                    output_path=str(output_path),
-                    output_file_name=resolved_output_file_name,
-                    created_at=datetime.now(timezone.utc),
-                    fill_mode=fill_mode,
-                    document_ids=document_ids,
-                    filled_cells=direct_result,
-                    warnings=[],
-                )
-                if persist_result:
-                    self._repository.save_template_result(result)
-                return result
-
-        # ── Strategy B / Fallback: LLM-driven data transformation ──
+        # ── Unified pipeline: LLM-driven data transformation ──
         try:
             from app.services.llm_transform import run_llm_transform_pipeline
             llm_result = run_llm_transform_pipeline(
@@ -912,14 +834,16 @@ class TemplateService:
             )
             return None
 
-        # Log if some documents lack structured data (but proceed anyway)
+        # Guard: if any selected source lacks structured data, fall back so
+        # the LLM transform pipeline can process *all* sources (including text).
         missing_docs = set(document_ids[:5]) - docs_with_structured_data
         if missing_docs:
             self._logger.info(
-                "Direct search: %d/%d docs have structured blocks (%s missing, proceeding with available data)",
-                len(docs_with_structured_data), len(document_ids[:5]),
+                "Direct search skipped: %d/%d docs lack structured blocks (%s) — falling back to LLM pipeline",
+                len(missing_docs), len(document_ids[:5]),
                 sorted(missing_docs),
             )
+            return None
 
         # Parse template tables
         if suffix == ".docx":

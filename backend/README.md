@@ -75,9 +75,7 @@ uvicorn app.main:app --reload --port 8000
 | `template_analyzer` | 模板结构解析与字段映射 |
 | `template_filler` | 模板回填执行与单元格赋值 |
 | `template_service` | 模板结果检索与导出 |
-| `agent_service` | Agent 会话与执行调度 |
 | `trace_service` | 事实来源追溯链 |
-| `benchmark_service` | 评测任务执行与报告 |
 
 ## API 概览
 

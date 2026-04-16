@@ -13,7 +13,9 @@ import logging
 import re
 import traceback
 from collections import defaultdict
+from datetime import datetime
 from io import StringIO
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -135,6 +137,7 @@ def compress_text_blocks(
     text_blocks: list[str],
     *,
     min_numbers: int = 3,
+    keep_keywords: list[str] | None = None,
 ) -> list[str]:
     """Rule-based compression of prose text blocks.
 
@@ -144,8 +147,12 @@ def compress_text_blocks(
     2. For kept paragraphs, split into clauses (by ，；。,;) and keep only
        clauses that contain at least one number.  This strips filler prose
        while preserving all data-bearing text intact.
+    3. If *keep_keywords* is provided, paragraphs containing any of these
+       keywords are always kept (even with few numbers), preserved whole
+       without clause-level filtering.
     """
     compressed: list[str] = []
+    _kw_lower = [k.lower() for k in (keep_keywords or [])]
 
     for blk in text_blocks:
         blk = blk.strip()
@@ -154,7 +161,11 @@ def compress_text_blocks(
 
         # Count meaningful numeric tokens
         nums = [n for n in _NUM_RE.findall(blk) if len(n) > 1]
+
+        # Keyword rescue: keep paragraph whole if it mentions a missing field
         if len(nums) < min_numbers:
+            if _kw_lower and any(kw in blk.lower() for kw in _kw_lower):
+                compressed.append(blk)
             continue
 
         # ── Clause-level filtering ──
@@ -576,12 +587,15 @@ _SYSTEM_PROMPT = """\
 3. 最终结果必须赋值给变量 `result_df`，它是一个 pandas DataFrame。
    - 如果模板有多张表(如docx中3个表各自有筛选条件)，则分别生成 result_df_0, result_df_1, result_df_2 ...
    - 同时也赋值 result_df = result_df_0 (作为默认)。
-4. `result_df` 的列名必须与模板列名完全一致。
-5. 仔细分析模板结构：
-   - 如果模板没有日期/时间列，说明需要按实体（如国家）聚合多天的数据。
-   - 聚合策略：数值列用 sum 求总和（如病例数、检测数），人均指标和人口用 first 或 mean。
-   - 如果源数据包含省/州级数据，但模板只有国家列，需要汇总到国家级别。
-6. 日期过滤：如果用户指定了日期范围，先过滤再聚合。日期列可能是字符串格式。
+4. `result_df` 的列名必须与模板列名**完全一致**。源列名与模板列名不同时，用 rename() 映射。
+5. 仔细分析模板结构和用户指令来决定数据转换策略：
+   - 如果用户指定了日期范围(如"2020/7/1到8/31")，先按日期筛选源数据。
+   - 如果用户指定日期范围且模板没有日期列，筛选后**按实体(如国家/地区)聚合**：
+     累计型指标(如病例数、检测数、销售额)用 sum，人均/比率指标用 mean，属性字段(如人口、大洲)用 first。
+   - 如果模板有多张表且每张表有上下文描述(如城市名、时间)，按描述中的条件**分别筛选**源数据。
+   - 源列名可能与模板列名不完全匹配(如"国家/地区"→"地区")，需要根据语义 rename。
+6. 日期过滤：日期列如果是字符串格式(如 '2020-07-01')，用 pd.to_datetime(errors='coerce') 转换。
+   日期列如果已经是字符串格式的日期，直接用 pd.to_datetime 转换即可。
 7. 多源数据合并：如果有多个 DataFrame，先分别处理再用 concat/merge 合并。
 8. 处理数据类型：数值列先用 pd.to_numeric(errors='coerce') 转换。
 9. 结果不要包含全部为 NaN 的行。部分字段缺失的行应保留(缺失列填 NaN)。
@@ -591,7 +605,21 @@ _SYSTEM_PROMPT = """\
     - **重要**: 不要使用 `if all([...])` 来过滤行。即使某些字段提取失败，也要保留该行，缺失字段填 None。
     - 数值中可能包含逗号(如 56,708.71)，注意去掉逗号后转 float。
     - 用多种正则模式匹配不同格式，确保不遗漏任何实体。
+    - **重要**: 文本源中解析出的子实体(如省份、城市)应聚合为其上级实体。
+      例如：多个中国省份的数据应聚合为一条"中国"(或"China")行，与结构化数据源中的国家级实体对齐。
+      聚合规则：累计型指标(如病例数、检测数)用 sum，人均/比率指标(如人均GDP)用加权平均或 mean，
+      属性字段(如大洲)用 first，人口用 sum。聚合后的实体名应与模板/结构化数据中的实体名一致。
+    - **重要**: 跳过不含实体(省份/城市/国家)的段落(如纯日期、标题、总结段落)。
+      省份匹配示例: r'^(\\S+(?:省|市|自治区))'。如果开头不是实体名则跳过该段落。
+    - **重要**: 从文本中提取的数值，保持原文中的数值不做单位转换（如"人口约5775万"提取为5775，
+      "人均GDP约7.3万元"提取为7.3）。单位转换只在模板或用户明确要求时才做。
+      检测数如"12.6万份"提取为126000（乘以10000），因为模板中检测数列通常是绝对数量。
 11. 只输出 Python 代码，不要包含任何解释文字。用 ```python 和 ``` 包裹代码。
+12. 多源合并时，如果一个 DataFrame 行数远大于另一个（如 2000 行 vs 10 行），
+    大 DataFrame 是主数据源，小 DataFrame 是补充信息。
+    应使用 merge(how='left') 保留主数据源全部行。
+    补充数据应以实体名(国家/地区)作为 merge key 映射到主源的每一行。
+    **聚合操作**：先 merge 全部行，再根据用户指令决定是否 groupby 聚合。
 """
 
 
@@ -602,7 +630,12 @@ def generate_transform_code(
     source_descriptions: list[str],
     user_instruction: str,
 ) -> str:
-    """Ask LLM to generate pandas transformation code."""
+    """Ask LLM to generate pandas transformation code.
+
+    This is the ONLY LLM call in the entire pipeline.
+    All filtering, column mapping, aggregation, and text parsing logic
+    is generated here in one shot.
+    """
     user_parts = [
         "## 模板结构",
         f"列名: {template_schema['columns']}",
@@ -616,11 +649,12 @@ def generate_transform_code(
             ctx = ti.get("context_text", "")
             user_parts.append(
                 f"  表{ti['table_index']}: 列名={ti['columns']}, 数据行数={ti.get('data_rows', '?')}"
-                + (f", 上下文描述=「{ctx[:150]}」" if ctx else "")
+                + (f"\n  上下文描述=「{ctx[:300]}」" if ctx else "")
             )
         user_parts.append(
             "请为每张表分别生成 result_df_0, result_df_1, ... 并设 result_df = result_df_0。"
-            "每张表的筛选条件从上下文描述中提取。"
+            "每张表的筛选条件从上下文描述中提取（如城市名、时间等）。"
+            "每张表必须根据各自的上下文描述做独立筛选，不能使用相同的筛选结果。"
         )
 
     user_parts.append("\n## 源数据")
@@ -725,7 +759,9 @@ def execute_transform_safely(
         if key.startswith("result_df_") and key != "result_df":
             suffix = key[len("result_df_"):]
             if suffix.isdigit():
-                val = local_ns.get(key) or restricted_globals.get(key)
+                val = local_ns.get(key)
+                if val is None:
+                    val = restricted_globals.get(key)
                 if isinstance(val, pd.DataFrame) and not val.empty:
                     per_table[int(suffix)] = val
 
@@ -835,11 +871,16 @@ def write_dataframe_to_docx(
         if not table.rows:
             continue
         header_row = table.rows[0]
-        col_names = [str(c.value or "").strip() for c in header_row.cells]
+        col_names = [str(v or "").strip() for v in header_row.values]
 
         # Pick the DataFrame for this table
+        # LLM generates 0-indexed keys (result_df_0, result_df_1, ...)
+        # but docx tables use 1-based table_index (1, 2, 3, ...)
         t_idx = getattr(table, "table_index", 0)
-        if per_table_dfs and t_idx in per_table_dfs:
+        lookup_idx = t_idx - 1 if t_idx >= 1 else t_idx
+        if per_table_dfs and lookup_idx in per_table_dfs:
+            df_for_table = per_table_dfs[lookup_idx]
+        elif per_table_dfs and t_idx in per_table_dfs:
             df_for_table = per_table_dfs[t_idx]
         else:
             df_for_table = result_df
@@ -847,7 +888,7 @@ def write_dataframe_to_docx(
         col_map: dict[str, int] = {}
         for idx, name in enumerate(col_names):
             if name in df_for_table.columns:
-                col_map[name] = idx
+                col_map[name] = idx + 1  # 1-based column index for WordCellWrite
         if not col_map:
             continue
 
@@ -889,6 +930,68 @@ def write_dataframe_to_docx(
 
 
 # ---------------------------------------------------------------------------
+# 6b. Rule-based xlsx DataFrame cleaning
+# ---------------------------------------------------------------------------
+
+_DATE_COL_PATTERNS = re.compile(r"日期|date|时间|time|年月|month|day|日$", re.IGNORECASE)
+_ENTITY_COL_PATTERNS = re.compile(
+    r"国家|地区|城市|省|country|region|city|province|州|area|location|名称|name",
+    re.IGNORECASE,
+)
+
+
+def basic_clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """Basic deterministic cleanup for any DataFrame — no LLM, no filtering.
+
+    Only does format-level operations that are safe for ALL scenarios:
+    - Drop completely empty rows
+    - Coerce numeric-looking columns to numbers
+    - Deduplicate column names
+
+    Column selection, date filtering, and row filtering are left to code gen.
+    """
+    orig_shape = df.shape
+
+    # Deduplicate column names (append _1, _2 etc.)
+    cols = list(df.columns)
+    seen: dict[str, int] = {}
+    for i, c in enumerate(cols):
+        if c in seen:
+            seen[c] += 1
+            cols[i] = f"{c}_{seen[c]}"
+        else:
+            seen[c] = 0
+    df.columns = cols
+
+    # Drop all-NaN rows
+    df = df.dropna(how="all")
+
+    # Try numeric coercion
+    for col in df.columns:
+        df[col] = pd.to_numeric(df[col], errors="ignore")
+
+    # Auto-convert Excel serial date columns to date strings
+    # Excel serial dates are int64 values typically in the 30000-55000 range
+    for col in df.columns:
+        if df[col].dtype in ("int64", "float64"):
+            col_lower = str(col).lower()
+            if any(kw in col_lower for kw in ("日期", "date", "时间", "time")):
+                vals = df[col].dropna()
+                if len(vals) > 0:
+                    mn, mx = vals.min(), vals.max()
+                    if 30000 < mn and mx < 55000:
+                        try:
+                            df[col] = pd.to_timedelta(df[col], unit="D") + pd.Timestamp("1899-12-30")
+                            df[col] = df[col].dt.strftime("%Y-%m-%d")
+                            logger.info("basic_clean: converted column '%s' from Excel serial date to date string", col)
+                        except Exception:
+                            pass
+
+    logger.info("basic_clean: %d×%d → %d×%d", orig_shape[0], orig_shape[1], df.shape[0], df.shape[1])
+    return df
+
+
+# ---------------------------------------------------------------------------
 # 7. Orchestrator: full LLM transform pipeline
 # ---------------------------------------------------------------------------
 
@@ -901,144 +1004,168 @@ def run_llm_transform_pipeline(
     document_ids: list[str],
     user_requirement: str,
 ) -> list | None:
-    """Run the full LLM transform pipeline.
+    """Run the unified LLM transform pipeline.
+
+    Step 1 — Rule-based preprocessing (0 LLM calls):
+      xlsx  → basic_clean_dataframe (drop empty rows, numeric coercion)
+      text  → compress_text_blocks → DataFrame(content column)
+
+    Step 2 — LLM code generation (1 LLM call):
+      Always generates pandas code for filtering, mapping, aggregation, merging.
+
+    Step 3 — Execute code + write to template (0 LLM calls)
+
+    Total: exactly 1 LLM call.
     Returns a list of FilledCellRecord on success, or None if not applicable.
     """
     if not openai_client.is_configured:
         logger.info("LLM transform skipped: OpenAI client not configured")
         return None
 
-    # Step 1: Load source DataFrames
+    # ── Step 1a: Load sources & describe template ──
     sources = load_source_dataframes(repository, document_ids)
     if not sources:
         logger.info("LLM transform skipped: no source DataFrames loaded")
         return None
 
-    # Step 2: Describe template
     template_schema = describe_template_schema(template_path)
     if not template_schema["columns"]:
         logger.info("LLM transform skipped: no template columns detected")
         return None
 
-    # Step 1b: For text sources, use direct LLM extraction (faster than code gen).
-    # The LLM reads the text directly and extracts structured data as JSON.
-    text_source_idx: list[int] = []
-    for i, src in enumerate(sources):
-        if src.get("source") != "text" or not src.get("text_blocks"):
-            continue
-        text_blocks = src["text_blocks"]
-        total_chars = sum(len(b) for b in text_blocks)
-        logger.info(
-            "Text source '%s': %d paragraphs, %d chars → direct extraction",
-            src["file_name"], len(text_blocks), total_chars,
-        )
-        text_source_idx.append(i)
+    template_columns = template_schema["columns"]
 
-    # If there are text sources, compress then extract them directly with LLM
-    if text_source_idx:
-        for i in text_source_idx:
-            src = sources[i]
-            try:
-                raw_blocks = src["text_blocks"]
-                # ── Rule-based compression: strip prose, keep data ──
-                compressed = compress_text_blocks(raw_blocks)
-                blocks_to_use = compressed if compressed else raw_blocks
-                df = extract_text_to_dataframe(
-                    openai_client,
-                    blocks_to_use,
-                    template_schema["columns"],
-                    max_chars_per_chunk=2500,  # small chunks to stay within DeepSeek gateway timeout
-                )
-                if df is not None and not df.empty:
-                    sources[i]["df"] = df
-                    sources[i]["source"] = "text_extracted"
-                    logger.info(
-                        "Direct text extraction for '%s': %d rows",
-                        src["file_name"], len(df),
-                    )
-                else:
-                    logger.warning("Direct text extraction returned empty for '%s'", src["file_name"])
-            except Exception as exc:
-                logger.warning("Direct text extraction failed for '%s': %s", src["file_name"], exc)
+    # ── Step 1b: Rule-based preprocessing (no LLM) ──
+    cleaned_sources: list[dict] = []
 
-    # For any remaining text sources that weren't extracted, convert to content DataFrame for code gen
-    for i, src in enumerate(sources):
-        if src.get("source") != "text" or not src.get("text_blocks"):
-            continue
-        text_blocks = src["text_blocks"]
-        logger.info(
-            "Text source '%s': fallback to content DataFrame for code gen",
-            src["file_name"],
-        )
-        sources[i]["df"] = pd.DataFrame({"content": text_blocks})
-        sources[i]["source"] = "text_as_df"
+    for src in sources:
+        src_type = src.get("source")
+        fname = src["file_name"]
 
-    # Filter out sources that still have no DataFrame
-    sources = [s for s in sources if "df" in s]
-    if not sources:
-        logger.info("LLM transform skipped: no usable source DataFrames")
+        if src_type == "text" and src.get("text_blocks"):
+            # Text source → compress → content DataFrame
+            text_blocks = src["text_blocks"]
+            total_chars = sum(len(b) for b in text_blocks)
+            compressed = compress_text_blocks(text_blocks)
+            blocks_to_use = compressed if compressed else text_blocks
+            logger.info(
+                "Step1 text '%s': %d paragraphs (%d chars) → compressed %d paragraphs → text_as_df",
+                fname, len(text_blocks), total_chars, len(blocks_to_use),
+            )
+            cleaned_sources.append({
+                "file_name": fname,
+                "df": pd.DataFrame({"content": blocks_to_use}),
+                "source": "text_as_df",
+                "text_blocks": blocks_to_use,
+            })
+        elif "df" in src:
+            # Structured source → basic cleanup only
+            logger.info(
+                "Step1 xlsx '%s': %d rows, %d cols → basic_clean",
+                fname, len(src["df"]), len(src["df"].columns),
+            )
+            cleaned_df = basic_clean_dataframe(src["df"])
+            cleaned_sources.append({
+                "file_name": fname,
+                "df": cleaned_df,
+                "source": "xlsx_cleaned",
+            })
+        else:
+            logger.warning("Step1: source '%s' has no df or text_blocks, skipping", fname)
+
+    if not cleaned_sources:
+        logger.info("LLM transform skipped: no cleaned sources")
         return None
 
-    # Step 3-5: If all sources are already extracted (no text_as_df needing code gen),
-    # skip code generation entirely and use the DataFrames directly.
-    need_code_gen = any(s.get("source") == "text_as_df" for s in sources)
-
-    if not need_code_gen and len(sources) == 1:
-        # Single source already extracted: use its DataFrame directly
-        result_df = sources[0]["df"]
-        per_table_dfs = None
-        logger.info(
-            "LLM transform: using directly extracted DataFrame (no code gen needed), shape=%s",
-            result_df.shape,
-        )
-    else:
-        # Step 3: Describe source data (use text description for text sources)
-        source_descriptions: list[str] = []
-        for idx, s in enumerate(sources):
-            if s.get("source") == "text_as_df" and s.get("text_blocks"):
-                source_descriptions.append(
-                    describe_text_source(s["text_blocks"], s["file_name"], idx)
-                )
-            else:
-                source_descriptions.append(describe_dataframe(s["df"], s["file_name"]))
-
-        # Step 4: Generate transform code
-        logger.info(
-            "LLM transform: generating code for %d sources → template(%s)",
-            len(sources), template_schema["columns"],
-        )
-        code = generate_transform_code(
-            openai_client,
-            template_schema=template_schema,
-            source_descriptions=source_descriptions,
-            user_instruction=user_requirement or "将源数据填入模板",
-        )
-        logger.info("LLM transform: generated code:\n%s", code)
-
-        # Step 5: Execute
-        try:
-            exec_result = execute_transform_safely(
-                code, [s["df"] for s in sources],
-            )
-        except ValueError as exc:
-            logger.warning("LLM transform execution failed: %s", exc)
-            return None
-
-        # Handle per-table results (dict) vs single DataFrame
-        per_table_dfs = None
-        if isinstance(exec_result, dict):
-            per_table_dfs = {k: v for k, v in exec_result.items() if k >= 0}
-            result_df = exec_result.get(-1) or next(iter(per_table_dfs.values()))
-            logger.info(
-                "LLM transform: per-table results: %s",
-                {k: f"shape={v.shape}" for k, v in per_table_dfs.items()},
+    # ── Step 2: LLM code generation (always, exactly 1 call) ──
+    source_descriptions: list[str] = []
+    for idx, s in enumerate(cleaned_sources):
+        if s.get("source") == "text_as_df" and s.get("text_blocks"):
+            source_descriptions.append(
+                describe_text_source(s["text_blocks"], s["file_name"], idx)
             )
         else:
-            result_df = exec_result
+            source_descriptions.append(describe_dataframe(s["df"], s["file_name"]))
 
-    logger.info("LLM transform: result_df shape=%s, columns=%s", result_df.shape, list(result_df.columns))
+    # ── Dump debug info to file for easy inspection ──
+    _debug_lines: list[str] = []
+    _debug_lines.append("=" * 60)
+    _debug_lines.append(f"TIMESTAMP: {datetime.now().isoformat()}")
+    _debug_lines.append(f"TEMPLATE: {template_path}")
+    _debug_lines.append(f"OUTPUT:   {output_path}")
+    _debug_lines.append("")
+    _debug_lines.append("## TEMPLATE SCHEMA")
+    _debug_lines.append(f"  columns: {template_schema.get('columns')}")
+    _debug_lines.append(f"  description: {template_schema.get('description', '')[:500]}")
+    if template_schema.get("tables"):
+        for ti in template_schema["tables"]:
+            _debug_lines.append(
+                f"  table {ti['table_index']}: cols={ti['columns']}, "
+                f"context='{ti.get('context_text', '')[:300]}'"
+            )
+    _debug_lines.append("")
+    _debug_lines.append("## SOURCE DESCRIPTIONS")
+    for idx, desc in enumerate(source_descriptions):
+        _debug_lines.append(f"\n### df_{idx}\n{desc}")
+    _debug_lines.append("")
+    _debug_lines.append(f"## USER INSTRUCTION\n{user_requirement or '将源数据填入模板'}")
+    _debug_lines.append("=" * 60)
 
-    # Step 6: Write to template
+    logger.info(
+        "Step2 code gen: %d sources (%s), total %d rows → template(%s)",
+        len(cleaned_sources),
+        [s["source"] for s in cleaned_sources],
+        sum(len(s["df"]) for s in cleaned_sources),
+        template_columns,
+    )
+    code = generate_transform_code(
+        openai_client,
+        template_schema=template_schema,
+        source_descriptions=source_descriptions,
+        user_instruction=user_requirement or "将源数据填入模板",
+    )
+    logger.info("Step2 generated code (see debug file for full details)")
+
+    _debug_lines.append("")
+    _debug_lines.append("## LLM GENERATED CODE")
+    _debug_lines.append(code)
+    _debug_lines.append("=" * 60)
+
+    # Write debug file next to the output
+    try:
+        _debug_dir = Path(output_path).parent
+        _tpl_stem = Path(template_path).stem
+        _ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        _debug_path = _debug_dir / f"debug_{_tpl_stem}_{_ts}.txt"
+        _debug_path.write_text("\n".join(_debug_lines), encoding="utf-8")
+        logger.info("Debug file written: %s", _debug_path)
+    except Exception as _e:
+        logger.warning("Failed to write debug file: %s", _e)
+
+    try:
+        exec_result = execute_transform_safely(
+            code, [s["df"] for s in cleaned_sources],
+        )
+    except ValueError as exc:
+        logger.warning("Step2 code execution failed: %s", exc)
+        return None
+
+    per_table_dfs = None
+    if isinstance(exec_result, dict):
+        per_table_dfs = {k: v for k, v in exec_result.items() if k >= 0}
+        result_df = exec_result.get(-1)
+        if result_df is None:
+            result_df = next(iter(per_table_dfs.values()))
+        logger.info(
+            "Step2 per-table results: %s",
+            {k: f"shape={v.shape}" for k, v in per_table_dfs.items()},
+        )
+    else:
+        result_df = exec_result
+
+    logger.info("Step2 result_df: shape=%s, columns=%s", result_df.shape, list(result_df.columns))
+
+    # ── Step 3: Write to template ──
     suffix = str(template_path).rsplit(".", 1)[-1].lower()
     try:
         if suffix == "xlsx":
@@ -1052,8 +1179,8 @@ def run_llm_transform_pipeline(
             )
         else:
             return None
-        logger.info("LLM transform: wrote %d filled cells to template", len(filled))
+        logger.info("Step3: wrote %d filled cells to template", len(filled))
         return filled if filled else None
     except Exception as exc:
-        logger.error("LLM transform: write to template failed: %s", exc, exc_info=True)
+        logger.error("Step3: write to template failed: %s", exc, exc_info=True)
         return None

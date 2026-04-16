@@ -20,22 +20,9 @@ from typing import Any, Generator
 
 class ErrorCode:
     # Parsing
-    PARSE_UNSUPPORTED_FORMAT = "E1001"
     PARSE_READ_FAILURE = "E1002"
-    PARSE_STRUCTURE_ERROR = "E1003"
     # Extraction
     EXTRACT_NO_FACTS = "E2001"
-    EXTRACT_LOW_CONFIDENCE = "E2002"
-    EXTRACT_CONFLICT = "E2003"
-    # Template fill
-    FILL_TEMPLATE_LOAD = "E3001"
-    FILL_NO_MATCHING_FACTS = "E3002"
-    FILL_WRITE_FAILURE = "E3003"
-    FILL_CELL_MISMATCH = "E3004"
-    # Agent
-    AGENT_INTENT_UNKNOWN = "E4001"
-    AGENT_LLM_FAILURE = "E4002"
-    AGENT_PLAN_INVALID = "E4003"
 
 
 class StructuredFormatter(logging.Formatter):

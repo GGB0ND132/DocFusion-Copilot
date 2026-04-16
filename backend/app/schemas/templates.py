@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from app.schemas.common import APIModel, TemplateResultResponse
+from app.schemas.common import APIModel
 
 
 # ---------------------------------------------------------------------------
@@ -20,14 +20,6 @@ class TemplateFillAcceptedResponse(APIModel):
     template_name: str
     document_set_id: str | None = None
     auto_match: bool = True
-
-
-class TemplateFillResultResponse(APIModel):
-    """用于返回已完成模板结果元数据的包装结构。
-    Wrapper schema for returning completed template result metadata.
-    """
-
-    result: TemplateResultResponse
 
 
 # ---------------------------------------------------------------------------
@@ -85,14 +77,4 @@ class TemplateIntent:
     """从 user_requirement 中解析出的目标实体列表，如 ['济南', '青岛']。"""
 
 
-@dataclass(slots=True)
-class ExtractionPlanItem:
-    """针对单个字段的抽取策略。
-    Extraction strategy for one field derived from TemplateIntent.
-    """
 
-    field_requirement: FieldRequirement
-    extraction_strategy: str = "rule"
-    """抽取策略: 'rule' | 'llm_targeted' | 'compute'"""
-    source_hint: str = ""
-    """提示应该从哪类文档/段落中查找该字段。"""

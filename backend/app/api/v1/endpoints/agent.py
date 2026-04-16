@@ -16,8 +16,6 @@ from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from app.core.container import get_container
 from app.models.domain import ConversationRecord
 from app.schemas.agent import (
-    AgentChatRequest,
-    AgentChatResponse,
     AgentExecuteRequest,
     AgentExecuteResponse,
     ConversationCreateRequest,
@@ -217,23 +215,6 @@ def _persist_conversation(context_id: str, user_msg: str, assistant_msg: str) ->
 
 
 # ── Endpoints ──
-
-
-@router.post("/chat", response_model=AgentChatResponse)
-def chat(payload: AgentChatRequest) -> AgentChatResponse:
-    """将自然语言请求交给 LangGraph agent 处理。"""
-    result = _invoke_agent(payload.message, payload.context_id)
-    return AgentChatResponse(
-        intent=result["intent"],
-        entities=[],
-        fields=[],
-        target="agent",
-        need_db_store=False,
-        context_id=result["context_id"],
-        preview=[],
-        edits=[],
-        planner="langgraph",
-    )
 
 
 @router.post("/execute", response_model=AgentExecuteResponse)

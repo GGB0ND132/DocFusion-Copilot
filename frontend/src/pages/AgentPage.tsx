@@ -13,9 +13,7 @@ import {
   CheckCircle2,
   XCircle,
   Clock,
-  Search,
   RotateCcw,
-  AlertTriangle,
   MessageSquarePlus,
   Trash2,
   Sparkles,
@@ -48,7 +46,7 @@ import {
   type AgentExecuteResponse,
   type ConversationResponse,
   type DocumentResponse,
-  type FilledCellResponse,
+
   type SuggestDocumentCandidate,
   type TaskResponse,
 } from '@/services';
@@ -83,11 +81,12 @@ export default function AgentPage() {
   const [pendingFillText, setPendingFillText] = useState('');
   const [pendingFillContextId, setPendingFillContextId] = useState<string | null>(null);
   const [pendingFillDocSetId, setPendingFillDocSetId] = useState<string | null>(null);
+  const [fillSourceDocs, setFillSourceDocs] = useState<{ id: string; name: string }[]>([]);
 
   const uploadedDocuments = useUiStore((s) => s.uploadedDocuments);
   const currentDocumentSetId = useUiStore((s) => s.currentDocumentSetId);
   const upsertTaskSnapshot = useUiStore((s) => s.upsertTaskSnapshot);
-  const openTraceByFactId = useUiStore((s) => s.openTraceByFactId);
+
   const conversationList = useUiStore((s) => s.conversationList);
   const setConversationList = useUiStore((s) => s.setConversationList);
   const switchConversation = useUiStore((s) => s.switchConversation);
@@ -163,6 +162,12 @@ export default function AgentPage() {
     const selectedNames = selectedDocIds
       .map((id) => docSelectCandidates.find((c) => c.doc_id === id)?.file_name ?? id)
       .join('、');
+    setFillSourceDocs(
+      selectedDocIds.map((id) => ({
+        id,
+        name: docSelectCandidates.find((c) => c.doc_id === id)?.file_name ?? id,
+      })),
+    );
     addAgentMessage({
       role: 'assistant',
       text: `已选择 ${selectedDocIds.length} 个源文档：${selectedNames}\n正在提交回填任务…`,
@@ -522,15 +527,6 @@ export default function AgentPage() {
     el.style.height = `${Math.min(el.scrollHeight, 200)}px`;
   }, []);
 
-  // Use the latest task for filled cells display
-  const latestTaskId = fillTaskIds.length > 0 ? fillTaskIds[fillTaskIds.length - 1] : null;
-  const latestTask = latestTaskId ? fillTasks[latestTaskId] ?? null : null;
-
-  const filledCells = useMemo<FilledCellResponse[]>(() => {
-    if (!latestTask?.result) return [];
-    return Array.isArray(latestTask.result.filled_cells) ? (latestTask.result.filled_cells as FilledCellResponse[]) : [];
-  }, [latestTask]);
-
   return (
     <>
     <ResizablePanelGroup className="h-full">
@@ -778,84 +774,32 @@ export default function AgentPage() {
       {/* ── Right sidebar: results ── */}
       <ResizablePanel defaultSize={30} minSize={15}>
       <div className="flex h-full flex-col bg-card">
-        <Tabs defaultValue="result" className="flex h-full flex-col">
+        <Tabs defaultValue="tasks" className="flex h-full flex-col">
           <div className="border-b px-3">
-            <TabsList className="h-9 w-full grid grid-cols-3">
-              <TabsTrigger value="result" className="text-xs">回填结果</TabsTrigger>
-              <TabsTrigger value="context" className="text-xs">上下文</TabsTrigger>
+            <TabsList className="h-9 w-full grid grid-cols-2">
               <TabsTrigger value="tasks" className="text-xs">任务</TabsTrigger>
+              <TabsTrigger value="context" className="text-xs">上下文</TabsTrigger>
             </TabsList>
           </div>
 
-          {/* ── Result tab ── */}
-          <TabsContent value="result" className="flex-1 overflow-hidden m-0">
-            <ScrollArea className="h-full">
-              <div className="p-3 space-y-3">
-                {/* Filled cells */}
-                {filledCells.length > 0 && (
-                  <>
-                    <div className="text-xs font-medium">已填充单元格 ({filledCells.length})</div>
-                    {filledCells.slice(0, 20).map((cell) => (
-                      <Card
-                        key={`${cell.sheet_name}-${cell.cell_ref}`}
-                        className={`p-0 shadow-none ${cell.confidence < 0.7 ? 'border-amber-400 bg-amber-50 dark:bg-amber-950/20' : ''}`}
-                        title={cell.evidence_text ? `来源：${cell.evidence_text}` : undefined}
-                      >
-                        <CardContent className="p-2 space-y-0.5">
-                          <div className="flex items-center justify-between">
-                            <span className="text-[11px] font-medium">{cell.sheet_name} / {cell.cell_ref}</span>
-                            <div className="flex items-center gap-1">
-                              {cell.confidence < 0.7 && <AlertTriangle className="h-3 w-3 text-amber-500" />}
-                              <Badge variant={cell.confidence < 0.7 ? 'destructive' : 'outline'} className="text-[9px] h-4">
-                                {(cell.confidence * 100).toFixed(0)}%
-                              </Badge>
-                            </div>
-                          </div>
-                          <div className="text-[10px] text-muted-foreground">
-                            {cell.entity_name} · {cell.field_name}
-                          </div>
-                          <div className="text-xs text-foreground">{String(cell.value)}</div>
-                          {cell.evidence_text && (
-                            <div className="text-[9px] text-muted-foreground truncate" title={cell.evidence_text}>
-                              📎 {cell.evidence_text}
-                            </div>
-                          )}
-                          <div className="text-[9px] font-mono text-muted-foreground/60 truncate">
-                            {cell.fact_id}
-                          </div>
-                          {cell.fact_id && (
-                            <Button
-                              variant="ghost"
-                              size="sm"
-                              className="h-5 text-[9px] px-1.5 text-primary hover:text-primary/80"
-                              onClick={() => openTraceByFactId(cell.fact_id, `${cell.sheet_name}/${cell.cell_ref}`)}
-                            >
-                              <Search className="h-2.5 w-2.5 mr-0.5" /> 追溯来源
-                            </Button>
-                          )}
-                        </CardContent>
-                      </Card>
-                    ))}
-                  </>
-                )}
-
-                {!latestTask && filledCells.length === 0 && (
-                  <p className="text-xs text-muted-foreground py-4 text-center">上传模板并发送需求后，回填结果将显示在这里。</p>
-                )}
-              </div>
-            </ScrollArea>
-          </TabsContent>
-
           {/* ── Context tab ── */}
-          {/* ?? Context tab ?? */}
           <TabsContent value="context" className="flex-1 overflow-hidden m-0">
             <ScrollArea className="h-full">
               <div className="p-3 space-y-3 text-xs">
-                <div className="space-y-1">
-                  <span className="text-muted-foreground">document_set_id</span>
-                  <p className="font-mono text-[10px] break-all">{effectiveDocumentSetId ?? currentDocumentSetId ?? '未设置'}</p>
-                </div>
-                <Separator />
+                {fillSourceDocs.length > 0 && (
+                  <>
+                    <div className="space-y-1">
+                      <span className="text-muted-foreground">回填源文档 ({fillSourceDocs.length})</span>
+                      {fillSourceDocs.map((doc) => (
+                        <div key={doc.id} className="flex items-center gap-1.5 py-0.5">
+                          <span className="h-1.5 w-1.5 rounded-full bg-blue-500 shrink-0" />
+                          <span className="truncate">{doc.name}</span>
+                        </div>
+                      ))}
+                    </div>
+                    <Separator />
+                  </>
+                )}
                 <div className="space-y-1">
                   <span className="text-muted-foreground">可用源文档 ({scopedDocumentIds.length})</span>
                   {scopedDocuments.length === 0 ? (

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-from functools import lru_cache
 
 from langchain_openai import ChatOpenAI
 

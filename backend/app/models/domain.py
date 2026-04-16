@@ -34,8 +34,6 @@ class TaskType(StrEnum):
 
     parse_document = "parse_document"
     fill_template = "fill_template"
-    evaluate_facts = "evaluate_facts"
-    benchmark_template_fill = "benchmark_template_fill"
 
 
 @dataclass(slots=True)
