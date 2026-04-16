@@ -6,7 +6,7 @@ from pathlib import Path
 from time import perf_counter
 
 from app.core.config import Settings
-from app.core.logging import ErrorCode, get_logger, log_operation
+from app.core.logging import ErrorCode, get_logger
 from app.models.domain import DocumentRecord, DocumentStatus, TaskRecord, TaskStatus, TaskType
 from app.parsers.factory import ParserRegistry
 from app.repositories.base import Repository

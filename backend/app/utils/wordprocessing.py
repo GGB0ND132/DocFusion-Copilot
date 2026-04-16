@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import io
-import re
 import zipfile
 from copy import deepcopy
 from dataclasses import dataclass
@@ -13,22 +11,6 @@ XML_NS = "http://www.w3.org/XML/1998/namespace"
 W = {"w": W_NS}
 
 ET.register_namespace("w", W_NS)
-
-
-def _register_all_namespaces(xml_bytes: bytes) -> None:
-    """注册 XML 中所有命名空间前缀，防止序列化时丢失。
-    Register every namespace prefix found in *xml_bytes* so that
-    ``ET.tostring`` preserves them instead of rewriting to ns0/ns1/…"""
-    for _, (prefix, uri) in ET.iterparse(io.BytesIO(xml_bytes), events=["start-ns"]):
-        if prefix and uri:
-            try:
-                ET.register_namespace(prefix, uri)
-            except ValueError:
-                pass
-
-_DOCX_HEADING_RE = re.compile(
-    r"^(?P<prefix>(?:[一二三四五六七八九十]+[、.．]|\d{1,2}(?:\.\d{1,2}){0,2}[、.．]))\s*(?P<title>\S.*)$"
-)
 
 
 @dataclass(slots=True)
@@ -224,76 +206,6 @@ def apply_docx_updates(template_path: str | Path, output_path: str | Path, updat
     doc.save(str(destination_file))
 
 
-def reformat_docx_document(source_path: str | Path, output_path: str | Path) -> None:
-    """对 DOCX 段落执行基础排版规范化。    Apply basic layout normalization to DOCX paragraphs."""
-
-    template_file = Path(source_path)
-    destination_file = Path(output_path)
-    destination_file.parent.mkdir(parents=True, exist_ok=True)
-
-    with zipfile.ZipFile(template_file, "r") as source_archive:
-        doc_xml = source_archive.read("word/document.xml")
-        _register_all_namespaces(doc_xml)
-        root = ET.fromstring(doc_xml)
-        for paragraph_el in root.findall(".//w:p", W):
-            text = _text_from_element(paragraph_el).strip()
-            if not text:
-                continue
-            normalized_text, heading_level = _normalize_paragraph_text(text)
-            _set_paragraph_text(paragraph_el, normalized_text)
-            if heading_level is not None:
-                _set_paragraph_style(paragraph_el, f"Heading{min(heading_level, 3)}")
-
-        document_payload = ET.tostring(root, encoding="utf-8", xml_declaration=True)
-        with zipfile.ZipFile(destination_file, "w", compression=zipfile.ZIP_DEFLATED) as destination_archive:
-            for file_info in source_archive.infolist():
-                payload = (
-                    document_payload
-                    if file_info.filename == "word/document.xml"
-                    else source_archive.read(file_info.filename)
-                )
-                destination_archive.writestr(file_info, payload)
-
-
-def create_empty_docx(output_path: str | Path) -> None:
-    """创建一个只有空段落的 DOCX 文件。    Create a minimal DOCX with a single empty paragraph."""
-
-    from io import BytesIO
-
-    destination_file = Path(output_path)
-    destination_file.parent.mkdir(parents=True, exist_ok=True)
-
-    content_types = (
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
-        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
-        '<Default Extension="xml" ContentType="application/xml"/>'
-        '<Override PartName="/word/document.xml" '
-        'ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>'
-        '</Types>'
-    )
-    rels = (
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
-        '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" '
-        'Target="word/document.xml"/>'
-        '</Relationships>'
-    )
-    document_xml = (
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-        '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
-        '<w:body><w:p/></w:body>'
-        '</w:document>'
-    )
-
-    buf = BytesIO()
-    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr("[Content_Types].xml", content_types)
-        zf.writestr("_rels/.rels", rels)
-        zf.writestr("word/document.xml", document_xml)
-    destination_file.write_bytes(buf.getvalue())
-
-
 def replace_text_in_docx_document(
     source_path: str | Path,
     output_path: str | Path,
@@ -433,25 +345,6 @@ def _set_cell_text(cell_el: ET.Element, value: str) -> None:
     text_el.text = value
 
 
-def _normalize_paragraph_text(text: str) -> tuple[str, int | None]:
-    """规范化段落文本并识别标题层级。    Normalize paragraph text and detect a heading level."""
-
-    normalized = re.sub(r"\s+", " ", text).strip()
-    match = _DOCX_HEADING_RE.match(normalized)
-    if not match:
-        return normalized, None
-
-    prefix = match.group("prefix").strip()
-    title = match.group("title").strip()
-    if not title:
-        return normalized, None
-
-    if prefix[0].isdigit():
-        level = prefix.rstrip("、.．").count(".") + 1
-        return f"{prefix} {title}".strip(), level
-    return f"{prefix}{title}", 1
-
-
 def _set_paragraph_text(paragraph_el: ET.Element, value: str) -> None:
     """重写段落文本并尽量保留段落样式。    Rewrite paragraph text while preserving paragraph styling when possible."""
 
@@ -477,18 +370,3 @@ def _set_paragraph_text(paragraph_el: ET.Element, value: str) -> None:
     if value != value.strip():
         text_el.set(f"{{{XML_NS}}}space", "preserve")
     text_el.text = value
-
-
-def _set_paragraph_style(paragraph_el: ET.Element, style_name: str) -> None:
-    """设置段落样式名。    Set the style name for one paragraph."""
-
-    paragraph_pr = paragraph_el.find("w:pPr", W)
-    if paragraph_pr is None:
-        paragraph_pr = ET.Element(_w("pPr"))
-        paragraph_el.insert(0, paragraph_pr)
-
-    style_el = paragraph_pr.find("w:pStyle", W)
-    if style_el is None:
-        style_el = ET.Element(_w("pStyle"))
-        paragraph_pr.insert(0, style_el)
-    style_el.set(_w("val"), style_name)

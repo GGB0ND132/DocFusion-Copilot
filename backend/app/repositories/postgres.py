@@ -229,6 +229,31 @@ class PostgresRepository:
             session.flush()
             return self._task_from_row(row)
 
+    def list_tasks(
+        self,
+        *,
+        task_type: str | None = None,
+        limit: int = 100,
+    ) -> list[TaskRecord]:
+        """列出任务记录，按创建时间降序。"""
+        with self._session() as session:
+            stmt = select(TaskRow).order_by(TaskRow.created_at.desc()).limit(limit)
+            if task_type is not None:
+                stmt = stmt.where(TaskRow.task_type == task_type)
+            rows = session.execute(stmt).scalars().all()
+            return [self._task_from_row(row) for row in rows]
+
+    def delete_task(self, task_id: str) -> TaskRecord | None:
+        """删除任务记录；关联的 template_results 通过外键级联删除。"""
+        with self._session() as session:
+            row = session.get(TaskRow, task_id)
+            if row is None:
+                return None
+            snapshot = self._task_from_row(row)
+            session.delete(row)
+            session.flush()
+            return snapshot
+
     def delete_facts_by_doc_id(self, doc_id: str) -> int:
         """删除指定文档的全部事实记录，返回删除条数。"""
         with self._session() as session:

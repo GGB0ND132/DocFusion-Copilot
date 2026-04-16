@@ -6,13 +6,15 @@
 
 - React 19 + TypeScript 5.8
 - Vite 6
-- Tailwind CSS 3.4
+- Tailwind CSS 3.4 + tailwindcss-animate
 - Zustand 5（状态管理）
+- React Router 7（路由）
 - Radix UI / shadcn 风格组件
 - Lucide React（图标）
 - Sonner（Toast 通知）
 - React Resizable Panels（面板布局）
-- React PDF / React Markdown（文档预览）
+- React PDF / React Markdown + remark-gfm（文档预览）
+- @tanstack/react-virtual（长列表虚拟滚动）
 
 ## 页面与功能
 

@@ -1,9 +1,15 @@
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback, useRef } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
+import { Document, Page, pdfjs } from 'react-pdf';
+import 'react-pdf/dist/Page/AnnotationLayer.css';
+import 'react-pdf/dist/Page/TextLayer.css';
 import { getDocumentRawUrl, getDocumentBlocks } from '@/services';
 import type { BlockResponse } from '@/services/types';
 import { Badge } from '@/components/ui/badge';
+
+// Configure PDF.js worker from CDN to match bundled version
+pdfjs.GlobalWorkerOptions.workerSrc = `https://unpkg.com/pdfjs-dist@${pdfjs.version}/build/pdf.worker.min.mjs`;
 
 interface FilePreviewProps {
   docId: string;
@@ -86,12 +92,77 @@ function MarkdownPreview({ url }: { url: string }) {
 }
 
 function PdfPreview({ url }: { url: string }) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const [numPages, setNumPages] = useState(0);
+  const [pageNum, setPageNum] = useState(1);
+  const [width, setWidth] = useState<number>(0);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!containerRef.current) return;
+    const el = containerRef.current;
+    const update = () => setWidth(el.clientWidth - 32);
+    update();
+    const ro = new ResizeObserver(update);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+
+  if (error) {
+    return (
+      <div className="flex flex-col items-center justify-center h-full gap-2 text-sm text-muted-foreground p-8">
+        <p>PDF 加载失败：{error}</p>
+        <a href={url} download className="text-primary underline">下载原文件</a>
+      </div>
+    );
+  }
+
   return (
-    <iframe
-      src={url}
-      title="PDF Preview"
-      className="w-full h-full border-0"
-    />
+    <div ref={containerRef} className="h-full overflow-auto bg-muted/30 flex flex-col items-center py-4 relative">
+      <Document
+        file={url}
+        onLoadSuccess={({ numPages: n }) => {
+          setNumPages(n);
+          setPageNum(1);
+          setError(null);
+        }}
+        onLoadError={(err) => setError(err?.message ?? '未知错误')}
+        loading={<p className="p-4 text-sm text-muted-foreground">PDF 加载中…</p>}
+        error={<p className="p-4 text-sm text-destructive">PDF 加载失败</p>}
+      >
+        {numPages > 0 && width > 0 && (
+          <Page
+            pageNumber={pageNum}
+            width={width}
+            renderAnnotationLayer={false}
+            renderTextLayer={true}
+          />
+        )}
+      </Document>
+
+      {numPages > 1 && (
+        <div className="sticky bottom-2 mt-2 flex items-center gap-2 bg-background/90 backdrop-blur px-3 py-1.5 rounded-full border shadow text-xs">
+          <button
+            className="px-2 py-0.5 rounded hover:bg-muted disabled:opacity-40"
+            disabled={pageNum <= 1}
+            onClick={() => setPageNum((p) => Math.max(1, p - 1))}
+          >
+            上一页
+          </button>
+          <span className="tabular-nums">
+            {pageNum} / {numPages}
+          </span>
+          <button
+            className="px-2 py-0.5 rounded hover:bg-muted disabled:opacity-40"
+            disabled={pageNum >= numPages}
+            onClick={() => setPageNum((p) => Math.min(numPages, p + 1))}
+          >
+            下一页
+          </button>
+          <a href={url} download className="ml-2 text-primary underline">下载</a>
+        </div>
+      )}
+    </div>
   );
 }
 

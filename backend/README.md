@@ -73,9 +73,13 @@ uvicorn app.main:app --reload --port 8000
 | `fact_extraction` | LLM 驱动的事实抽取 |
 | `fact_service` | 事实 CRUD、归一化、冲突处理 |
 | `template_analyzer` | 模板结构解析与字段映射 |
-| `template_filler` | 模板回填执行与单元格赋值 |
-| `template_service` | 模板结果检索与导出 |
+| `template_filler` | 模板回填执行与单元格赋值（规则通路） |
+| `llm_transform` | 统一 LLM 代码生成 + 沙箱执行的回填主通路，处理 xlsx / docx 模板 |
+| `template_service` | 模板任务调度、结果检索与导出 |
+| `embedding_service` | 文档向量化与检索 |
 | `trace_service` | 事实来源追溯链 |
+
+> 默认走 `llm_transform` 主通路：一次 LLM 调用生成 pandas 代码，在受限沙箱内执行抽取/聚合/回填；`template_filler` 作为规则回退使用。
 
 ## API 概览
 
@@ -120,11 +124,20 @@ uvicorn app.main:app --reload --port 8000
 
 - `GET /api/v1/tasks/{task_id}` — 任务状态查询
 
-## 测试
+## 测试与评测
 
 ```bash
+# 单元 / 集成测试
 python -m pytest tests -v
+
+# 端到端基准（针对测试集/包含模板文件 下每个场景跑一遍回填并输出报告）
+# 需后端已启动
+python scripts/run_benchmark.py
 ```
+
+报告输出到 `storage/benchmark_reports/`，每次回填任务还会在 `storage/outputs/` 下写入
+`debug_task_{task_id}_{模板名}_{时间戳}.txt`，内含模板 schema、源文档摘要、用户指令、
+LLM 生成的代码，便于排查。
 
 ## 常见问题
 

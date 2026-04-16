@@ -167,6 +167,29 @@ class InMemoryRepository:
             task.updated_at = datetime.now(timezone.utc)
             return replace(task)
 
+    def list_tasks(
+        self,
+        *,
+        task_type: str | None = None,
+        limit: int = 100,
+    ) -> list[TaskRecord]:
+        """列出任务，按创建时间降序返回。"""
+        with self._lock:
+            tasks = list(self._tasks.values())
+            if task_type is not None:
+                tasks = [t for t in tasks if str(t.task_type) == task_type]
+            tasks.sort(key=lambda t: t.created_at, reverse=True)
+            return [replace(t) for t in tasks[:limit]]
+
+    def delete_task(self, task_id: str) -> TaskRecord | None:
+        """删除任务记录，若同时有模板结果则一并移除。"""
+        with self._lock:
+            task = self._tasks.pop(task_id, None)
+            if task is None:
+                return None
+            self._template_results.pop(task_id, None)
+            return replace(task)
+
     def delete_facts_by_doc_id(self, doc_id: str) -> int:
         """删除指定文档的全部事实记录，返回删除条数。"""
         with self._lock:

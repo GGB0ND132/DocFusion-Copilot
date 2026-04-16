@@ -253,6 +253,19 @@ async def execute(request: Request) -> AgentExecuteResponse:
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+        assistant_summary = (
+            f"模板回填任务已提交。\n"
+            f"模板：{template_name}\n"
+            f"任务 ID：{task_id}\n"
+            f"状态：{task.status}"
+        )
+        # 将回填操作（用户提示词 + 助手确认消息）记入会话历史
+        if context_id:
+            try:
+                _persist_conversation(context_id, message, assistant_summary)
+            except Exception as exc:  # noqa: BLE001
+                _logger.warning("persist fill conversation failed: %s", exc)
+
         return AgentExecuteResponse(
             intent="extract_and_fill_template",
             entities=[],
@@ -264,7 +277,7 @@ async def execute(request: Request) -> AgentExecuteResponse:
             edits=[],
             planner="direct",
             execution_type="template_fill_task",
-            summary=f"模板回填任务已提交（{template_name}）",
+            summary=assistant_summary,
             facts=[],
             artifacts=[],
             document_ids=document_ids,

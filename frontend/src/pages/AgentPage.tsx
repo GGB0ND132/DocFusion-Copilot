@@ -51,6 +51,7 @@ import {
   type TaskResponse,
 } from '@/services';
 import DocumentSelectDialog from '@/components/DocumentSelectDialog';
+import { scoreDocumentRelevance } from '@/lib/relevance';
 
 export default function AgentPage() {
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -63,13 +64,17 @@ export default function AgentPage() {
   const setAgentContextId = useUiStore((s) => s.setAgentContextId);
   const clearConversation = useUiStore((s) => s.clearAgentConversation);
 
+  const fillTaskHistory = useUiStore((s) => s.fillTaskHistory);
+  const fillTasksHydrated = useUiStore((s) => s.fillTasksHydrated);
+  const loadFillTasks = useUiStore((s) => s.loadFillTasks);
+  const upsertFillTask = useUiStore((s) => s.upsertFillTask);
+  const removeFillTask = useUiStore((s) => s.removeFillTask);
+
   const [inputText, setInputText] = useState('');
   const [isExecuting, setIsExecuting] = useState(false);
   const [thinkingStartTime, setThinkingStartTime] = useState<number | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
   const [templateFile, setTemplateFile] = useState<File | null>(null);
-  const [fillTaskIds, setFillTaskIds] = useState<string[]>([]);
-  const [fillTasks, setFillTasks] = useState<Record<string, TaskResponse>>({});
   const [availableDocuments, setAvailableDocuments] = useState<DocumentResponse[]>([]);
   const [documentsHydrated, setDocumentsHydrated] = useState(false);
 
@@ -159,20 +164,15 @@ export default function AgentPage() {
   const handleDocSelectConfirm = useCallback(async (selectedDocIds: string[]) => {
     setDocSelectOpen(false);
     if (!templateFile || selectedDocIds.length === 0) return;
+    const templateNameAtSubmit = templateFile.name;
     const selectedNames = selectedDocIds
-      .map((id) => docSelectCandidates.find((c) => c.doc_id === id)?.file_name ?? id)
-      .join('、');
+      .map((id) => docSelectCandidates.find((c) => c.doc_id === id)?.file_name ?? id);
     setFillSourceDocs(
       selectedDocIds.map((id) => ({
         id,
         name: docSelectCandidates.find((c) => c.doc_id === id)?.file_name ?? id,
       })),
     );
-    addAgentMessage({
-      role: 'assistant',
-      text: `已选择 ${selectedDocIds.length} 个源文档：${selectedNames}\n正在提交回填任务…`,
-      timestamp: Date.now(),
-    });
     const ac = new AbortController();
     abortControllerRef.current = ac;
     setIsExecuting(true);
@@ -193,16 +193,24 @@ export default function AgentPage() {
       if (!resp.task_id) {
         throw new Error('未返回模板回填任务 ID');
       }
-      setFillTaskIds(prev => [...prev, resp.task_id]);
       const task = await getTaskStatus(resp.task_id);
-      setFillTasks(prev => ({ ...prev, [resp.task_id]: task }));
       upsertTaskSnapshot(task);
+      upsertFillTask(task);
+      const displayTemplate = resp.template_name || templateNameAtSubmit;
+      const docList = selectedNames.map((n) => `- ${n}`).join('\n');
       addAgentMessage({
         role: 'assistant',
-        text: `模板回填任务已提交。\n模板：${resp.template_name}\n任务 ID：${resp.task_id}\n状态：${task.status}`,
+        text:
+          `模板回填任务已提交。\n` +
+          `**模板**：${displayTemplate}\n` +
+          `**源文档 (${selectedNames.length})**：\n${docList}\n` +
+          `**任务 ID**：${resp.task_id}\n` +
+          `**状态**：${task.status}`,
         timestamp: Date.now(),
         taskId: resp.task_id,
       });
+      // reset template selection so next turn is clean
+      setTemplateFile(null);
       refreshConversations();
     } catch (err) {
       if (err instanceof DOMException && err.name === 'AbortError') {
@@ -217,7 +225,7 @@ export default function AgentPage() {
       setIsExecuting(false);
       setThinkingStartTime(null);
     }
-  }, [templateFile, pendingFillText, pendingFillContextId, pendingFillDocSetId, docSelectCandidates, agentContextId, setAgentContextId, addAgentMessage, upsertTaskSnapshot, refreshConversations]);
+  }, [templateFile, pendingFillText, pendingFillContextId, pendingFillDocSetId, docSelectCandidates, agentContextId, setAgentContextId, addAgentMessage, upsertTaskSnapshot, upsertFillTask, refreshConversations]);
 
   const handleDocSelectCancel = useCallback(() => {
     setDocSelectOpen(false);
@@ -298,22 +306,41 @@ export default function AgentPage() {
 
   // Poll fill task status for all pending tasks
   useEffect(() => {
-    const pendingIds = fillTaskIds.filter(id => {
-      const t = fillTasks[id];
-      return !t || !['succeeded', 'completed', 'success', 'failed'].includes(t.status);
-    });
+    if (!fillTasksHydrated) return;
+    const pendingIds = fillTaskHistory
+      .filter((t) => !['succeeded', 'completed', 'success', 'failed'].includes(t.status))
+      .map((t) => t.task_id);
     if (pendingIds.length === 0) return;
     const timer = window.setInterval(async () => {
       for (const id of pendingIds) {
         try {
           const t = await getTaskStatus(id);
-          setFillTasks(prev => ({ ...prev, [id]: t }));
           upsertTaskSnapshot(t);
+          upsertFillTask(t);
+          // Update only the status line in the bound assistant message (in place).
+          useUiStore.setState((state) => {
+            const next = state.agentMessages.map((m) => {
+              if (m.role !== 'assistant' || m.taskId !== id) return m;
+              const patched = m.text.replace(
+                /(\*\*状态\*\*：)\S.*/,
+                `$1${t.status}`,
+              );
+              return patched === m.text ? m : { ...m, text: patched };
+            });
+            return { agentMessages: next };
+          });
         } catch { /* ignore */ }
       }
     }, 3000);
     return () => window.clearInterval(timer);
-  }, [fillTaskIds, fillTasks, upsertTaskSnapshot]);
+  }, [fillTaskHistory, fillTasksHydrated, upsertTaskSnapshot, upsertFillTask]);
+
+  // Hydrate fill task history on mount
+  useEffect(() => {
+    if (!fillTasksHydrated) {
+      loadFillTasks();
+    }
+  }, [fillTasksHydrated, loadFillTasks]);
 
   useEffect(() => {
     if (!templateFile || !documentsHydrated || parsedScopedDocIds.length > 0) return;
@@ -391,20 +418,17 @@ export default function AgentPage() {
         .filter(isSourceDocument)
         .filter((doc) => doc.status === 'parsed');
 
-      const tplBase = templateFile.name.replace(/\.[^.]+$/, '').toLowerCase();
-      const tplTokens = tplBase.split(/[\s_\-—·()（）【】\[\]]+/).filter(Boolean);
+      const tplName = templateFile.name;
+      const scored = allParsedSrc.map((doc) => ({
+        doc,
+        score: scoreDocumentRelevance(tplName, doc.file_name),
+      }));
+      scored.sort((a, b) => b.score - a.score);
 
-      const scored = allParsedSrc.map((doc) => {
-        const fn = doc.file_name.toLowerCase();
-        const hits = tplTokens.filter((tok) => fn.includes(tok)).length;
-        return { doc, hits };
-      });
-      scored.sort((a, b) => b.hits - a.hits);
-
-      const latestParsedDocs: SuggestDocumentCandidate[] = scored.map(({ doc }) => ({
+      const latestParsedDocs: SuggestDocumentCandidate[] = scored.map(({ doc, score }) => ({
         doc_id: doc.doc_id,
         file_name: doc.file_name,
-        score: 0,
+        score,
         field_hits: [] as string[],
         entity_hits: [] as string[],
         keyword_hits: [] as string[],
@@ -826,19 +850,33 @@ export default function AgentPage() {
           <TabsContent value="tasks" className="flex-1 overflow-hidden m-0">
             <ScrollArea className="h-full">
               <div className="p-3 space-y-3">
-                {fillTaskIds.length === 0 && (
+                {fillTaskHistory.length === 0 && (
                   <p className="text-[10px] text-muted-foreground">暂无回填任务。选择模板并提交后，任务会显示在这里。</p>
                 )}
-                {[...fillTaskIds].reverse().map((taskId) => {
-                  const task = fillTasks[taskId];
-                  if (!task) return null;
+                {fillTaskHistory.map((task) => {
+                  const taskId = task.task_id;
                   const done = ['succeeded', 'completed', 'success'].includes(task.status);
                   return (
                     <Card key={taskId} className="p-0 shadow-none">
                       <CardContent className="p-3 space-y-2">
                         <div className="flex items-center justify-between">
                           <span className="text-xs font-medium">模板回填任务</span>
-                          <TaskStatusBadge status={task.status} />
+                          <div className="flex items-center gap-1">
+                            <TaskStatusBadge status={task.status} />
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              className="h-5 w-5"
+                              onClick={() => {
+                                if (window.confirm('确定要删除这个任务及其结果文件吗？')) {
+                                  removeFillTask(taskId).then(() => toast.info('任务已删除'));
+                                }
+                              }}
+                              title="删除任务"
+                            >
+                              <Trash2 className="h-3 w-3 text-destructive" />
+                            </Button>
+                          </div>
                         </div>
                         <div className="flex items-center justify-between text-[10px] text-muted-foreground">
                           <span className="truncate">{taskId}</span>

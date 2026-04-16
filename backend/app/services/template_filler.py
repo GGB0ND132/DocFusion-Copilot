@@ -12,9 +12,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from app.models.domain import FactRecord, FilledCellRecord
-from app.schemas.templates import FieldRequirement, TemplateIntent
+from app.schemas.templates import TemplateIntent
 from app.utils.normalizers import (
-    format_value,
     is_entity_column,
     normalize_entity_name,
     normalize_field_name,

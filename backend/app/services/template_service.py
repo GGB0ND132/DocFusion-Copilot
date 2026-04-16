@@ -7,7 +7,7 @@ from pathlib import Path
 from time import perf_counter
 
 from app.core.config import Settings
-from app.core.logging import ErrorCode, get_logger, log_operation
+from app.core.logging import get_logger, log_operation
 from app.core.openai_client import OpenAIClientError, OpenAICompatibleClient
 from app.models.domain import (
     DocumentRecord,

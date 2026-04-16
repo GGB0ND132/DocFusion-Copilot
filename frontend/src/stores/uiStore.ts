@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import { getFactTrace } from '@/services';
+import { getFactTrace, listTasks as apiListTasks, deleteTask as apiDeleteTask } from '@/services';
 import type { AgentExecuteResponse, ConversationResponse, DocumentResponse, FactTraceResponse, TaskResponse } from '@/services';
 
 type ToastTone = 'success' | 'error' | 'info';
@@ -57,6 +57,7 @@ type UiState = {
   agentMessages: ChatMessage[];
   agentContextId: string | null;
   addAgentMessage: (msg: ChatMessage) => void;
+  updateAgentMessageByTaskId: (taskId: string, patch: Partial<ChatMessage>) => void;
   setAgentContextId: (id: string | null) => void;
   clearAgentConversation: () => void;
   conversationList: ConversationResponse[];
@@ -64,6 +65,12 @@ type UiState = {
   switchConversation: (conv: ConversationResponse) => void;
   startNewConversation: () => void;
   removeConversationFromList: (conversationId: string) => void;
+  // ── Persisted fill task history (loaded from backend) ──
+  fillTaskHistory: TaskResponse[];
+  fillTasksHydrated: boolean;
+  loadFillTasks: () => Promise<void>;
+  upsertFillTask: (task: TaskResponse) => void;
+  removeFillTask: (taskId: string) => Promise<void>;
 };
 
 export const useUiStore = create<UiState>((set) => ({
@@ -190,6 +197,12 @@ export const useUiStore = create<UiState>((set) => ({
   agentContextId: null,
   addAgentMessage: (msg) =>
     set((state) => ({ agentMessages: [...state.agentMessages, msg] })),
+  updateAgentMessageByTaskId: (taskId, patch) =>
+    set((state) => ({
+      agentMessages: state.agentMessages.map((m) =>
+        m.role === 'assistant' && m.taskId === taskId ? { ...m, ...patch } : m,
+      ),
+    })),
   setAgentContextId: (id) => set({ agentContextId: id }),
   clearAgentConversation: () =>
     set({
@@ -223,4 +236,35 @@ export const useUiStore = create<UiState>((set) => ({
     set((state) => ({
       conversationList: state.conversationList.filter((c) => c.conversation_id !== conversationId),
     })),
+  fillTaskHistory: [],
+  fillTasksHydrated: false,
+  loadFillTasks: async () => {
+    try {
+      const tasks = await apiListTasks('template_fill', 100);
+      set({ fillTaskHistory: tasks, fillTasksHydrated: true });
+    } catch (err) {
+      console.warn('loadFillTasks failed', err);
+      set({ fillTasksHydrated: true });
+    }
+  },
+  upsertFillTask: (task) =>
+    set((state) => {
+      const idx = state.fillTaskHistory.findIndex((t) => t.task_id === task.task_id);
+      if (idx === -1) {
+        return { fillTaskHistory: [task, ...state.fillTaskHistory] };
+      }
+      const next = state.fillTaskHistory.slice();
+      next[idx] = task;
+      return { fillTaskHistory: next };
+    }),
+  removeFillTask: async (taskId) => {
+    try {
+      await apiDeleteTask(taskId);
+    } catch (err) {
+      console.warn('deleteTask failed', err);
+    }
+    set((state) => ({
+      fillTaskHistory: state.fillTaskHistory.filter((t) => t.task_id !== taskId),
+    }));
+  },
 }));

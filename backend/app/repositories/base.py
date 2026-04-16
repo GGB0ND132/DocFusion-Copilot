@@ -84,6 +84,21 @@ class Repository(Protocol):
         Update task status fields.
         """
 
+    def list_tasks(
+        self,
+        *,
+        task_type: str | None = None,
+        limit: int = 100,
+    ) -> list[TaskRecord]:
+        """列出任务记录，按创建时间降序。
+        List task records ordered by created_at DESC.
+        """
+
+    def delete_task(self, task_id: str) -> TaskRecord | None:
+        """删除任务记录，返回被删除的记录。
+        Delete a task record and return the removed record if any.
+        """
+
     def delete_facts_by_doc_id(self, doc_id: str) -> int:
         """删除指定文档的全部事实记录，返回删除条数。
         Delete all facts belonging to a document. Returns count of deleted rows.

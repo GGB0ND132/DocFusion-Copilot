@@ -11,7 +11,6 @@ from __future__ import annotations
 import json
 import logging
 import re
-import traceback
 from collections import defaultdict
 from datetime import datetime
 from io import StringIO
@@ -283,7 +282,12 @@ def extract_text_to_dataframe(
         "5. 按文本出现顺序排列。\n"
         "6. 注意: 同一文档中可能存在多种描述格式(如详细段落 vs 简短列举),\n"
         "   所有格式的实体都要提取，不要遗漏。\n"
-        "7. 只输出JSON数组,不要附加任何解释文字。"
+        "7. **实体名列只填规范实体名，不得携带任何描述性后缀**。\n"
+        "   ❌错误：'上海以' / '北京紧随其后' / '深圳以' / '重庆凭借' /\n"
+        "     '广州在转型压力下稳步前行' / '苏州作为当之无愧的'\n"
+        "   ✅正确：'上海' / '北京' / '深圳' / '重庆' / '广州' / '苏州'\n"
+        "   遇到'以|紧随|凭借|作为|是|为|占据|稳步|在|凭|借'等连接词立即截断。\n"
+        "8. 只输出JSON数组,不要附加任何解释文字。"
     )
 
     # ── Parallel extraction: send all chunks to LLM concurrently ──
@@ -324,8 +328,162 @@ def extract_text_to_dataframe(
     for col in template_columns:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="ignore")
+    # Clean entity columns (strip description suffixes from entity names)
+    df = _clean_entity_columns(df)
     logger.info("extract_text_to_dataframe: total %d rows extracted", len(df))
     return df[template_columns]
+
+
+# ---------------------------------------------------------------------------
+# 1b. Robust numeric extraction helper (injected into LLM exec namespace)
+# ---------------------------------------------------------------------------
+
+# Unit multipliers for Chinese magnitude units → base numeric value.
+# Callers pass a "target unit" and get a value expressed in that target unit.
+_UNIT_BASE_MULTIPLIER = {
+    "": 1.0,
+    "元": 1.0,
+    "个": 1.0,
+    "人": 1.0,
+    "万": 1e4,
+    "万元": 1e4,
+    "万人": 1e4,
+    "万份": 1e4,
+    "亿": 1e8,
+    "亿元": 1e8,
+    "亿人": 1e8,
+    "千": 1e3,
+    "百": 1e2,
+}
+
+
+def _find_num_robust(
+    text: str,
+    keyword_regex: str,
+    *,
+    target_unit: str = "",
+    alt_units: tuple[str, ...] = (),
+) -> float | None:
+    """Extract a numeric value for a given keyword from prose text.
+
+    Handles both orderings:
+      A) "<keyword> ... <digits> <unit>"   e.g. "GDP 总量达到 52,073.40 亿元"
+      B) "<digits> <unit> ... <keyword>"   e.g. "238,320 元的惊人人均 GDP"
+
+    Tolerates spaces/punctuation between tokens, and auto-converts magnitude
+    units (万 / 亿 / 千) to the caller's ``target_unit`` so values are
+    comparable across paragraphs with mixed units (e.g. "5775 万" vs "1.26 亿").
+
+    Args:
+        text: source paragraph/sentence.
+        keyword_regex: regex identifying the field name (e.g. r'GDP\\s*总量').
+        target_unit: desired output unit ('亿元', '万', '元', '人', '万份', ...).
+            '' means the caller accepts whatever raw number is found.
+        alt_units: tuple of other units that may appear in the text and should
+            be accepted with on-the-fly conversion. e.g. target_unit='万',
+            alt_units=('亿',) converts "1.26 亿" → 12600 万.
+    """
+    if not isinstance(text, str) or not text:
+        return None
+
+    target_mul = _UNIT_BASE_MULTIPLIER.get(target_unit, 1.0)
+    # Candidate units to try.  Explicit units (anything except '') are tried
+    # first — a specific unit match beats a unit-less one, otherwise
+    # "5775 万人" gets captured as 5775 instead of 5775 * 1e4.
+    candidates: list[tuple[str, float]] = []
+    seen: set[str] = set()
+    ordered = [u for u in (target_unit,) + tuple(alt_units) if u]  # non-empty first
+    if "" in (target_unit,) + tuple(alt_units):
+        ordered.append("")  # unit-less last
+    else:
+        ordered.append("")  # always allow unit-less fallback at the end
+    for u in ordered:
+        if u in seen:
+            continue
+        seen.add(u)
+        candidates.append((u, _UNIT_BASE_MULTIPLIER.get(u, 1.0)))
+
+    num_re = r"([\d,]+\.?\d*)"
+    for unit, src_mul in candidates:
+        # Build unit regex: escape unit chars, allow optional trailing qualifier (元 after 亿 etc)
+        if unit:
+            unit_re = re.escape(unit)
+        else:
+            unit_re = r"(?![\u4e00-\u9fff\d])"  # lookahead: not followed by CJK or digit
+        # Order A: keyword then number then optional unit
+        pattern_a = keyword_regex + r"[^\d]{0,12}" + num_re + r"\s*" + unit_re
+        m = re.search(pattern_a, text)
+        if m:
+            try:
+                raw = float(m.group(1).replace(",", ""))
+                return raw * src_mul / target_mul if target_mul else raw * src_mul
+            except ValueError:
+                pass
+        # Order B: number then unit then (within short window) keyword
+        pattern_b = num_re + r"\s*" + unit_re + r"[^。；\n]{0,12}?" + keyword_regex
+        m = re.search(pattern_b, text)
+        if m:
+            try:
+                raw = float(m.group(1).replace(",", ""))
+                return raw * src_mul / target_mul if target_mul else raw * src_mul
+            except ValueError:
+                pass
+    return None
+
+
+# ---------------------------------------------------------------------------
+# 1c. Entity-name column cleaner (remove description suffixes)
+# ---------------------------------------------------------------------------
+
+_ENTITY_COL_KEYWORDS = (
+    "城市", "国家", "省", "地区", "名称", "实体",
+    "city", "country", "province", "region", "name", "entity",
+)
+_ENTITY_BREAK_TOKENS = re.compile(
+    r"(以|紧随|凭借|凭|借|作为|是为|占据|稳步|在转型|在此|依靠|依托|成为|表现|当之无愧|作为当|紧追)"
+)
+
+
+def _clean_entity_value(value: object) -> object:
+    """Strip description suffixes from a single entity-name cell.
+
+    Rules:
+    - Only process str values with at least one Chinese character.
+    - If a break token appears, truncate at the break point.
+    - Then keep only the leading 2–5 Chinese-character run.
+    """
+    if not isinstance(value, str):
+        return value
+    text = value.strip()
+    if not text:
+        return text
+    # Contains any Chinese char?
+    if not re.search(r"[\u4e00-\u9fff]", text):
+        return text
+    # Cut at first break token
+    cut = _ENTITY_BREAK_TOKENS.search(text)
+    if cut is not None:
+        text = text[: cut.start()]
+    # Keep leading Chinese run (2–6 chars, allow trailing 市/省/自治区 suffix)
+    m = re.match(r"^([\u4e00-\u9fff]{2,6})", text)
+    if m:
+        return m.group(1)
+    return text
+
+
+def _clean_entity_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Detect entity-name columns by header keyword and clean their values in place."""
+    if df is None or df.empty:
+        return df
+    for col in list(df.columns):
+        col_name = str(col).lower()
+        if any(kw in str(col) or kw in col_name for kw in _ENTITY_COL_KEYWORDS):
+            try:
+                df[col] = df[col].map(_clean_entity_value)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("_clean_entity_columns: skip column %s: %s", col, exc)
+    return df
+
 
 
 # ---------------------------------------------------------------------------
@@ -441,7 +599,15 @@ def _extract_text_as_csv(
         "6. 按文本出现顺序排列，不要遗漏任何实体。\n"
         "7. 注意：文本中早期城市是长段描述(可能跨句)，后期城市是简短列举，\n"
         "   两种格式都要提取，不要遗漏。\n"
-        "8. 只输出 CSV，开头不要任何解释文字。"
+        "8. **实体名列只填规范实体名，不得携带任何描述性后缀**。\n"
+        "   ❌错误示例：'上海以' / '北京紧随其后' / '深圳以' / '重庆凭借' /\n"
+        "     '广州在转型压力下稳步前行' / '苏州作为当之无愧的'\n"
+        "   ✅正确示例：'上海' / '北京' / '深圳' / '重庆' / '广州' / '苏州'\n"
+        "   规则：城市/国家/省份列只保留 2–5 字的纯实体名，\n"
+        "   遇到'以|紧随|凭借|作为|是|为|占据|稳步|在|凭|借'等连接词即截断。\n"
+        "9. 即使实体段落描述较长（跨多句），也必须提取该实体，不得漏掉任何\n"
+        "   可识别的城市/国家/省份。\n"
+        "10. 只输出 CSV，开头不要任何解释文字。"
     )
 
     prompt = f"目标列名: {col_header}\n\n文本:\n{full_text}\n\n请提取所有实体数据，输出CSV。"
@@ -492,6 +658,9 @@ def _extract_text_as_csv(
     for col in template_columns:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="ignore")
+
+    # Clean entity-name columns
+    df = _clean_entity_columns(df)
 
     logger.info(
         "_extract_text_as_csv: parsed %d rows, columns=%s",
@@ -605,15 +774,105 @@ _SYSTEM_PROMPT = """\
     - **重要**: 不要使用 `if all([...])` 来过滤行。即使某些字段提取失败，也要保留该行，缺失字段填 None。
     - 数值中可能包含逗号(如 56,708.71)，注意去掉逗号后转 float。
     - 用多种正则模式匹配不同格式，确保不遗漏任何实体。
-    - **重要**: 文本源中解析出的子实体(如省份、城市)应聚合为其上级实体。
-      例如：多个中国省份的数据应聚合为一条"中国"(或"China")行，与结构化数据源中的国家级实体对齐。
-      聚合规则：累计型指标(如病例数、检测数)用 sum，人均/比率指标(如人均GDP)用加权平均或 mean，
-      属性字段(如大洲)用 first，人口用 sum。聚合后的实体名应与模板/结构化数据中的实体名一致。
+    - **重要：实体名提取必须做连接词截断**：
+      从段落开头提取城市/省份/国家时，**禁止**把后续连接词当作实体名的一部分。
+      ❌错误：'上海以' / '北京紧随其后' / '深圳以' / '重庆凭借' /
+         '广州在转型压力下稳步前行' / '苏州作为当之无愧的'
+      ✅正确：'上海' / '北京' / '深圳' / '重庆' / '广州' / '苏州'
+      **标准提取模板（必须按此结构写）**：
+      ```python
+      m = re.match(r'^([\u4e00-\u9fff]{2,4}(?:市|省|自治区)?)', content)
+      if m:
+          name = m.group(1)
+          # 二次切断：去掉所有连接词后缀
+          name = re.split(r'以|紧随|凭借|作为|稳步|是|为|占据|在|凭|借|达|高达|同比|位列|排名|当之', name)[0]
+          # 去掉单字残留
+          if len(name) < 2: continue
+      else:
+          continue  # 跳过不含实体的段落
+      ```
+      不得因为段落描述较长就跳过该实体；每个含实体名的段落都必须产出一行。
+    - **重要（强制）: 文本源中解析出的子实体(如省份、城市)必须聚合为其上级实体**。
+      例如：多个中国省份的数据必须聚合为**单独一条"中国"(或"China")行**，
+      与结构化数据源中的国家级实体对齐。禁止把各省份直接 concat 到 result_df。
+      即使用户指令没有明确说"聚合"，当模板列仅含国家级字段（如'国家/地区'、'大洲'）时，
+      也必须默认聚合为父实体单行。
+      **聚合方法决策表（按列名关键词匹配，必须按列单独指定方法，禁止全部用 sum）：**
+      - 列名含 "人均|增长率|率|%|per capita|rate|比率|同比|环比" → **mean**
+        （例：人均GDP 必须用 mean；否则 14 亿人口 × 7 万会严重错误）
+      - 列名含 "人口|population" → **sum**（多个省份人口相加得国家人口）
+      - 列名含 "GDP总量|病例|检测|死亡|新增|累计|销售|金额|数量|订单|产量|面积" → **sum**
+      - 列名含 "大洲|国家代码|洲|时区|地区类型|continent" → **first**
+      - 其他未匹配的数值列默认 **sum**，未匹配的文本列默认 **first**
+      聚合代码模板（必须参考此模板实现，按列名动态构建 agg_map）：
+      ```python
+      # 先确保每行有效（有实体名 + 至少一个数值字段）
+      df_parsed = df_parsed.dropna(subset=['国家/地区'], how='any')
+      # 先对所有非 key 列统一 to_numeric(errors='coerce')，避免字符串被忽略
+      entity_col = '国家/地区'  # 按模板实际 key 列名替换
+      for _c in df_parsed.columns:
+          if _c != entity_col:
+              try: df_parsed[_c] = pd.to_numeric(df_parsed[_c], errors='ignore')
+              except Exception: pass
+      agg_map = {}
+      for c in df_parsed.columns:
+          if c == entity_col: continue
+          cl = str(c)
+          if any(k in cl for k in ['人均','增长率','比率','同比','环比']) or 'per capita' in cl.lower() or 'rate' in cl.lower() or '%' in cl or cl.endswith('率'):
+              agg_map[c] = 'mean'
+          elif any(k in cl for k in ['大洲','洲','国家代码','continent','时区']):
+              agg_map[c] = 'first'
+          else:
+              # 人口/病例/检测/GDP总量/金额/销售等默认 sum（**禁止人口用 first**）
+              agg_map[c] = 'sum' if pd.api.types.is_numeric_dtype(df_parsed[c]) else 'first'
+      # 先把所有子实体统一替换为父实体名，再 groupby 聚合成单行
+      df_parsed[entity_col] = '中国'  # 或 'China'，与结构化源的国家名一致
+      china_row = df_parsed.groupby(entity_col, as_index=False).agg(agg_map)
+      # **禁止**再把 df_parsed 原始各省份行 concat 进 result_df。
+      # result_df 应只包含一行"中国"（文本源）+ 结构化源的其余国家行。
+      ```
+      **最终 result_df 的粒度必须与模板列一致**：若模板只有'国家/地区'列，
+      则文本源聚合结果只能是一行"中国"，不得保留各省份明细。
     - **重要**: 跳过不含实体(省份/城市/国家)的段落(如纯日期、标题、总结段落)。
       省份匹配示例: r'^(\\S+(?:省|市|自治区))'。如果开头不是实体名则跳过该段落。
     - **重要**: 从文本中提取的数值，保持原文中的数值不做单位转换（如"人口约5775万"提取为5775，
       "人均GDP约7.3万元"提取为7.3）。单位转换只在模板或用户明确要求时才做。
       检测数如"12.6万份"提取为126000（乘以10000），因为模板中检测数列通常是绝对数量。
+    - **重要（双向正则）：同一字段在文本中可能以两种顺序出现，必须两种都匹配**：
+      顺序A（关键词在前）："GDP 总量达 27,695.10 亿元" / "人均 GDP 为 105,790 元"
+      顺序B（数字在前）：  "56,708.71 亿元的 GDP 总量" / "238,320 元的惊人人均 GDP" /
+                         "1,779.05 万常住人口" / "3,191.43 万的庞大人口基数"
+      **强制：必须直接调用注入的 `find_num` 辅助函数，不要自己写正则**（自写容易漏空格、漏单位、漏反向顺序）。
+      `find_num` 已在沙箱中可用，签名如下：
+      ```python
+      find_num(text: str, keyword_regex: str, *, target_unit: str = '',
+               alt_units: tuple = ()) -> float | None
+      ```
+      - `keyword_regex`：字段关键词正则，如 r'GDP\\s*总量' / r'(?:常住)?人口' / r'人均\\s*GDP'
+      - `target_unit`：模板列要求的单位（影响返回值）。常用值：
+          '亿元'（GDP总量/预算）、'元'（人均GDP）、'万'（人口单位为万）、
+          '万份'（检测量）、'人'（人口单位为人）、''（不转换）
+      - `alt_units`：文本中可能出现的其它单位（会自动换算到 target_unit）。
+          例如人口列单位为'万'时，传 `alt_units=('亿',)` 可自动把"1.26亿"转为 12600 万。
+      内部自动处理：顺序A/B 双向匹配、数字与单位间的空格、千分号逗号、
+      动词白名单（"达|达到|约|为|突破|跃升至|稳居|位列|拿下"等）。
+      典型用法（务必根据**模板列名中的单位后缀**选 target_unit）：
+      ```python
+      # 百强报告 — 模板列自带单位后缀：GDP总量（亿元）、常住人口（万）、人均GDP（元）
+      gdp_total = find_num(content, r'GDP\\s*总量',       target_unit='亿元')
+      population = find_num(content, r'(?:常住)?人口',     target_unit='万',  alt_units=('亿',))
+      gdp_pc     = find_num(content, r'人均\\s*GDP',       target_unit='元',  alt_units=('万元',))
+      budget     = find_num(content, r'一般公共预算收入', target_unit='亿元')
+      # COVID 文本 — 模板列名无单位后缀（'人口'/'每日检测数'→ 原始计数）
+      # 文本可能用 "5775 万" 或 "1.26 亿"，必须给 alt_units 让函数自动换算成原始计数
+      pop      = find_num(content, r'(?:常住)?人口',    target_unit='',  alt_units=('亿','万'))
+      # 人均GDP 模板列'人均GDP'(无单位,当作美元/元) — 文本'7.3万元' 需换算为 73000 元
+      gdp_pc   = find_num(content, r'人均\\s*GDP',       target_unit='元', alt_units=('万元','万'))
+      # 每日检测数 无单位 — 文本'12.6 万份' 需换算为 126000 份
+      tests    = find_num(content, r'(?:核酸)?检测量?', target_unit='',  alt_units=('万份','万'))
+      ```
+      **禁止**再出现 `re.search(r'GDP\\s*总量[^\\d]*([\\d.,]+)', ...)` 这类手写正则用于
+      从文本中提取数值。
 11. 只输出 Python 代码，不要包含任何解释文字。用 ```python 和 ``` 包裹代码。
 12. 多源合并时，如果一个 DataFrame 行数远大于另一个（如 2000 行 vs 10 行），
     大 DataFrame 是主数据源，小 DataFrame 是补充信息。
@@ -725,10 +984,32 @@ def execute_transform_safely(
             "True": True,
             "False": False,
             "None": None,
+            # Additional safe builtins needed by LLM-generated aggregation/filter code
+            "any": any,
+            "all": all,
+            "type": type,
+            "bool": bool,
+            "hasattr": hasattr,
+            "getattr": getattr,
+            "iter": iter,
+            "next": next,
+            "reversed": reversed,
+            "repr": repr,
+            "Exception": Exception,
+            "ValueError": ValueError,
+            "TypeError": TypeError,
+            "KeyError": KeyError,
+            "IndexError": IndexError,
+            "AttributeError": AttributeError,
+            "ZeroDivisionError": ZeroDivisionError,
+            "StopIteration": StopIteration,
         },
         "pd": pd,
         "np": np,
         "re": re,
+        # Robust numeric extraction helper — the LLM is strongly encouraged
+        # to use this instead of hand-rolled regex for prose paragraphs.
+        "find_num": _find_num_robust,
     }
     # Inject source DataFrames
     for i, df in enumerate(dataframes):
@@ -738,16 +1019,16 @@ def execute_transform_safely(
     code = re.sub(r'^\s*import\s+\w+.*$', '', code, flags=re.MULTILINE)
     code = re.sub(r'^\s*from\s+\w+\s+import.*$', '', code, flags=re.MULTILINE)
 
-    local_ns: dict = {}
+    # Use a single namespace so generator/comprehension expressions inside
+    # the exec'd code can see module-level variables (two-dict exec breaks
+    # e.g. `any(k in cl for k in [...])` at module scope).
     try:
-        exec(code, restricted_globals, local_ns)  # noqa: S102
+        exec(code, restricted_globals)  # noqa: S102
     except Exception as exc:
         logger.error("LLM transform code execution failed:\n%s\nError: %s", code, exc)
         raise ValueError(f"LLM 生成的代码执行失败: {exc}") from exc
 
-    result_df = local_ns.get("result_df")
-    if result_df is None:
-        result_df = restricted_globals.get("result_df")
+    result_df = restricted_globals.get("result_df")
     if not isinstance(result_df, pd.DataFrame):
         raise ValueError("LLM 代码未生成 result_df DataFrame")
     if result_df.empty:
@@ -755,20 +1036,29 @@ def execute_transform_safely(
 
     # Check for per-table DataFrames (result_df_0, result_df_1, ...)
     per_table: dict[int, pd.DataFrame] = {}
-    for key in list(local_ns.keys()) + list(restricted_globals.keys()):
+    for key in list(restricted_globals.keys()):
         if key.startswith("result_df_") and key != "result_df":
             suffix = key[len("result_df_"):]
             if suffix.isdigit():
-                val = local_ns.get(key)
-                if val is None:
-                    val = restricted_globals.get(key)
+                val = restricted_globals.get(key)
                 if isinstance(val, pd.DataFrame) and not val.empty:
                     per_table[int(suffix)] = val
 
     if per_table:
         per_table[-1] = result_df  # marker: -1 = default result_df
+        # Entity-name cleanup safety net for multi-table outputs
+        for k in list(per_table.keys()):
+            try:
+                per_table[k] = _clean_entity_columns(per_table[k])
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("_clean_entity_columns (multi) skip key %s: %s", k, exc)
         return per_table  # type: ignore[return-value]
 
+    # Entity-name cleanup safety net for single-table outputs
+    try:
+        result_df = _clean_entity_columns(result_df)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("_clean_entity_columns (single) skipped: %s", exc)
     return result_df
 
 
